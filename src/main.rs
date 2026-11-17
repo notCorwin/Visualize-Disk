@@ -160,8 +160,12 @@ fn show_file_tooltip(
     response: &egui::Response,
     file: &scan::FileEntry,
 ) -> Option<egui::InnerResponse<()>> {
+    // List rows share this helper with the treemap, so gate the always-open
+    // tooltip here rather than relying on the caller's treemap hit test.
+    if !response.enabled() || !response.hovered() {
+        return None;
+    }
     let width = (response.ctx.content_rect().width() - 32.0).clamp(1.0, 420.0);
-    // The treemap hit test already gates this call on the hovered file.
     // Skip the standard tooltip delay so moving across files updates immediately.
     egui::Tooltip::for_widget(response)
         .at_pointer()
@@ -1369,19 +1373,16 @@ impl App {
                     }
                     ui.separator();
                 }
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(if self.filter_rx.is_some() {
-                            "更新中…"
-                        } else if self.filtered.is_empty() {
-                            "没有匹配的文件"
-                        } else {
-                            " "
-                        })
-                        .color(MUTED),
-                    )
-                    .truncate(),
-                );
+                let status = if self.filter_rx.is_some() {
+                    Some("更新中…")
+                } else if self.filtered.is_empty() {
+                    Some("没有匹配的文件")
+                } else {
+                    None
+                };
+                if let Some(status) = status {
+                    ui.add(egui::Label::new(RichText::new(status).color(MUTED)).truncate());
+                }
                 let data = self.data.as_ref().unwrap();
                 if let Some(selected) = self.file_list.show(
                     ui,
@@ -2319,6 +2320,162 @@ mod tests {
                 .to_string_lossy();
             text_shape(&output, &path);
         }
+    }
+
+    #[test]
+    fn file_tooltips_only_paint_the_hovered_file_and_resize_their_shadow() {
+        fn frames(shape: &egui::Shape, result: &mut Vec<(Rect, Rect)>) {
+            if let egui::Shape::Vec(shapes) = shape {
+                if let [egui::Shape::Rect(shadow), egui::Shape::Rect(body)] = shapes.as_slice()
+                    && shadow.blur_width > 0.0
+                {
+                    result.push((shadow.rect, body.rect));
+                } else {
+                    for shape in shapes {
+                        frames(shape, result);
+                    }
+                }
+            }
+        }
+        fn paths<'a>(shape: &'a egui::Shape, result: &mut Vec<&'a str>) {
+            match shape {
+                egui::Shape::Text(shape) if shape.galley.job.text.starts_with("/tooltip/") => {
+                    result.push(&shape.galley.job.text);
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        paths(shape, result);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut data = snapshot();
+        for (index, file) in data.files.iter_mut().enumerate() {
+            file.size = 100;
+            let name = if index == 0 {
+                "long_movie_name_".repeat(8)
+            } else {
+                format!("short_{index}")
+            };
+            file.path = format!("/tooltip/{name}.mov").into();
+            file.parent = "/tooltip".into();
+        }
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.data = Some(Arc::new(data));
+        settle(&mut app, &ctx);
+        let canvas = app.canvas_rect.unwrap();
+        let map = &app.map_cache.as_ref().unwrap().map;
+        let points: Vec<_> = (0..3)
+            .map(|index| {
+                let rect = map.rect(index).unwrap();
+                canvas.min
+                    + Vec2::new(
+                        (rect.x + rect.w * 0.5) * canvas.width() / map.bounds.w,
+                        (rect.y + rect.h * 0.5) * canvas.height() / map.bounds.h,
+                    )
+            })
+            .collect();
+        let start = ctx.input(|input| input.time);
+        let mut list_points = Vec::new();
+        let mut heights = Vec::new();
+        // Warm up the first Area sizing pass, then alternate long/short files,
+        // leave the canvas, and move across list rows and back to the canvas.
+        for (step, hovered) in [
+            Some(0),
+            Some(0),
+            Some(1),
+            Some(0),
+            Some(1),
+            None,
+            Some(0),
+            Some(0),
+            Some(1),
+            Some(1),
+            Some(2),
+            Some(2),
+            None,
+            Some(1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let point = match (step, hovered) {
+                (6..=11, Some(index)) => list_points[index],
+                (_, Some(index)) => points[index],
+                _ => egui::pos2(1.0, 1.0),
+            };
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(1180.0, 780.0),
+                    )),
+                    time: Some(start + (step + 1) as f64 * 0.01),
+                    events: vec![egui::Event::PointerMoved(point)],
+                    ..Default::default()
+                },
+                |ctx| app.ui(ctx),
+            );
+            if list_points.is_empty() {
+                list_points = app
+                    .data
+                    .as_ref()
+                    .unwrap()
+                    .files
+                    .iter()
+                    .map(|file| {
+                        let name = file.path.file_name().unwrap().to_string_lossy();
+                        text_shape(&output, &name).0.pos + Vec2::splat(3.0)
+                    })
+                    .collect();
+            }
+            let mut frame_rects = Vec::new();
+            let mut tooltip_paths = Vec::new();
+            for shape in &output.shapes {
+                frames(&shape.shape, &mut frame_rects);
+                paths(&shape.shape, &mut tooltip_paths);
+            }
+            assert!(
+                frame_rects.len() <= 1,
+                "step {step}: multiple file tooltips painted"
+            );
+            if (1..=4).contains(&step) || [7, 9, 11, 13].contains(&step) {
+                assert_eq!(frame_rects.len(), 1, "step {step}: current tooltip missing");
+                assert_eq!(tooltip_paths.len(), 1);
+                if step <= 4 {
+                    heights.push(frame_rects[0].1.height());
+                }
+            }
+            if let Some(index) = hovered {
+                for path in tooltip_paths {
+                    assert_eq!(
+                        path,
+                        app.data.as_ref().unwrap().files[index]
+                            .path
+                            .to_str()
+                            .unwrap(),
+                        "step {step}: non-hovered file tooltip painted"
+                    );
+                }
+            } else {
+                assert!(
+                    frame_rects.is_empty(),
+                    "unhovered files must not create tooltips"
+                );
+            }
+            for (shadow, body) in frame_rects {
+                let token = ctx.style().visuals.popup_shadow;
+                let offset = Vec2::new(token.offset[0] as f32, token.offset[1] as f32);
+                assert_eq!(shadow, body.translate(offset).expand(token.spread as f32));
+            }
+        }
+        assert!(heights[0] > heights[1]);
+        assert_eq!(heights[0], heights[2]);
+        assert_eq!(heights[1], heights[3]);
     }
 
     #[test]
