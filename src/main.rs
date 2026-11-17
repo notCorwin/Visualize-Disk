@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
+mod directory_map;
 mod file_actions;
 mod file_list;
 mod permission;
@@ -376,44 +377,21 @@ fn layout_snapshot(
             }
             Ok(a)
         });
-    let groups: Vec<_> = grouped.ok()?.into_iter().collect();
-    if token.load(Ordering::Relaxed) != generation {
-        return None;
-    }
-    let weights: Vec<_> = groups
-        .par_iter()
-        .enumerate()
-        .map(|(i, (_, files))| (i, files.iter().fold(0u64, |n, (_, s)| n.saturating_add(*s))))
-        .collect();
     let bounds = treemap::Rect {
         x: 0.0,
         y: 0.0,
         w: key.logical_size.x,
         h: key.logical_size.y,
     };
-    let group_bounds = treemap::layout_with_cancel(&weights, bounds, token, generation)?;
-    let pieces: Result<Vec<Vec<render::RenderEntry>>, ()> = group_bounds
-        .into_par_iter()
-        .map(|(i, bounds)| {
-            if token.load(Ordering::Relaxed) != generation {
-                return Err(());
-            }
-            let (path, files) = &groups[i];
-            let c = color(path);
-            Ok(
-                treemap::layout_with_cancel(files, bounds, token, generation)
-                    .ok_or(())?
-                    .into_iter()
-                    .map(|(id, rect)| render::RenderEntry { id, rect, color: c })
-                    .collect(),
-            )
-        })
-        .collect();
-    let entries = pieces.ok()?.into_iter().flatten().collect();
-    if token.load(Ordering::Relaxed) != generation {
-        return None;
-    }
-    render::RenderMap::build_with_size(entries, bounds, key.physical_size, token, generation)
+    let (entries, surfaces) = directory_map::layout(grouped.ok()?, bounds, token, generation)?;
+    render::RenderMap::build_with_surfaces(
+        entries,
+        surfaces,
+        bounds,
+        key.physical_size,
+        token,
+        generation,
+    )
 }
 
 struct Job {

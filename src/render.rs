@@ -9,15 +9,41 @@ const MAX_SIDE: usize = 2048;
 const BAND_ROWS: usize = 128;
 const NONE: u32 = u32::MAX;
 const BACKGROUND: Color32 = Color32::from_rgb(19, 23, 29);
-const SHADE_LIGHT: f64 = 1.08;
-const SHADE_X: f64 = 0.14;
-const SHADE_Y: f64 = 0.10;
+/// Accumulated derivative coefficients of ancestor cushions in world space.
+/// Only directories store these; files reference a shared surface by index.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Surface {
+    slope: [f64; 2],
+    curvature: [f64; 2],
+}
+
+impl Surface {
+    pub fn cushion(mut self, rect: Rect, strength: f64) -> Self {
+        let shortest = (rect.w as f64).min(rect.h as f64);
+        for (axis, (origin, length)) in [(rect.x, rect.w), (rect.y, rect.h)].into_iter().enumerate()
+        {
+            let amplitude = strength * shortest / length as f64;
+            let curvature = -2.0 * amplitude / length as f64;
+            self.curvature[axis] += curvature;
+            self.slope[axis] += amplitude - curvature * origin as f64;
+        }
+        self
+    }
+
+    fn gradient(self, x: f64, y: f64) -> [f64; 2] {
+        [
+            self.slope[0] + self.curvature[0] * x,
+            self.slope[1] + self.curvature[1] * y,
+        ]
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct RenderEntry {
     pub id: usize,
     pub rect: Rect,
     pub color: Color32,
+    pub surface: u32,
 }
 
 pub struct RenderRaster {
@@ -51,6 +77,8 @@ pub struct RenderMap {
     pub image: Option<ColorImage>,
     pub bounds: Rect,
     entries: Vec<RenderEntry>,
+    #[cfg(test)]
+    surfaces: Vec<Surface>,
     by_id: Vec<u32>,
     base: RenderRaster,
 }
@@ -76,8 +104,27 @@ impl RenderMap {
 
     /// Keep logical geometry and physical pixel dimensions separate for HiDPI
     /// windows. The same raster owns both the displayed pixels and hit map.
+    #[cfg(test)]
     pub fn build_with_size(
         entries: Vec<RenderEntry>,
+        bounds: Rect,
+        size: [usize; 2],
+        token: &AtomicU64,
+        generation: u64,
+    ) -> Option<Self> {
+        Self::build_with_surfaces(
+            entries,
+            vec![Surface::default()],
+            bounds,
+            size,
+            token,
+            generation,
+        )
+    }
+
+    pub fn build_with_surfaces(
+        entries: Vec<RenderEntry>,
+        surfaces: Vec<Surface>,
         bounds: Rect,
         size: [usize; 2],
         token: &AtomicU64,
@@ -91,17 +138,22 @@ impl RenderMap {
             if index % 4096 == 0 && cancelled(token, generation) {
                 return None;
             }
-            if entry.id >= by_id.len() || index >= NONE as usize {
+            if entry.id >= by_id.len()
+                || index >= NONE as usize
+                || entry.surface as usize >= surfaces.len()
+            {
                 return None;
             }
             by_id[entry.id] = index as u32;
         }
-        let mut base = rasterize(&entries, bounds, size, token, generation)?;
+        let mut base = rasterize(&entries, &surfaces, bounds, size, token, generation)?;
         let image = base.image.take();
         Some(Self {
             image,
             bounds,
             entries,
+            #[cfg(test)]
+            surfaces,
             by_id,
             base,
         })
@@ -187,7 +239,7 @@ impl RenderMap {
         token: &AtomicU64,
         generation: u64,
     ) -> Option<RenderRaster> {
-        rasterize(&self.entries, view, size, token, generation)
+        rasterize(&self.entries, &self.surfaces, view, size, token, generation)
     }
 }
 
@@ -199,9 +251,8 @@ struct Draw {
     y0: u16,
     y1: u16,
     color: Color32,
-    shade: f32,
-    shade_dx: f32,
-    shade_dy: f32,
+    gradient: [f32; 2],
+    gradient_step: [f32; 2],
 }
 
 fn valid(rect: Rect) -> bool {
@@ -225,6 +276,7 @@ fn dimensions(requested: [usize; 2]) -> [usize; 2] {
 
 fn rasterize(
     entries: &[RenderEntry],
+    surfaces: &[Surface],
     view: Rect,
     requested: [usize; 2],
     token: &AtomicU64,
@@ -256,8 +308,6 @@ fn rasterize(
         // Sample pixel centres: small files never become artificial minimum-size
         // blocks that overwrite their neighbours. Every drawn pixel has exactly
         // one original file id; further zoom renders finer original rectangles.
-        // Fill the complete file rectangle. A subtle luminance ramp restarts
-        // per file, separating same-colour neighbours without black gutters.
         let x0 = (((r.x - view.x) * sx - 0.5).ceil().max(0.0) as usize).min(width);
         let x1 = ((((r.x + r.w) - view.x) * sx - 0.5).ceil().max(0.0) as usize).min(width);
         let y0 = (((r.y - view.y) * sy - 0.5).ceil().max(0.0) as usize).min(height);
@@ -265,12 +315,17 @@ fn rasterize(
         if x1 <= x0 || y1 <= y0 {
             continue;
         }
+        // Ancestor surfaces are cached per directory. A small file cushion
+        // separates neighbouring files without gutters or changes to ownership.
+        let surface = surfaces[entry.surface as usize].cushion(r, 0.48);
         for band in y0 / BAND_ROWS..=(y1 - 1) / BAND_ROWS {
             let band_y0 = y0.max(band * BAND_ROWS);
-            // Anchor shading to the original full file, never the viewport or
-            // clipped band. f64 subtraction avoids cancellation on tiny files.
-            let u = (view.x as f64 - r.x as f64 + (x0 as f64 + 0.5) / sx as f64) / r.w as f64;
-            let v = (view.y as f64 - r.y as f64 + (band_y0 as f64 + 0.5) / sy as f64) / r.h as f64;
+            // Evaluate the original world surface, independent of viewport,
+            // HiDPI sampling or the boundary of a parallel raster band.
+            let gradient = surface.gradient(
+                view.x as f64 + (x0 as f64 + 0.5) / sx as f64,
+                view.y as f64 + (band_y0 as f64 + 0.5) / sy as f64,
+            );
             bands[band].push(Draw {
                 id: entry.id as u32,
                 x0: x0 as u16,
@@ -278,9 +333,11 @@ fn rasterize(
                 y0: band_y0 as u16,
                 y1: y1.min((band + 1) * BAND_ROWS) as u16,
                 color: entry.color,
-                shade: (SHADE_LIGHT - SHADE_X * u - SHADE_Y * v) as f32,
-                shade_dx: (-SHADE_X / (sx as f64 * r.w as f64)) as f32,
-                shade_dy: (-SHADE_Y / (sy as f64 * r.h as f64)) as f32,
+                gradient: gradient.map(|value| value as f32),
+                gradient_step: [
+                    (surface.curvature[0] / sx as f64) as f32,
+                    (surface.curvature[1] / sy as f64) as f32,
+                ],
             });
         }
     }
@@ -302,9 +359,15 @@ fn rasterize(
                 for y in draw.y0 as usize..draw.y1 as usize {
                     let start = (y - band * BAND_ROWS) * width + draw.x0 as usize;
                     let end = start + (draw.x1 - draw.x0) as usize;
-                    let row_shade = draw.shade + (y - draw.y0 as usize) as f32 * draw.shade_dy;
+                    let gy =
+                        draw.gradient[1] + (y - draw.y0 as usize) as f32 * draw.gradient_step[1];
                     for (offset, pixel) in pixels[start..end].iter_mut().enumerate() {
-                        let shade = (row_shade + offset as f32 * draw.shade_dx).clamp(0.84, 1.08);
+                        let gx = draw.gradient[0] + offset as f32 * draw.gradient_step[0];
+                        // Lambert lighting with a fixed upper-left light and
+                        // ambient fill: a shallow relief, never black valleys.
+                        let diffuse =
+                            (0.4082483 * (gx + gy) + 0.8164966) / (1.0 + gx * gx + gy * gy).sqrt();
+                        let shade = 0.30 + 0.90 * diffuse.max(0.0);
                         let alpha = draw.color.a();
                         let channel =
                             |value: u8| (value as f32 * shade).round().min(alpha as f32) as u8;
@@ -342,16 +405,19 @@ mod tests {
                 id: 0,
                 rect: rect(0.0, 0.0, 50.0, 100.0),
                 color: Color32::RED,
+                surface: 0,
             },
             RenderEntry {
                 id: 1,
                 rect: rect(50.0, 0.0, 49.999, 100.0),
                 color: Color32::BLUE,
+                surface: 0,
             },
             RenderEntry {
                 id: 2,
                 rect: rect(99.999, 0.0, 0.001, 100.0),
                 color: Color32::GREEN,
+                surface: 0,
             },
         ]
     }
@@ -400,6 +466,7 @@ mod tests {
                 id: 0,
                 rect: rect(0.0, 0.0, 2048.0, 2048.0),
                 color: Color32::RED,
+                surface: 0,
             }],
             rect(0.0, 0.0, 2048.0, 2048.0),
             [2048, 2048],
@@ -441,11 +508,13 @@ mod tests {
                 id: 0,
                 rect: rect(0.0, 0.0, 50.0, 100.0),
                 color: base,
+                surface: 0,
             },
             RenderEntry {
                 id: 1,
                 rect: rect(50.0, 0.0, 50.0, 100.0),
                 color: base,
+                surface: 0,
             },
         ];
         let map = RenderMap::build(entries, rect(0.0, 0.0, 100.0, 100.0), &token, 1).unwrap();
@@ -505,6 +574,7 @@ mod tests {
                     id,
                     rect,
                     color: Color32::from_rgb(65, 143, 151),
+                    surface: 0,
                 })
                 .collect();
             let map = RenderMap::build_with_size(entries, bounds, size, &token, 1).unwrap();
@@ -522,6 +592,7 @@ mod tests {
                 id: 0,
                 rect: rect(0.0, 0.0, 64.0, 300.0),
                 color: Color32::from_rgb(65, 143, 151),
+                surface: 0,
             }],
             rect(0.0, 0.0, 64.0, 300.0),
             &token,
@@ -590,6 +661,7 @@ mod tests {
                 } else {
                     Color32::GREEN
                 },
+                surface: 0,
             })
             .collect();
         let token = AtomicU64::new(1);
