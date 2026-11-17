@@ -9,33 +9,113 @@ const MAX_SIDE: usize = 2048;
 const BAND_ROWS: usize = 128;
 const NONE: u32 = u32::MAX;
 const BACKGROUND: Color32 = Color32::from_rgb(19, 23, 29);
-/// Accumulated derivative coefficients of ancestor cushions in world space.
-/// Only directories store these; files reference a shared surface by index.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Surface {
-    slope: [f64; 2],
-    curvature: [f64; 2],
+// Logical-point design tokens for the shared platform material.
+const MIN_PLATFORM_SIDE: f32 = 28.0;
+const MIN_PLATFORM_AREA: f32 = 1800.0;
+const MAX_SHOULDER: f32 = 18.0;
+const MAX_RISE: f32 = 8.0;
+const FILE_SHADE_LIGHT: f64 = 1.12;
+const FILE_SHADE_X: f64 = 0.065;
+const FILE_SHADE_Y: f64 = 0.045;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Platform {
+    pub bounds: Rect,
+    pub top: Rect,
+    pub content: Rect,
+    pub color: Color32,
+    rise: f32,
+    bevel: f32,
 }
 
-impl Surface {
-    pub fn cushion(mut self, rect: Rect, strength: f64) -> Self {
-        let shortest = (rect.w as f64).min(rect.h as f64);
-        for (axis, (origin, length)) in [(rect.x, rect.w), (rect.y, rect.h)].into_iter().enumerate()
-        {
-            let amplitude = strength * shortest / length as f64;
-            let curvature = -2.0 * amplitude / length as f64;
-            self.curvature[axis] += curvature;
-            self.slope[axis] += amplitude - curvature * origin as f64;
+impl Platform {
+    pub fn new(bounds: Rect, color: Color32) -> Option<Self> {
+        let side = bounds.w.min(bounds.h);
+        if !valid(bounds) || side < MIN_PLATFORM_SIDE || bounds.w * bounds.h < MIN_PLATFORM_AREA {
+            return None;
         }
-        self
+        let gap = (side * 0.012).clamp(0.8, 2.0);
+        let rise = (side * 0.045).clamp(2.5, MAX_RISE);
+        let top = Rect {
+            x: bounds.x + gap,
+            y: bounds.y + gap,
+            w: bounds.w - gap * 2.0 - rise * 0.25,
+            h: bounds.h - gap * 2.0 - rise,
+        };
+        let shoulder = (side * 0.065).clamp(3.0, MAX_SHOULDER);
+        let content = Rect {
+            x: top.x + shoulder,
+            y: top.y + shoulder,
+            w: top.w - shoulder * 2.0,
+            h: top.h - shoulder * 2.0,
+        };
+        Some(Self {
+            bounds,
+            top,
+            content,
+            color,
+            rise,
+            bevel: (rise * 0.42).max(1.0),
+        })
     }
 
-    fn gradient(self, x: f64, y: f64) -> [f64; 2] {
-        [
-            self.slope[0] + self.curvature[0] * x,
-            self.slope[1] + self.curvature[1] * y,
-        ]
+    // Returns material only inside this allocation. Shadows never obscure a
+    // neighbouring file; every exposed shoulder/side keeps a NONE owner.
+    fn sample(self, x: f32, y: f32) -> Option<Color32> {
+        let r = self.top;
+        if x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h {
+            let left = x - r.x;
+            let upper = y - r.y;
+            let right = r.x + r.w - x;
+            let bottom = r.y + r.h - y;
+            let material = 1.055 - 0.07 * upper / r.h - 0.025 * left / r.w;
+            // Continuous chamfer lighting reads as a physical surface rather
+            // than a one-pixel frame around a flat rectangle.
+            let smooth = |distance: f32| {
+                let t = (1.0 - distance / self.bevel).clamp(0.0, 1.0);
+                t * t * (3.0 - 2.0 * t)
+            };
+            let shade = material + 0.18 * smooth(upper) + 0.11 * smooth(left)
+                - 0.20 * smooth(bottom)
+                - 0.13 * smooth(right);
+            return Some(shaded(self.color, shade));
+        }
+        let dx = self.rise * 0.25;
+        if y >= r.y + r.h && y < r.y + r.h + self.rise {
+            let f = (y - r.y - r.h) / self.rise;
+            if x >= r.x + dx * f && x < r.x + r.w + dx * f {
+                return Some(shaded(self.color, 0.75 - 0.12 * f));
+            }
+        }
+        if x >= r.x + r.w && x < r.x + r.w + dx {
+            let f = (x - r.x - r.w) / dx;
+            if y >= r.y + self.rise * f && y < r.y + r.h + self.rise * f {
+                return Some(shaded(self.color, 0.66 - 0.07 * f));
+            }
+        }
+        // Premultiplied contact shadow blends with the already-painted parent
+        // material instead of cutting a black outline into its shoulder.
+        let distance = (x - r.x - r.w - dx)
+            .max(0.0)
+            .max((y - r.y - r.h - self.rise).max(0.0));
+        if x >= r.x && y >= r.y && distance < 2.0 {
+            return Some(Color32::from_black_alpha(
+                (70.0 * (1.0 - distance / 2.0)) as u8,
+            ));
+        }
+        None
     }
+}
+
+fn shaded(color: Color32, shade: f32) -> Color32 {
+    let alpha = color.a();
+    let channel = |v: u8| (v as f32 * shade).round().min(alpha as f32) as u8;
+    Color32::from_rgba_premultiplied(
+        channel(color.r()),
+        channel(color.g()),
+        channel(color.b()),
+        alpha,
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -43,7 +123,6 @@ pub struct RenderEntry {
     pub id: usize,
     pub rect: Rect,
     pub color: Color32,
-    pub surface: u32,
 }
 
 pub struct RenderRaster {
@@ -78,7 +157,7 @@ pub struct RenderMap {
     pub bounds: Rect,
     entries: Vec<RenderEntry>,
     #[cfg(test)]
-    surfaces: Vec<Surface>,
+    platforms: Vec<Platform>,
     by_id: Vec<u32>,
     base: RenderRaster,
 }
@@ -112,19 +191,12 @@ impl RenderMap {
         token: &AtomicU64,
         generation: u64,
     ) -> Option<Self> {
-        Self::build_with_surfaces(
-            entries,
-            vec![Surface::default()],
-            bounds,
-            size,
-            token,
-            generation,
-        )
+        Self::build_with_platforms(entries, Vec::new(), bounds, size, token, generation)
     }
 
-    pub fn build_with_surfaces(
+    pub fn build_with_platforms(
         entries: Vec<RenderEntry>,
-        surfaces: Vec<Surface>,
+        platforms: Vec<Platform>,
         bounds: Rect,
         size: [usize; 2],
         token: &AtomicU64,
@@ -138,22 +210,19 @@ impl RenderMap {
             if index % 4096 == 0 && cancelled(token, generation) {
                 return None;
             }
-            if entry.id >= by_id.len()
-                || index >= NONE as usize
-                || entry.surface as usize >= surfaces.len()
-            {
+            if entry.id >= by_id.len() || index >= NONE as usize {
                 return None;
             }
             by_id[entry.id] = index as u32;
         }
-        let mut base = rasterize(&entries, &surfaces, bounds, size, token, generation)?;
+        let mut base = rasterize(&entries, &platforms, bounds, size, token, generation)?;
         let image = base.image.take();
         Some(Self {
             image,
             bounds,
             entries,
             #[cfg(test)]
-            surfaces,
+            platforms,
             by_id,
             base,
         })
@@ -162,6 +231,16 @@ impl RenderMap {
     pub fn rect(&self, id: usize) -> Option<Rect> {
         let index = *self.by_id.get(id)?;
         (index != NONE).then(|| self.entries[index as usize].rect)
+    }
+
+    #[cfg(test)]
+    pub fn platform_count(&self) -> usize {
+        self.platforms.len()
+    }
+
+    pub fn color(&self, id: usize) -> Option<Color32> {
+        let index = *self.by_id.get(id)?;
+        (index != NONE).then(|| self.entries[index as usize].color)
     }
 
     pub fn hit_test(&self, x: f32, y: f32) -> Option<usize> {
@@ -239,7 +318,14 @@ impl RenderMap {
         token: &AtomicU64,
         generation: u64,
     ) -> Option<RenderRaster> {
-        rasterize(&self.entries, &self.surfaces, view, size, token, generation)
+        rasterize(
+            &self.entries,
+            &self.platforms,
+            view,
+            size,
+            token,
+            generation,
+        )
     }
 }
 
@@ -251,8 +337,8 @@ struct Draw {
     y0: u16,
     y1: u16,
     color: Color32,
-    gradient: [f32; 2],
-    gradient_step: [f32; 2],
+    shade: f32,
+    shade_step: [f32; 2],
 }
 
 fn valid(rect: Rect) -> bool {
@@ -276,7 +362,7 @@ fn dimensions(requested: [usize; 2]) -> [usize; 2] {
 
 fn rasterize(
     entries: &[RenderEntry],
-    surfaces: &[Surface],
+    platforms: &[Platform],
     view: Rect,
     requested: [usize; 2],
     token: &AtomicU64,
@@ -315,17 +401,10 @@ fn rasterize(
         if x1 <= x0 || y1 <= y0 {
             continue;
         }
-        // Ancestor surfaces are cached per directory. A small file cushion
-        // separates neighbouring files without gutters or changes to ownership.
-        let surface = surfaces[entry.surface as usize].cushion(r, 0.48);
         for band in y0 / BAND_ROWS..=(y1 - 1) / BAND_ROWS {
             let band_y0 = y0.max(band * BAND_ROWS);
-            // Evaluate the original world surface, independent of viewport,
-            // HiDPI sampling or the boundary of a parallel raster band.
-            let gradient = surface.gradient(
-                view.x as f64 + (x0 as f64 + 0.5) / sx as f64,
-                view.y as f64 + (band_y0 as f64 + 0.5) / sy as f64,
-            );
+            let u = (view.x as f64 - r.x as f64 + (x0 as f64 + 0.5) / sx as f64) / r.w as f64;
+            let v = (view.y as f64 - r.y as f64 + (band_y0 as f64 + 0.5) / sy as f64) / r.h as f64;
             bands[band].push(Draw {
                 id: entry.id as u32,
                 x0: x0 as u16,
@@ -333,10 +412,10 @@ fn rasterize(
                 y0: band_y0 as u16,
                 y1: y1.min((band + 1) * BAND_ROWS) as u16,
                 color: entry.color,
-                gradient: gradient.map(|value| value as f32),
-                gradient_step: [
-                    (surface.curvature[0] / sx as f64) as f32,
-                    (surface.curvature[1] / sy as f64) as f32,
+                shade: (FILE_SHADE_LIGHT - FILE_SHADE_X * u - FILE_SHADE_Y * v) as f32,
+                shade_step: [
+                    (-FILE_SHADE_X / (sx as f64 * r.w as f64)) as f32,
+                    (-FILE_SHADE_Y / (sy as f64 * r.h as f64)) as f32,
                 ],
             });
         }
@@ -344,14 +423,66 @@ fn rasterize(
     if cancelled(token, generation) {
         return None;
     }
+    let mut platform_bands: Vec<Vec<(Platform, [usize; 4])>> = (0..height.div_ceil(BAND_ROWS))
+        .map(|_| Vec::new())
+        .collect();
+    for (index, &platform) in platforms.iter().enumerate() {
+        if index % 1024 == 0 && cancelled(token, generation) {
+            return None;
+        }
+        let r = platform.bounds;
+        let x0 = (((r.x - view.x) * sx - 0.5).ceil().max(0.0) as usize).min(width);
+        let x1 = ((((r.x + r.w) - view.x) * sx - 0.5).ceil().max(0.0) as usize).min(width);
+        let y0 = (((r.y - view.y) * sy - 0.5).ceil().max(0.0) as usize).min(height);
+        let y1 = ((((r.y + r.h) - view.y) * sy - 0.5).ceil().max(0.0) as usize).min(height);
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+        for band in y0 / BAND_ROWS..=(y1 - 1) / BAND_ROWS {
+            platform_bands[band].push((
+                platform,
+                [
+                    x0,
+                    x1,
+                    y0.max(band * BAND_ROWS),
+                    y1.min((band + 1) * BAND_ROWS),
+                ],
+            ));
+        }
+    }
     let mut pixels = vec![BACKGROUND; width * height];
     let mut owners = vec![NONE; width * height];
     pixels
         .par_chunks_mut(width * BAND_ROWS)
         .zip(owners.par_chunks_mut(width * BAND_ROWS))
         .zip(bands.into_par_iter())
+        .zip(platform_bands.into_par_iter())
         .enumerate()
-        .for_each(|(band, ((pixels, owners), draws))| {
+        .for_each(|(band, (((pixels, owners), draws), platforms))| {
+            for (platform, [x0, x1, y0, y1]) in platforms {
+                if cancelled(token, generation) {
+                    return;
+                }
+                for y in y0..y1 {
+                    let world_y = view.y + (y as f32 + 0.5) / sy;
+                    for x in x0..x1 {
+                        let world_x = view.x + (x as f32 + 0.5) / sx;
+                        if let Some(color) = platform.sample(world_x, world_y) {
+                            let pixel = &mut pixels[(y - band * BAND_ROWS) * width + x];
+                            let inverse = 255 - color.a() as u16;
+                            let blend = |front: u8, back: u8| {
+                                (front as u16 + (back as u16 * inverse + 127) / 255).min(255) as u8
+                            };
+                            *pixel = Color32::from_rgba_premultiplied(
+                                blend(color.r(), pixel.r()),
+                                blend(color.g(), pixel.g()),
+                                blend(color.b(), pixel.b()),
+                                255,
+                            );
+                        }
+                    }
+                }
+            }
             for (index, draw) in draws.into_iter().enumerate() {
                 if index % 4096 == 0 && cancelled(token, generation) {
                     return;
@@ -359,24 +490,9 @@ fn rasterize(
                 for y in draw.y0 as usize..draw.y1 as usize {
                     let start = (y - band * BAND_ROWS) * width + draw.x0 as usize;
                     let end = start + (draw.x1 - draw.x0) as usize;
-                    let gy =
-                        draw.gradient[1] + (y - draw.y0 as usize) as f32 * draw.gradient_step[1];
+                    let row_shade = draw.shade + (y - draw.y0 as usize) as f32 * draw.shade_step[1];
                     for (offset, pixel) in pixels[start..end].iter_mut().enumerate() {
-                        let gx = draw.gradient[0] + offset as f32 * draw.gradient_step[0];
-                        // Lambert lighting with a fixed upper-left light and
-                        // ambient fill: a shallow relief, never black valleys.
-                        let diffuse =
-                            (0.4082483 * (gx + gy) + 0.8164966) / (1.0 + gx * gx + gy * gy).sqrt();
-                        let shade = 0.30 + 0.90 * diffuse.max(0.0);
-                        let alpha = draw.color.a();
-                        let channel =
-                            |value: u8| (value as f32 * shade).round().min(alpha as f32) as u8;
-                        *pixel = Color32::from_rgba_premultiplied(
-                            channel(draw.color.r()),
-                            channel(draw.color.g()),
-                            channel(draw.color.b()),
-                            alpha,
-                        );
+                        *pixel = shaded(draw.color, row_shade + offset as f32 * draw.shade_step[0]);
                     }
                     owners[start..end].fill(draw.id);
                 }
@@ -405,22 +521,69 @@ mod tests {
                 id: 0,
                 rect: rect(0.0, 0.0, 50.0, 100.0),
                 color: Color32::RED,
-                surface: 0,
             },
             RenderEntry {
                 id: 1,
                 rect: rect(50.0, 0.0, 49.999, 100.0),
                 color: Color32::BLUE,
-                surface: 0,
             },
             RenderEntry {
                 id: 2,
                 rect: rect(99.999, 0.0, 0.001, 100.0),
                 color: Color32::GREEN,
-                surface: 0,
             },
         ]
     }
+    #[test]
+    fn platform_shoulders_and_sides_are_material_without_file_owners() {
+        let token = AtomicU64::new(1);
+        let platform = Platform::new(
+            rect(0.0, 0.0, 100.0, 100.0),
+            Color32::from_rgb(70, 145, 150),
+        )
+        .unwrap();
+        let entry = RenderEntry {
+            id: 0,
+            rect: platform.content,
+            color: platform.color,
+        };
+        let mut map = RenderMap::build_with_platforms(
+            vec![entry],
+            vec![platform],
+            platform.bounds,
+            [200, 200],
+            &token,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            map.hit_test(platform.top.x + 0.5, platform.top.y + 0.5),
+            None
+        );
+        assert_eq!(
+            map.hit_test(50.0, platform.top.y + platform.top.h + 1.0),
+            None
+        );
+        assert_eq!(map.hit_test(50.0, 50.0), Some(0));
+        let highlight = platform
+            .sample(platform.top.x + 5.0, platform.top.y + 0.1)
+            .unwrap();
+        let side = platform
+            .sample(50.0, platform.top.y + platform.top.h + 1.0)
+            .unwrap();
+        assert!(highlight.g() > side.g() + 60);
+        let before = map.image.as_ref().unwrap().pixels.clone();
+        let holes = map.erase(0);
+        assert_eq!(map.hit_test(50.0, 50.0), None);
+        assert!(!holes.is_empty());
+        assert!(
+            holes
+                .iter()
+                .all(|hole| hole.x >= entry.rect.x - 0.5 && hole.y >= entry.rect.y - 0.5)
+        );
+        assert_eq!(map.image.as_ref().unwrap().pixels, before);
+    }
+
     #[test]
     fn erase_masks_only_owned_pixels_at_hidpi_and_subpixel_boundaries() {
         let token = AtomicU64::new(1);
@@ -466,7 +629,6 @@ mod tests {
                 id: 0,
                 rect: rect(0.0, 0.0, 2048.0, 2048.0),
                 color: Color32::RED,
-                surface: 0,
             }],
             rect(0.0, 0.0, 2048.0, 2048.0),
             [2048, 2048],
@@ -508,13 +670,11 @@ mod tests {
                 id: 0,
                 rect: rect(0.0, 0.0, 50.0, 100.0),
                 color: base,
-                surface: 0,
             },
             RenderEntry {
                 id: 1,
                 rect: rect(50.0, 0.0, 50.0, 100.0),
                 color: base,
-                surface: 0,
             },
         ];
         let map = RenderMap::build(entries, rect(0.0, 0.0, 100.0, 100.0), &token, 1).unwrap();
@@ -526,7 +686,7 @@ mod tests {
             }
         }
         assert_eq!(pixels[20 * 100 + 10], pixels[20 * 100 + 60]);
-        assert!(pixels[50 * 100 + 50].g() > pixels[50 * 100 + 49].g() + 15);
+        assert!(pixels[50 * 100 + 50].g() > pixels[50 * 100 + 49].g() + 5);
         assert!(pixels[10 * 100 + 10].g() > pixels[90 * 100 + 40].g());
     }
     #[test]
@@ -574,7 +734,6 @@ mod tests {
                     id,
                     rect,
                     color: Color32::from_rgb(65, 143, 151),
-                    surface: 0,
                 })
                 .collect();
             let map = RenderMap::build_with_size(entries, bounds, size, &token, 1).unwrap();
@@ -592,7 +751,6 @@ mod tests {
                 id: 0,
                 rect: rect(0.0, 0.0, 64.0, 300.0),
                 color: Color32::from_rgb(65, 143, 151),
-                surface: 0,
             }],
             rect(0.0, 0.0, 64.0, 300.0),
             &token,
@@ -661,7 +819,6 @@ mod tests {
                 } else {
                     Color32::GREEN
                 },
-                surface: 0,
             })
             .collect();
         let token = AtomicU64::new(1);

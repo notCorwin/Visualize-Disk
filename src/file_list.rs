@@ -1,6 +1,6 @@
 use crate::scan::FileEntry;
 use eframe::egui::{self, Color32, FontId, Rect, Sense, Vec2};
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 // Keep height bookkeeping proportional to recently viewed rows, never the disk.
 const MAX_MEASURED_ROWS: usize = 512;
@@ -142,7 +142,7 @@ impl WrappedFileList {
         files: &[FileEntry],
         indices: &[usize],
         selected: Option<usize>,
-        color: impl Fn(&Path) -> Color32,
+        color: impl Fn(usize) -> Color32,
     ) -> Option<usize> {
         let key = Self::key(
             ui,
@@ -194,7 +194,7 @@ impl WrappedFileList {
                 ),
                 Vec2::splat(MARKER),
             );
-            ui.painter().rect_filled(marker, 2.0, color(&file.parent));
+            ui.painter().rect_filled(marker, 2.0, color(id));
             let text_x = rect.left() + PADDING + MARKER + MARKER_GAP;
             ui.painter()
                 .galley(egui::pos2(text_x, rect.top() + PADDING), name, crate::TEXT);
@@ -331,6 +331,7 @@ impl WrappedFileList {
 mod tests {
     use super::*;
     use crate::scan::FileIdentity;
+    use std::path::Path;
 
     fn context() -> egui::Context {
         let ctx = egui::Context::default();

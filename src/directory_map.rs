@@ -1,35 +1,40 @@
-//! Directory nesting and shared cushion surfaces for the cached file map.
+//! Nested directory platforms for the cached, top-down terrace map.
 use crate::{
-    render::{RenderEntry, Surface},
+    render::{Platform, RenderEntry},
     treemap::{self, Rect},
 };
+use eframe::egui::Color32;
 use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, HashMap},
-    path::{Path, PathBuf},
+    path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
 
 #[derive(Default)]
-struct Directory {
+struct Directory<'a> {
+    path: Option<&'a Path>,
     parent: usize,
     children: Vec<usize>,
     files: Vec<(usize, u64)>,
     weight: u64,
-    color: eframe::egui::Color32,
+}
+
+pub struct DirectoryLayout {
+    pub entries: Vec<RenderEntry>,
+    pub platforms: Vec<Platform>,
 }
 
 pub fn layout(
     groups: BTreeMap<&Path, Vec<(usize, u64)>>,
+    root: &Path,
     bounds: Rect,
     token: &AtomicU64,
     generation: u64,
-) -> Option<(Vec<RenderEntry>, Vec<Surface>)> {
+) -> Option<DirectoryLayout> {
     let cancelled = || token.load(Ordering::Relaxed) != generation;
-    // A synthetic root also handles snapshots containing unrelated roots.
-    // Resolve ancestors only once per unique directory, never once per file.
     let mut directories = vec![Directory::default()];
-    let mut indices: HashMap<PathBuf, usize> = HashMap::new();
+    let mut indices: HashMap<&Path, usize> = HashMap::new();
     let mut file_count = 0;
     for (path, files) in groups {
         if cancelled() {
@@ -53,12 +58,12 @@ pub fn layout(
         for path in missing.into_iter().rev() {
             let id = directories.len();
             directories.push(Directory {
+                path: Some(path),
                 parent,
-                color: crate::color(path),
                 ..Default::default()
             });
             directories[parent].children.push(id);
-            indices.insert(path.to_path_buf(), id);
+            indices.insert(path, id);
             parent = id;
         }
         let mut weight = 0u64;
@@ -83,23 +88,47 @@ pub fn layout(
             .saturating_add(directories[id].weight);
     }
     let mut entries = Vec::with_capacity(file_count);
-    let mut surfaces = vec![Surface::default(); directories.len()];
-    // Iteration tolerates deeply nested paths. Unary chains add no new visual
-    // subdivision, so they do not accumulate identical cushions or consume depth.
-    let mut pending = vec![(0, bounds, 0i32, Surface::default())];
+    let mut platforms = Vec::new();
+    // Iterative breadth-first publication paints a whole parent before its
+    // children. Unary paths do not consume shoulder space or extra elevation.
+    let mut pending = vec![(0, bounds, None::<(Color32, u8)>)];
     while !pending.is_empty() {
         if cancelled() {
             return None;
         }
-        // Sibling directories share the global Rayon pool. Each task produces
-        // only its own geometry; publishing a generation stays all-or-nothing.
         let pieces: Option<Vec<_>> = pending
             .into_par_iter()
-            .map(|(id, bounds, depth, surface)| {
+            .map(|(id, bounds, inherited)| {
                 if cancelled() {
                     return None;
                 }
                 let directory = &directories[id];
+                let below_root = directory
+                    .path
+                    .is_some_and(|path| path != root && path.starts_with(root));
+                let (base_color, depth) =
+                    inherited.unwrap_or_else(|| (crate::color(directory.path.unwrap_or(root)), 0));
+                let factor = 1.0 + (depth as f32 * 0.035).min(0.14);
+                let channel = |v: u8| (v as f32 * factor).min(255.0) as u8;
+                let color = Color32::from_rgb(
+                    channel(base_color.r()),
+                    channel(base_color.g()),
+                    channel(base_color.b()),
+                );
+
+                let unary = directory.children.len() == 1 && directory.files.is_empty();
+                let platform = (below_root && !unary)
+                    .then(|| Platform::new(bounds, color))
+                    .flatten();
+                let content = platform.map_or(bounds, |platform| platform.content);
+                let family = if below_root {
+                    Some((
+                        base_color,
+                        depth.saturating_add(u8::from(platform.is_some())),
+                    ))
+                } else {
+                    None
+                };
                 let child_count = directory.children.len();
                 let mut items = Vec::with_capacity(child_count + directory.files.len());
                 for (slot, &child) in directory.children.iter().enumerate() {
@@ -114,8 +143,7 @@ pub fn layout(
                     }
                     items.push((child_count + slot, weight));
                 }
-                let divided = items.len() > 1;
-                let geometry = treemap::layout_with_cancel(&items, bounds, token, generation)?;
+                let geometry = treemap::layout_with_cancel(&items, content, token, generation)?;
                 let mut files = Vec::with_capacity(directory.files.len());
                 let mut children = Vec::with_capacity(child_count);
                 for (index, (slot, rect)) in geometry.into_iter().enumerate() {
@@ -123,48 +151,36 @@ pub fn layout(
                         return None;
                     }
                     if slot < child_count {
-                        let child = directory.children[slot];
-                        let inherited = if divided {
-                            surface.cushion(rect, 1.05 * 0.72f64.powi(depth))
-                        } else {
-                            surface
-                        };
-                        children.push((
-                            child,
-                            rect,
-                            depth.saturating_add(i32::from(divided)),
-                            inherited,
-                        ));
+                        children.push((directory.children[slot], rect, family));
                     } else {
                         files.push(RenderEntry {
                             id: directory.files[slot - child_count].0,
                             rect,
-                            color: directory.color,
-                            surface: id as u32,
+                            color,
                         });
                     }
                 }
-                Some((id, surface, files, children))
+                Some((files, children, platform))
             })
             .collect();
         pending = Vec::new();
-        for (id, surface, mut files, children) in pieces? {
+        for (mut files, children, platform) in pieces? {
             if cancelled() {
                 return None;
             }
-            surfaces[id] = surface;
             entries.append(&mut files);
             pending.extend(children);
+            if let Some(platform) = platform {
+                platforms.push(platform);
+            }
         }
     }
-    (!cancelled()).then_some((entries, surfaces))
+    (!cancelled()).then_some(DirectoryLayout { entries, platforms })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eframe::egui::Color32;
-
     fn bounds() -> Rect {
         Rect {
             x: 0.0,
@@ -173,143 +189,168 @@ mod tests {
             h: 760.0,
         }
     }
+    fn contains(a: Rect, b: Rect) -> bool {
+        b.x >= a.x && b.y >= a.y && b.x + b.w <= a.x + a.w + 0.01 && b.y + b.h <= a.y + a.h + 0.01
+    }
+    fn area(r: Rect) -> f32 {
+        r.w * r.h
+    }
 
     #[test]
-    fn descendants_form_contiguous_weighted_regions_without_losing_files() {
+    fn children_share_parent_material_and_fit_inside_weighted_platforms() {
         let token = AtomicU64::new(1);
-        let groups = BTreeMap::from([
-            (Path::new("/a"), vec![(0, 10)]),
-            (Path::new("/a/nested"), vec![(1, 10), (2, 20)]),
-            (Path::new("/b"), vec![(3, 40)]),
-        ]);
-        let (entries, surfaces) = layout(groups, bounds(), &token, 1).unwrap();
-        assert_eq!(entries.len(), 4);
-        let mut union = Rect {
-            x: f32::MAX,
-            y: f32::MAX,
-            w: 0.0,
-            h: 0.0,
-        };
-        let (mut right, mut bottom) = (0.0f32, 0.0f32);
-        for entry in entries.iter().filter(|entry| entry.id < 3) {
-            union.x = union.x.min(entry.rect.x);
-            union.y = union.y.min(entry.rect.y);
-            right = right.max(entry.rect.x + entry.rect.w);
-            bottom = bottom.max(entry.rect.y + entry.rect.h);
-        }
-        union.w = right - union.x;
-        union.h = bottom - union.y;
-        let area = bounds().w * bounds().h;
-        assert!((union.w * union.h - area * 0.5).abs() < 0.1);
-        for entry in &entries {
-            let weight = [10.0, 10.0, 20.0, 40.0][entry.id];
-            assert!((entry.rect.w * entry.rect.h - area * weight / 80.0).abs() < 0.1);
-        }
-        let map = crate::render::RenderMap::build_with_surfaces(
-            entries,
-            surfaces,
+        let scene = layout(
+            BTreeMap::from([
+                (Path::new("/a"), vec![(0, 10)]),
+                (Path::new("/a/nested"), vec![(1, 10), (2, 20)]),
+                (Path::new("/b"), vec![(3, 40)]),
+            ]),
+            Path::new("/"),
+            bounds(),
+            &token,
+            1,
+        )
+        .unwrap();
+        assert_eq!(scene.entries.len(), 4);
+        assert_eq!(scene.platforms.len(), 3);
+        let file = |id| scene.entries.iter().find(|entry| entry.id == id).unwrap();
+        assert!(file(1).color.r() >= file(0).color.r());
+        assert_eq!(file(1).color, file(2).color);
+        assert_ne!(file(0).color, file(3).color);
+        let parent = scene
+            .platforms
+            .iter()
+            .find(|p| {
+                p.color == file(0).color && (area(p.bounds) - area(bounds()) * 0.5).abs() < 0.1
+            })
+            .unwrap();
+        let nested = scene
+            .platforms
+            .iter()
+            .find(|p| area(p.bounds) < area(parent.bounds) && contains(parent.content, p.bounds))
+            .unwrap();
+        assert!(contains(parent.content, nested.bounds));
+        assert!(contains(parent.content, file(0).rect));
+        assert!(contains(nested.content, file(1).rect) && contains(nested.content, file(2).rect));
+        assert!((area(nested.bounds) / area(file(0).rect) - 3.0).abs() < 0.001);
+        assert!((area(file(2).rect) / area(file(1).rect) - 2.0).abs() < 0.001);
+        let map = crate::render::RenderMap::build_with_platforms(
+            scene.entries,
+            scene.platforms,
             bounds(),
             [1200, 760],
             &token,
             1,
         )
         .unwrap();
-        for y in 0..760 {
-            for x in 0..1200 {
-                assert!(map.hit_test(x as f32 + 0.5, y as f32 + 0.5).is_some());
-            }
+        for id in 0..4 {
+            let r = map.rect(id).unwrap();
+            assert_eq!(map.hit_test(r.x + r.w * 0.5, r.y + r.h * 0.5), Some(id));
         }
         token.store(2, Ordering::Relaxed);
-        assert!(layout(BTreeMap::new(), bounds(), &token, 1).is_none());
+        assert!(layout(BTreeMap::new(), Path::new("/"), bounds(), &token, 1).is_none());
     }
 
     #[test]
-    fn unary_ancestors_do_not_change_shading_or_geometry() {
+    fn unary_ancestors_and_dense_lod_do_not_consume_file_space() {
         let token = AtomicU64::new(1);
-        let build = |a, b| {
-            let groups = BTreeMap::from([(a, vec![(0, 10), (1, 20)]), (b, vec![(2, 30)])]);
-            let (mut entries, surfaces) = layout(groups, bounds(), &token, 1).unwrap();
-            entries
-                .iter_mut()
-                .for_each(|entry| entry.color = Color32::from_rgb(65, 143, 151));
-            crate::render::RenderMap::build_with_surfaces(
-                entries,
-                surfaces,
+        let build = |root: &Path, leaf: &Path| {
+            let scene = layout(
+                BTreeMap::from([(leaf, vec![(0, 1), (1, 2)])]),
+                root,
                 bounds(),
-                [1200, 760],
-                &token,
-                1,
-            )
-            .unwrap()
-        };
-        let shallow = build(Path::new("/a"), Path::new("/b"));
-        let deep = build(Path::new("/root/one/two/a"), Path::new("/root/one/two/b"));
-        assert_eq!(shallow.image.unwrap().pixels, deep.image.unwrap().pixels);
-    }
-
-    #[test]
-    fn nested_cushion_preview_and_crop_share_world_lighting() {
-        let token = AtomicU64::new(1);
-        let paths = [
-            "/Applications/Design",
-            "/Applications/Development",
-            "/Applications/Utilities",
-            "/Users/Pictures/Trips",
-            "/Users/Pictures/Family",
-            "/Users/Documents",
-            "/Users/Library/Caches",
-            "/System",
-            "/System/Library",
-        ];
-        let mut groups = BTreeMap::new();
-        let mut id = 0;
-        for (group, path) in paths.iter().enumerate() {
-            let files = (0..(12 + group * 5))
-                .map(|file| {
-                    let item = (
-                        id,
-                        ((file * 7 + group * 13) % 23 + 2) as u64 * (10 - group) as u64,
-                    );
-                    id += 1;
-                    item
-                })
-                .collect();
-            groups.insert(Path::new(path), files);
-        }
-        let (entries, surfaces) = layout(groups, bounds(), &token, 1).unwrap();
-        let map = crate::render::RenderMap::build_with_surfaces(
-            entries,
-            surfaces,
-            bounds(),
-            [1200, 760],
-            &token,
-            1,
-        )
-        .unwrap();
-        let detail = map
-            .rasterize(
-                Rect {
-                    x: 140.0,
-                    y: 120.0,
-                    w: 900.0,
-                    h: 520.0,
-                },
-                [900, 520],
                 &token,
                 1,
             )
             .unwrap();
+            assert_eq!(scene.platforms.len(), 1);
+            let rects: Vec<_> = scene.entries.iter().map(|e| e.rect).collect();
+            rects
+        };
+        assert_eq!(
+            build(Path::new("/"), Path::new("/a")),
+            build(Path::new("/root"), Path::new("/root/one/two/a"))
+        );
+        let paths: Vec<_> = (0..2000)
+            .map(|id| std::path::PathBuf::from(format!("/root/group{id}")))
+            .collect();
+        let groups = paths
+            .iter()
+            .enumerate()
+            .map(|(id, path)| (path.as_path(), vec![(id, 1)]))
+            .collect();
+        let scene = layout(groups, Path::new("/root"), bounds(), &token, 1).unwrap();
+        assert_eq!(scene.entries.len(), 2000);
+        assert!(scene.platforms.is_empty());
+        assert!(
+            scene
+                .entries
+                .iter()
+                .all(|entry| entry.rect.w > 0.0 && entry.rect.h > 0.0)
+        );
+        let total: f32 = scene.entries.iter().map(|entry| area(entry.rect)).sum();
+        assert!((total - area(bounds())).abs() < 4.0);
+    }
+
+    #[test]
+    fn terrace_preview_and_cropped_raster_keep_the_same_world_material() {
+        let token = AtomicU64::new(1);
+        let paths = [
+            "/Users/Pictures/Family",
+            "/Users/Pictures/Trips",
+            "/Users/Documents",
+            "/Users/Library/Caches",
+            "/Applications/Design",
+            "/Applications/Development",
+            "/Applications/Utilities",
+            "/System/Library",
+        ];
+        let mut groups = BTreeMap::new();
+        let mut id = 0;
+        let dense = std::env::var_os("TERRACE_DENSE").is_some();
+        for (group, path) in paths.iter().enumerate() {
+            let files = (0..if dense { 1500 } else { 16 })
+                .map(|file| {
+                    let entry = (id, ((file * 17 + group * 3) % 31 + 2) as u64);
+                    id += 1;
+                    entry
+                })
+                .collect();
+            groups.insert(Path::new(path), files);
+        }
+        let scene = layout(groups, Path::new("/"), bounds(), &token, 1).unwrap();
+        assert!(scene.platforms.len() >= 9);
+        let map = crate::render::RenderMap::build_with_platforms(
+            scene.entries,
+            scene.platforms,
+            bounds(),
+            [1200, 760],
+            &token,
+            1,
+        )
+        .unwrap();
+        let crop = Rect {
+            x: 90.0,
+            y: 100.0,
+            w: 1000.0,
+            h: 500.0,
+        };
+        let detail = map.rasterize(crop, [1000, 500], &token, 1).unwrap();
         let image = map.image.as_ref().unwrap();
-        for y in 0..520 {
-            for x in 0..900 {
-                let a = image.pixels[(y + 120) * 1200 + x + 140];
-                let b = detail.image.as_ref().unwrap().pixels[y * 900 + x];
+        for y in 0..500 {
+            for x in 0..1000 {
+                let a = image.pixels[(y + 100) * 1200 + x + 90];
+                let b = detail.image.as_ref().unwrap().pixels[y * 1000 + x];
                 for (a, b) in a.to_array().into_iter().zip(b.to_array()) {
                     assert!((a as i16 - b as i16).abs() <= 1);
                 }
+                assert_eq!(
+                    map.hit_test(x as f32 + 90.5, y as f32 + 100.5),
+                    detail.hit_test(x as f32 + 90.5, y as f32 + 100.5)
+                );
             }
         }
-        if let Ok(path) = std::env::var("CUSHION_PREVIEW_PATH") {
+        if let Ok(path) = std::env::var("TERRACE_PREVIEW_PATH") {
             use std::io::Write;
             let mut file = std::fs::File::create(path).unwrap();
             write!(file, "P6\n1200 760\n255\n").unwrap();

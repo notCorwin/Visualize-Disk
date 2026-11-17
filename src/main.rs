@@ -383,10 +383,10 @@ fn layout_snapshot(
         w: key.logical_size.x,
         h: key.logical_size.y,
     };
-    let (entries, surfaces) = directory_map::layout(grouped.ok()?, bounds, token, generation)?;
-    render::RenderMap::build_with_surfaces(
-        entries,
-        surfaces,
+    let layout = directory_map::layout(grouped.ok()?, &data.root, bounds, token, generation)?;
+    render::RenderMap::build_with_platforms(
+        layout.entries,
+        layout.platforms,
         bounds,
         key.physical_size,
         token,
@@ -1418,7 +1418,12 @@ impl App {
                     &data.files,
                     &self.filtered,
                     self.selected,
-                    color,
+                    |id| {
+                        self.map_cache
+                            .as_ref()
+                            .and_then(|cache| cache.map.color(id))
+                            .unwrap_or_else(|| color(&data.files[id].parent))
+                    },
                 ) {
                     self.selected = Some(selected);
                 }
@@ -2664,8 +2669,20 @@ mod tests {
         let files: Vec<_> = (0..n)
             .into_par_iter()
             .map(|i| scan::FileEntry {
-                path: format!("/group{}/file{i}", i / 1000).into(),
-                parent: format!("/group{}", i / 1000).into(),
+                path: format!(
+                    "/volume{}/folder{}/group{}/file{i}",
+                    i / 350000,
+                    i / 100000,
+                    i / 1000
+                )
+                .into(),
+                parent: format!(
+                    "/volume{}/folder{}/group{}",
+                    i / 350000,
+                    i / 100000,
+                    i / 1000
+                )
+                .into(),
                 size: (i % 10000 + 1) as u64,
                 identity: scan::FileIdentity::default(),
             })
@@ -2685,6 +2702,12 @@ mod tests {
         let begin = std::time::Instant::now();
         settle(&mut app, &ctx);
         let build = begin.elapsed();
+        let platform_count = app.map_cache.as_ref().unwrap().map.platform_count();
+        assert!(
+            platform_count > 10,
+            "benchmark must include multiple visible directory levels"
+        );
+        eprintln!("visible_platforms={platform_count}");
         settle(&mut app, &ctx);
         settle(&mut app, &ctx);
         app.selected = Some(n / 2);
