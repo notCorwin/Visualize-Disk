@@ -41,26 +41,64 @@ fi
 if [[ "$INSTALL" == 1 ]]; then
     STAGE="$(mktemp -d /Applications/.visualize-ssd.XXXXXX)"
     DEST='/Applications/Visualize SSD.app'
-    BACKUP=''
+    PREVIOUS="$STAGE/previous.app"
+    NEW_PLACED=0
     cleanup() {
         status=$?
-        if [[ "$status" != 0 && -n "$BACKUP" && ! -e "$DEST" ]]; then
-            mv "$BACKUP" "$DEST"
+        trap - EXIT
+        if [[ "$status" != 0 ]]; then
+            if [[ "$NEW_PLACED" == 1 ]] && ! rm -rf -- "$DEST"; then
+                printf 'Installation failed; recovery files remain at: %s\n' "$STAGE" >&2
+                exit "$status"
+            fi
+            if [[ -e "$PREVIOUS" ]] && ! mv "$PREVIOUS" "$DEST"; then
+                printf 'Rollback requires recovery from: %s\n' "$PREVIOUS" >&2
+                exit "$status"
+            fi
         fi
-        rm -rf "$STAGE"
+        if ! rm -rf -- "$STAGE"; then
+            printf 'Could not remove installation staging: %s\n' "$STAGE" >&2
+            [[ "$status" != 0 ]] || status=1
+        fi
         exit "$status"
     }
     trap cleanup EXIT
     /usr/bin/ditto "$BUNDLE" "$STAGE/Visualize SSD.app"
     /usr/bin/codesign --verify --deep --strict "$STAGE/Visualize SSD.app"
-    if [[ -e "$DEST" ]]; then
-        BACKUP="/Applications/Visualize SSD.previous.$(date +%Y%m%d-%H%M%S).$$.app"
-        mv "$DEST" "$BACKUP"
+    if [[ -e "$DEST" || -L "$DEST" ]]; then
+        [[ ! -L "$DEST" && "$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$DEST/Contents/Info.plist")" == 'com.visualizessd.app' ]] || {
+            printf 'Refusing to replace an unrelated application: %s\n' "$DEST" >&2
+            exit 1
+        }
+        mv "$DEST" "$PREVIOUS"
     fi
+    NEW_PLACED=1
     mv "$STAGE/Visualize SSD.app" "$DEST"
     /usr/bin/codesign --verify --deep --strict "$DEST"
+    /usr/bin/plutil -lint "$DEST/Contents/Info.plist"
+    # Remove only our former visible upgrade backups after the new app passes
+    # verification. The current rollback bundle remains hidden until cleanup.
+    shopt -s nullglob
+    LEGACY_APPS=(/Applications/Visualize\ SSD.previous.*.app)
+    LSREGISTER='/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
+    REMOVED=0
+    for legacy in "${LEGACY_APPS[@]}"; do
+        if [[ -d "$legacy" && ! -L "$legacy" ]] &&
+            [[ "$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$legacy/Contents/Info.plist" 2>/dev/null || true)" == 'com.visualizessd.app' ]]; then
+            if [[ -x "$LSREGISTER" ]]; then
+                "$LSREGISTER" -u "$legacy" >/dev/null 2>&1 ||
+                    printf 'Could not unregister old app entry: %s\n' "$legacy" >&2
+            fi
+            rm -rf -- "$legacy"
+            REMOVED=$((REMOVED + 1))
+        fi
+    done
+    if [[ -x "$LSREGISTER" ]]; then
+        "$LSREGISTER" -f "$DEST" >/dev/null 2>&1 ||
+            printf 'Could not refresh app registration: %s\n' "$DEST" >&2
+    fi
     printf 'Installed: %s\n' "$DEST"
-    [[ -z "$BACKUP" ]] || printf 'Previous version preserved: %s\n' "$BACKUP"
+    printf 'Removed old app versions: %s\n' "$REMOVED"
 else
     printf 'Packaged: %s\n' "$BUNDLE"
 fi

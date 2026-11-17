@@ -7,6 +7,8 @@ edition = "2024"
 eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow"] }
 
 rayon = "1.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [profile.release]
 lto = "thin"
@@ -14,4 +16,4 @@ strip = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSFileManager", "NSURL", "NSError", "NSString"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSFileManager", "NSURL", "NSError", "NSString", "NSAppleEventDescriptor", "NSProcessInfo", "NSPathUtilities", "NSData", "NSDate", "objc2-core-services"] }

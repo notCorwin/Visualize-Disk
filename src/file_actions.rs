@@ -3,12 +3,26 @@ use std::{fs, io::ErrorKind, path::Path};
 
 const REPLACED: &str = "文件已被替换，请重新扫描后重试。";
 
-/// Call only from a background worker. The system Trash API has no permanent
-/// deletion fallback; filesystem identity is revalidated against the scan.
+mod recovery;
+#[cfg_attr(test, allow(unused_imports))]
+pub use recovery::{RecoveryRecord, recoveries, restore};
+
+/// Finder performs the trash operation and maintains its own Put Back metadata.
+/// A durable original-location record is saved before dispatch for app recovery.
 pub fn move_to_trash(path: &Path, expected: FileIdentity) -> Result<Option<FileEntry>, String> {
-    move_with(path, expected, native_trash)
+    if already_in_trash(path) {
+        return Err("文件已在废纸篓中，请使用“放回原处”；不会再次删除。".into());
+    }
+    verify_file(path, expected)?;
+    native_trash(path, expected)
 }
 
+pub fn already_in_trash(path: &Path) -> bool {
+    path.components()
+        .any(|part| part.as_os_str() == ".Trash" || part.as_os_str() == ".Trashes")
+}
+
+#[cfg(test)]
 fn move_with(
     path: &Path,
     expected: FileIdentity,
@@ -40,54 +54,265 @@ fn verify_file(path: &Path, expected: FileIdentity) -> Result<(), String> {
     Ok(())
 }
 
+fn protected_recovery_location(path: &Path, support: &Path) -> bool {
+    path.starts_with(support)
+        || fs::canonicalize(path)
+            .ok()
+            .zip(fs::canonicalize(support).ok())
+            .is_some_and(|(p, root)| p.starts_with(root))
+}
+
 #[cfg(target_os = "macos")]
 fn native_trash(path: &Path, expected: FileIdentity) -> Result<Option<FileEntry>, String> {
-    use objc2::rc::autoreleasepool;
-    use objc2_foundation::{NSFileManager, NSURL};
-    use std::{
-        ffi::{CStr, CString, OsStr},
-        os::unix::ffi::OsStrExt,
-        ptr::NonNull,
-    };
-
-    autoreleasepool(|_| {
-        let path_bytes = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| "文件路径无效，请重新扫描后重试。".to_string())?;
-        // NSURL copies the filesystem representation during this synchronous
-        // call. The CString remains alive throughout the native operation.
-        let url = unsafe {
-            NSURL::fileURLWithFileSystemRepresentation_isDirectory_relativeToURL(
-                NonNull::new(path_bytes.as_ptr().cast_mut()).unwrap(),
-                false,
-                None,
-            )
-        };
-        // Minimize the path-lookup race after URL construction. As with Finder,
-        // NSFileManager operates on a directory entry; there is no public API
-        // for an atomic conditional trash-by-inode operation.
-        verify_file(path, expected)?;
-        let mut destination = None;
-        NSFileManager::defaultManager()
-            .trashItemAtURL_resultingItemURL_error(&url, Some(&mut destination))
-            .map_err(|error| native_error(&error.domain().to_string(), error.code()))?;
-        // A successful move is committed even when its destination cannot be
-        // resolved. Return None for a refresh, never an error that invites an
-        // unsafe retry. Trash files still occupy space on the scanned disk.
-        let Some(destination) = destination.filter(|url| url.isFileURL()) else {
-            return Ok(None);
-        };
-        // The resulting NSURL remains alive while its borrowed C string is
-        // copied into PathBuf, preserving non-UTF8 filenames exactly.
-        let destination_bytes =
-            unsafe { CStr::from_ptr(destination.fileSystemRepresentation().as_ptr()) };
-        let path = Path::new(OsStr::from_bytes(destination_bytes.to_bytes())).to_path_buf();
-        Ok(destination_entry(path))
-    })
+    let home = home_directory()?;
+    let home_meta =
+        fs::metadata(&home).map_err(|_| "无法确认当前用户的废纸篓位置，请在 Finder 中处理。")?;
+    if FileIdentity::from_metadata(&home_meta).device != expected.device {
+        return Err("此位置不支持本应用的可恢复废纸篓操作，请在 Finder 中处理。".into());
+    }
+    let support = home.join("Library/Application Support/com.visualizessd.app");
+    if protected_recovery_location(path, &support) {
+        return Err("该文件保存本应用的恢复记录，不能移到废纸篓。".into());
+    }
+    // This is the only place allowed to request OS consent: a user-initiated
+    // action. Native tests use the separate no-prompt authorization check.
+    finder::permission(true)?;
+    let store = recovery::Store::production()?;
+    let (mut record, fresh_record) = store.pending(path, expected)?;
+    if let Err(error) = verify_file(path, expected) {
+        if fresh_record {
+            let _ = store.remove(&record.id);
+        }
+        return Err(error);
+    }
+    let result = finder::trash(path);
+    let moved = result
+        .as_ref()
+        .ok()
+        .and_then(|p| p.as_ref())
+        .and_then(|p| destination_entry(p.clone()))
+        .filter(|f| {
+            f.identity == expected
+                && store.is_trash_destination(&f.path)
+                && verify_file(path, expected).is_err()
+        })
+        .or_else(|| {
+            if record.original_links == 1 && verify_file(path, expected).is_err() {
+                store.locate(expected)
+            } else {
+                None
+            }
+        });
+    if let Some(file) = moved {
+        record.trash_path = Some(file.path.clone());
+        record.identity = file.identity;
+        // The synced pending record remains recoverable even if this second
+        // write fails after Finder committed the move.
+        let _ = store.save(&record);
+        return Ok(Some(file));
+    }
+    match result {
+        Ok(_) => Ok(None),
+        Err(error) if verify_file(path, expected).is_ok() => {
+            if error.confirmed_rejection && fresh_record {
+                let _ = store.remove(&record.id);
+            }
+            Err(error.message)
+        }
+        // A lost/late reply does not mean the move failed. Keep the durable
+        // pending record and request reconciliation instead of unsafe retry.
+        Err(_) => Ok(None),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
 fn native_trash(_path: &Path, _expected: FileIdentity) -> Result<Option<FileEntry>, String> {
     Err("当前系统不支持 macOS 废纸篓操作。".into())
+}
+
+#[cfg(target_os = "macos")]
+fn home_directory() -> Result<std::path::PathBuf, String> {
+    use std::{
+        ffi::{CStr, OsStr},
+        os::unix::ffi::OsStrExt,
+    };
+    let home = objc2_foundation::NSHomeDirectory();
+    let bytes = unsafe { CStr::from_ptr(home.fileSystemRepresentation().as_ptr()) };
+    Ok(Path::new(OsStr::from_bytes(bytes.to_bytes())).to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+mod finder {
+    use super::*;
+    use objc2::rc::{Retained, autoreleasepool};
+    use objc2_foundation::{NSAppleEventDescriptor, NSAppleEventSendOptions, NSString, NSURL};
+    use std::{
+        ffi::{CStr, CString, OsStr},
+        os::unix::ffi::OsStrExt,
+        path::PathBuf,
+        ptr::NonNull,
+    };
+
+    const CORE: u32 = u32::from_be_bytes(*b"core");
+    const DELETE: u32 = u32::from_be_bytes(*b"delo");
+    const DIRECT: u32 = u32::from_be_bytes(*b"----");
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn AEDeterminePermissionToAutomateTarget(
+            target: *const std::ffi::c_void,
+            event_class: u32,
+            event_id: u32,
+            ask: u8,
+        ) -> i32;
+    }
+
+    fn target() -> Retained<NSAppleEventDescriptor> {
+        NSAppleEventDescriptor::descriptorWithBundleIdentifier(&NSString::from_str(
+            "com.apple.finder",
+        ))
+    }
+
+    pub(super) fn permission(ask: bool) -> Result<(), String> {
+        autoreleasepool(|_| {
+            let target = target();
+            let raw: *const std::ffi::c_void = target.aeDesc().cast();
+            let status =
+                unsafe { AEDeterminePermissionToAutomateTarget(raw, CORE, DELETE, u8::from(ask)) };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err("需要允许 Visualize SSD 控制 Finder，才能保留“放回原处”信息。请在系统设置 > 隐私与安全性 > 自动化中允许 Finder。文件尚未移动。".into())
+            }
+        })
+    }
+
+    fn event(id: u32, object: &NSAppleEventDescriptor) -> Retained<NSAppleEventDescriptor> {
+        let target = target();
+        let event = NSAppleEventDescriptor::appleEventWithEventClass_eventID_targetDescriptor_returnID_transactionID(CORE,id,Some(&target),-1,0);
+        event.setParamDescriptor_forKeyword(object, DIRECT);
+        event
+    }
+    #[derive(Debug)]
+    pub(super) struct Failure {
+        pub message: String,
+        pub confirmed_rejection: bool,
+    }
+    fn failure(code: isize, reply: bool) -> Failure {
+        Failure {
+            message: error_message(code),
+            confirmed_rejection: code != -1712
+                && (reply
+                    || matches!(
+                        code,
+                        -1743 | -1744 | -43 | -1728 | -5000 | -54 | -10004 | -1713 | -600
+                    )),
+        }
+    }
+    fn send(event: &NSAppleEventDescriptor) -> Result<Retained<NSAppleEventDescriptor>, Failure> {
+        // Finder may neither switch applications nor present confirmation/admin
+        // dialogs. Unsupported trash operations fail instead of deleting forever.
+        let reply = event
+            .sendEventWithOptions_timeout_error(
+                NSAppleEventSendOptions::WaitForReply | NSAppleEventSendOptions::NeverInteract,
+                30.0,
+            )
+            .map_err(|error| failure(error.code(), false))?;
+        if let Some(error) = reply_error(&reply) {
+            return Err(error);
+        }
+        Ok(reply)
+    }
+    fn error_message(code: isize) -> String {
+        match code {
+            -1743 | -1744 => {
+                "macOS 拒绝控制 Finder。请在系统设置 > 隐私与安全性 > 自动化中允许 Finder。".into()
+            }
+            -1712 => "Finder 尚未确认操作结果，请稍后检查恢复列表，避免重复操作。".into(),
+            -43 | -1728 => "Finder 找不到该文件，请重新扫描。".into(),
+            -5000 | -54 | -10004 | -1713 => {
+                "Finder 无法安全移动此文件，请检查权限或在 Finder 中处理；未尝试永久删除。".into()
+            }
+            _ => "Finder 未能确认移到废纸篓的结果，请检查恢复列表或重新扫描。".into(),
+        }
+    }
+    pub(super) fn reply_error(reply: &NSAppleEventDescriptor) -> Option<Failure> {
+        let error = reply.paramDescriptorForKeyword(u32::from_be_bytes(*b"errn"));
+        error.and_then(|e| {
+            let code = e.int32Value();
+            (code != 0).then(|| failure(code as isize, true))
+        })
+    }
+
+    fn reply_object(reply: &NSAppleEventDescriptor) -> Option<Retained<NSAppleEventDescriptor>> {
+        reply.paramDescriptorForKeyword(DIRECT)
+    }
+    pub(super) fn single_object(
+        object: Retained<NSAppleEventDescriptor>,
+    ) -> Option<Retained<NSAppleEventDescriptor>> {
+        let kind = object.descriptorType();
+        if kind == u32::from_be_bytes(*b"list") {
+            if object.numberOfItems() == 1 {
+                object.descriptorAtIndex(1)
+            } else {
+                None
+            }
+        } else {
+            Some(object)
+        }
+    }
+    fn file_path(desc: &NSAppleEventDescriptor) -> Option<PathBuf> {
+        let url = desc.fileURLValue()?;
+        let raw = unsafe { CStr::from_ptr(url.fileSystemRepresentation().as_ptr()) };
+        Some(Path::new(OsStr::from_bytes(raw.to_bytes())).to_path_buf())
+    }
+    fn file_object(path: &Path) -> Result<Retained<NSAppleEventDescriptor>, Failure> {
+        let bytes = CString::new(path.as_os_str().as_bytes()).map_err(|_| Failure {
+            message: "文件路径无效，请重新扫描。".into(),
+            confirmed_rejection: true,
+        })?;
+        let url = unsafe {
+            NSURL::fileURLWithFileSystemRepresentation_isDirectory_relativeToURL(
+                NonNull::new(bytes.as_ptr().cast_mut()).unwrap(),
+                false,
+                None,
+            )
+        };
+        return Ok(NSAppleEventDescriptor::descriptorWithFileURL(&url));
+    }
+    #[cfg(test)]
+    pub(super) fn file_codec_without_send(path: &Path) -> Option<PathBuf> {
+        autoreleasepool(|_| {
+            let object = file_object(path).ok()?;
+            let event = event(DELETE, &object);
+            let _ = event.aeDesc();
+            let direct = event.paramDescriptorForKeyword(DIRECT)?;
+            file_path(&direct)
+        })
+    }
+    pub(super) fn trash(path: &Path) -> Result<Option<PathBuf>, Failure> {
+        autoreleasepool(|_| {
+            let object = file_object(path)?;
+            let reply = send(&event(DELETE, &object))?;
+            let Some(object) = reply_object(&reply).and_then(single_object) else {
+                return Ok(None);
+            };
+            if let Some(path) = file_path(&object) {
+                return Ok(Some(path));
+            }
+            // Finder returns an object specifier. Ask Finder for its file URL,
+            // rather than parsing AppleScript text or interpolating filenames.
+            let get = event(u32::from_be_bytes(*b"getd"), &object);
+            let requested =
+                NSAppleEventDescriptor::descriptorWithTypeCode(u32::from_be_bytes(*b"furl"));
+            get.setParamDescriptor_forKeyword(&requested, u32::from_be_bytes(*b"rtyp"));
+            Ok(send(&get)
+                .ok()
+                .and_then(|r| reply_object(&r))
+                .and_then(single_object)
+                .and_then(|d| file_path(&d)))
+        })
+    }
 }
 
 fn destination_entry(path: std::path::PathBuf) -> Option<FileEntry> {
@@ -101,25 +326,6 @@ fn destination_entry(path: std::path::PathBuf) -> Option<FileEntry> {
         identity: FileIdentity::from_metadata(&metadata),
         path,
     })
-}
-
-fn native_error(domain: &str, code: isize) -> String {
-    match (domain, code) {
-        ("NSCocoaErrorDomain", 4 | 260) | ("NSPOSIXErrorDomain", 2) => {
-            "文件已移动或删除，请重新扫描。".into()
-        }
-        ("NSCocoaErrorDomain", 257 | 513) | ("NSPOSIXErrorDomain", 1 | 13) => {
-            "macOS 拒绝移动文件，请检查文件及所在目录的写入权限；系统保护的文件无法移到废纸篓。"
-                .into()
-        }
-        ("NSCocoaErrorDomain", 642) | ("NSPOSIXErrorDomain", 30) => {
-            "文件所在磁盘为只读，无法移到废纸篓。".into()
-        }
-        ("NSCocoaErrorDomain", 640) | ("NSPOSIXErrorDomain", 28) => {
-            "磁盘可用空间不足，无法移到废纸篓。请释放空间后重试。".into()
-        }
-        _ => "macOS 未能将文件移到废纸篓。请确认磁盘可写，并在 Finder 中检查该文件后重试。".into(),
-    }
 }
 
 #[cfg(test)]
@@ -142,7 +348,7 @@ mod tests {
                     SEQUENCE.fetch_add(1, Ordering::Relaxed)
                 ));
                 match fs::create_dir(&path) {
-                    Ok(()) => return Self(path),
+                    Ok(()) => return Self(fs::canonicalize(path).unwrap()),
                     Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
                     Err(error) => panic!("cannot create test fixture: {error}"),
                 }
@@ -215,16 +421,6 @@ mod tests {
     }
 
     #[test]
-    fn native_errors_are_concise_actionable_and_never_raw() {
-        assert!(native_error("NSCocoaErrorDomain", 513).contains("写入权限"));
-        assert!(native_error("NSPOSIXErrorDomain", 30).contains("只读"));
-        assert!(native_error("NSCocoaErrorDomain", 640).contains("空间不足"));
-        let unknown = native_error("untrusted native exception text", 9999);
-        assert!(!unknown.contains("untrusted"));
-        assert!(unknown.contains("Finder"));
-    }
-
-    #[test]
     fn destination_entry_preserves_file_identity_and_logical_bytes() {
         let temp = Temp::new();
         let (path, identity) = temp.file("source");
@@ -240,36 +436,122 @@ mod tests {
     }
 
     #[test]
+    fn trash_ancestors_are_rejected_before_any_operation() {
+        assert!(already_in_trash(Path::new("/Users/me/.Trash/file")));
+        assert!(already_in_trash(Path::new(
+            "/Volumes/disk/.Trashes/501/file"
+        )));
+        assert!(!already_in_trash(Path::new(
+            "/Users/me/Trash-not-trash/file"
+        )));
+        assert!(
+            move_to_trash(
+                Path::new("/Users/me/.Trash/missing"),
+                FileIdentity::default()
+            )
+            .unwrap_err()
+            .contains("不会再次删除")
+        );
+    }
+
+    #[test]
+    fn finder_production_codec_preserves_quoted_unicode_paths_without_dispatch() {
+        let temp = Temp::new();
+        let (path, _) = temp.file("quote\"-line\n中文");
+        assert_eq!(finder::file_codec_without_send(&path).as_ref(), Some(&path));
+    }
+    #[test]
+    fn finder_single_item_list_reply_is_unwrapped_without_sending_events() {
+        use objc2_foundation::{NSAppleEventDescriptor, NSString};
+        let list = NSAppleEventDescriptor::listDescriptor();
+        let item = NSAppleEventDescriptor::descriptorWithString(&NSString::from_str("result"));
+        list.insertDescriptor_atIndex(&item, 1);
+        assert_eq!(
+            finder::single_object(list)
+                .unwrap()
+                .stringValue()
+                .unwrap()
+                .to_string(),
+            "result"
+        );
+        assert!(finder::single_object(NSAppleEventDescriptor::listDescriptor()).is_none());
+    }
+    #[test]
+    fn application_recovery_files_are_protected_including_alias_paths() {
+        let temp = Temp::new();
+        let support = temp.0.join("Support");
+        fs::create_dir(&support).unwrap();
+        let file = support.join("journal.json");
+        fs::write(&file, b"data").unwrap();
+        assert!(protected_recovery_location(&file, &support));
+        let alias = temp.0.join("alias");
+        std::os::unix::fs::symlink(&support, &alias).unwrap();
+        assert!(protected_recovery_location(
+            &alias.join("journal.json"),
+            &support
+        ));
+        assert!(!protected_recovery_location(
+            &temp.0.join("other"),
+            &support
+        ));
+    }
+    #[test]
+    fn finder_application_error_is_not_mistaken_for_successful_transport() {
+        use objc2_foundation::NSAppleEventDescriptor;
+        let reply = NSAppleEventDescriptor::recordDescriptor();
+        let code = NSAppleEventDescriptor::descriptorWithInt32(-1743);
+        reply.setParamDescriptor_forKeyword(&code, u32::from_be_bytes(*b"errn"));
+        assert!(
+            finder::reply_error(&reply)
+                .unwrap()
+                .message
+                .contains("自动化")
+        );
+        let ok = NSAppleEventDescriptor::recordDescriptor();
+        assert!(finder::reply_error(&ok).is_none());
+    }
+
+    #[test]
     #[cfg(target_os = "macos")]
-    #[ignore = "moves one unique temporary fixture to native Trash, then restores it"]
-    fn native_trash_round_trip_of_temporary_fixture() {
+    #[ignore = "requires already-authorized Finder automation; never prompts or activates Finder"]
+    fn finder_trash_and_recorded_restore_fixture_without_prompt() {
+        if finder::permission(false).is_err() {
+            eprintln!(
+                "SKIPPED: Finder automation is not preauthorized; no prompt or file operation performed"
+            );
+            return;
+        }
         let temp = Temp::new();
         let name = format!(
-            "visualize-ssd-native-trash-test-{}-{}",
+            "visualize-finder-trash-{}-{}",
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         );
         let (path, identity) = temp.file(&name);
-        let destination = move_to_trash(&path, identity)
-            .unwrap()
-            .expect("native Trash must return actual destination");
-        struct Restore(PathBuf, PathBuf);
+        // Use an isolated journal; never write application/user recovery records.
+        let home = home_directory().unwrap();
+        let store =
+            recovery::Store::open_for_test(temp.0.join("records"), home.join(".Trash")).unwrap();
+        let mut record = store.pending(&path, identity).unwrap().0;
+        let result = finder::trash(&path).unwrap();
+        let moved = result
+            .and_then(destination_entry)
+            .or_else(|| store.locate(identity))
+            .expect("Finder should return or reveal the original object in Trash");
+        record.trash_path = Some(moved.path.clone());
+        store.save(&record).unwrap();
+        struct Restore(std::path::PathBuf, std::path::PathBuf);
         impl Drop for Restore {
             fn drop(&mut self) {
                 let _ = fs::rename(&self.0, &self.1);
             }
         }
-        let restore = Restore(destination.path.clone(), path.clone());
+        let guard = Restore(moved.path.clone(), path.clone());
         assert!(!path.exists());
-        assert!(destination.path.exists());
-        assert_eq!(destination.size, b"temporary fixture".len() as u64);
-        assert_eq!(
-            FileIdentity::from_metadata(&fs::symlink_metadata(&destination.path).unwrap()),
-            destination.identity
-        );
-        fs::rename(&destination.path, &path).unwrap();
-        drop(restore);
-        assert!(path.exists());
-        assert!(!destination.path.exists());
+        let restored = store.restore_for_test(&record.id).unwrap().unwrap();
+        assert_eq!(restored.path, path);
+        assert_eq!(restored.identity, identity);
+        assert!(!moved.path.exists());
+        drop(guard);
     }
 }

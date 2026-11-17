@@ -15,7 +15,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const BG: Color32 = Color32::from_rgb(19, 23, 29);
@@ -102,13 +102,94 @@ fn configure(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+fn is_trash_path(path: &std::path::Path) -> bool {
+    path.components()
+        .any(|part| matches!(part.as_os_str().to_str(), Some(".Trash" | ".Trashes")))
+}
+
+struct PathRow {
+    text: String,
+    depth: usize,
+    is_file: bool,
+}
+fn path_rows(path: &std::path::Path) -> Vec<PathRow> {
+    let components: Vec<_> = path.components().collect();
+    components
+        .iter()
+        .enumerate()
+        .map(|(index, component)| PathRow {
+            text: component.as_os_str().to_string_lossy().into_owned(),
+            depth: index,
+            is_file: index + 1 == components.len(),
+        })
+        .collect()
+}
+
 fn defer_drop<T: Send + 'static>(value: T) {
     rayon::spawn(move || drop(value));
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NoticeKind {
+    Success,
+    Info,
+    Error,
+}
+struct Notice {
+    text: String,
+    kind: NoticeKind,
+    expires: Option<Instant>,
+}
+impl Notice {
+    fn new(text: String, kind: NoticeKind) -> Self {
+        Self {
+            text,
+            kind,
+            expires: (kind != NoticeKind::Error).then(|| Instant::now() + Duration::from_secs(5)),
+        }
+    }
+    fn expired(&self) -> bool {
+        self.expires
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
 }
 
 struct TrashOutput {
     source: Arc<scan::ScanResult>,
     result: Result<Option<scan::ScanResult>, String>,
+}
+
+fn relocate_snapshot(
+    source: &scan::ScanResult,
+    old_path: &std::path::Path,
+    identity: scan::FileIdentity,
+    moved: Option<scan::FileEntry>,
+) -> Option<scan::ScanResult> {
+    let moved = moved?;
+    let matches: Vec<_> = source
+        .files
+        .par_iter()
+        .enumerate()
+        .filter_map(|(i, file)| (file.path == old_path && file.identity == identity).then_some(i))
+        .collect();
+    if matches.len() != 1 {
+        return None;
+    }
+    let id = matches[0];
+    let mut files: Vec<_> = source
+        .files
+        .par_iter()
+        .enumerate()
+        .map(|(i, file)| if i == id { moved.clone() } else { file.clone() })
+        .collect();
+    files.par_sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+    Some(scan::ScanResult {
+        root: source.root.clone(),
+        files,
+        skipped: source.skipped,
+        errors: source.errors.clone(),
+        elapsed: source.elapsed,
+    })
 }
 
 struct FilterOutput {
@@ -272,6 +353,15 @@ struct App {
     selected: Option<usize>,
     message: Option<String>,
     action_notice: Option<String>,
+    notice: Option<Notice>,
+    show_errors: bool,
+    show_recoveries: bool,
+    recovery_rx: Option<mpsc::Receiver<Result<Vec<file_actions::RecoveryRecord>, String>>>,
+    recovery_records: Vec<file_actions::RecoveryRecord>,
+    recoveries_loaded: bool,
+    recoveries_dirty: bool,
+    restore_rx: Option<mpsc::Receiver<TrashOutput>>,
+    canvas_rect: Option<Rect>,
     filtered: Vec<usize>,
     total_bytes: u64,
     dirty: bool,
@@ -298,6 +388,15 @@ impl Default for App {
             selected: None,
             message: None,
             action_notice: None,
+            notice: None,
+            show_errors: false,
+            show_recoveries: false,
+            recovery_rx: None,
+            recovery_records: Vec::new(),
+            recoveries_loaded: false,
+            recoveries_dirty: false,
+            restore_rx: None,
+            canvas_rect: None,
             filtered: Vec::new(),
             total_bytes: 0,
             dirty: true,
@@ -385,7 +484,10 @@ impl App {
         self.layout_key = None;
     }
     fn trash(&mut self, id: usize) {
-        if self.trash_rx.is_some() {
+        if self.access != permission::Access::Granted
+            || self.trash_rx.is_some()
+            || self.restore_rx.is_some()
+        {
             return;
         }
         let Some(source) = self.data.clone() else {
@@ -399,31 +501,234 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.trash_rx = Some(rx);
         self.action_notice = None;
-        self.message = Some("正在移到废纸篓…".into());
+        self.set_notice(Notice {
+            text: "正在移到废纸篓…".into(),
+            kind: NoticeKind::Info,
+            expires: None,
+        });
         rayon::spawn(move || {
-            let result = file_actions::move_to_trash(&path, identity).map(|moved| {
-                let moved = moved?;
-                // This operation can clone millions of paths; never do it on the
-                // UI thread. Source identity guards against a newer scan winning.
-                let mut files: Vec<_> = source
-                    .files
-                    .par_iter()
-                    .enumerate()
-                    .map(|(i, file)| if i == id { moved.clone() } else { file.clone() })
-                    .collect();
-                files.par_sort_unstable_by(|a, b| {
-                    b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path))
-                });
-                Some(scan::ScanResult {
-                    root: source.root.clone(),
-                    files,
-                    skipped: source.skipped,
-                    errors: source.errors.clone(),
-                    elapsed: source.elapsed,
+            let result = file_actions::move_to_trash(&path, identity)
+                .map(|moved| relocate_snapshot(&source, &path, identity, moved));
+            let _ = tx.send(TrashOutput { source, result });
+        });
+    }
+    fn load_recoveries(&mut self) {
+        self.recoveries_dirty = true;
+        self.pump_recoveries();
+    }
+    fn pump_recoveries(&mut self) {
+        #[cfg(test)]
+        {
+            self.recoveries_loaded = true;
+            self.recoveries_dirty = false;
+        }
+        #[cfg(not(test))]
+        {
+            if self.recovery_rx.is_some() || !self.recoveries_dirty {
+                return;
+            }
+            self.recoveries_dirty = false;
+            let (tx, rx) = mpsc::channel();
+            self.recovery_rx = Some(rx);
+            rayon::spawn(move || {
+                let _ = tx.send(file_actions::recoveries());
+            });
+        }
+    }
+    fn restore(&mut self, record_id: &str) {
+        if self.access != permission::Access::Granted
+            || self.restore_rx.is_some()
+            || self.trash_rx.is_some()
+        {
+            return;
+        }
+        let Some(record) = self
+            .recovery_records
+            .iter()
+            .find(|record| record.id == record_id)
+        else {
+            return;
+        };
+        let id = record.id.clone();
+        let old_path = record.trash_path.clone();
+        let identity = record.identity;
+        let source = self.data.clone();
+        let (tx, rx) = mpsc::channel();
+        self.restore_rx = Some(rx);
+        self.set_notice(Notice {
+            text: "正在放回原处…".into(),
+            kind: NoticeKind::Info,
+            expires: None,
+        });
+        rayon::spawn(move || {
+            let result = file_actions::restore(&id).map(|moved| match (&source, &old_path) {
+                (Some(source), Some(old_path)) => {
+                    relocate_snapshot(source, old_path, identity, moved)
+                }
+                _ => None,
+            });
+            // An empty placeholder can never match a current scan snapshot.
+            let source = source.unwrap_or_else(|| {
+                Arc::new(scan::ScanResult {
+                    root: "/".into(),
+                    files: Vec::new(),
+                    skipped: 0,
+                    errors: Vec::new(),
+                    elapsed: Duration::ZERO,
                 })
             });
             let _ = tx.send(TrashOutput { source, result });
         });
+    }
+    fn set_notice(&mut self, notice: Notice) {
+        if notice.kind != NoticeKind::Error
+            && self
+                .notice
+                .as_ref()
+                .is_some_and(|current| current.kind == NoticeKind::Error)
+        {
+            return;
+        }
+        self.notice = Some(notice);
+    }
+    fn collect_notices(&mut self) {
+        if self.notice.as_ref().is_some_and(Notice::expired) {
+            self.notice = None;
+        }
+        let success = self.action_notice.take();
+        if let Some(error) = self.message.take() {
+            self.set_notice(Notice::new(error, NoticeKind::Error));
+        } else if let Some(success) = success {
+            self.set_notice(Notice::new(success, NoticeKind::Success));
+        }
+    }
+    fn overlays(&mut self, ctx: &egui::Context) {
+        self.collect_notices();
+        let mut dismiss = false;
+        if let Some(notice) = &self.notice {
+            if let Some(deadline) = notice.expires {
+                ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
+            }
+            egui::Area::new("notification".into())
+                .order(egui::Order::Foreground)
+                .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -44.0])
+                .show(ctx, |ui| {
+                    ui.set_max_width((ctx.content_rect().width() - 40.0).clamp(200.0, 560.0));
+                    egui::Frame::new()
+                        .fill(PANEL)
+                        .inner_margin(14.0)
+                        .corner_radius(8.0)
+                        .stroke(egui::Stroke::new(1.0, MUTED.gamma_multiply(0.3)))
+                        .show(ui, |ui| {
+                            ui.horizontal_top(|ui| {
+                                let color = match notice.kind {
+                                    NoticeKind::Success => ACCENT,
+                                    NoticeKind::Info => TEXT,
+                                    NoticeKind::Error => Color32::from_rgb(235, 180, 116),
+                                };
+                                ui.add(
+                                    egui::Label::new(RichText::new(&notice.text).color(color))
+                                        .wrap(),
+                                );
+                                if ui.small_button("×").on_hover_text("关闭提示").clicked() {
+                                    dismiss = true;
+                                }
+                            });
+                        });
+                });
+        }
+        if dismiss {
+            self.notice = None;
+        }
+        if self.show_errors && self.access == permission::Access::Granted {
+            let mut open = true;
+            egui::Window::new("无法读取的路径")
+                .open(&mut open)
+                .default_width(540.0)
+                .default_height(280.0)
+                .show(ctx, |ui| {
+                    if let Some(data) = &self.data {
+                        egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                            )
+                            .max_height(360.0)
+                            .show(ui, |ui| {
+                                for error in &data.errors {
+                                    ui.add(egui::Label::new(error).wrap());
+                                }
+                            });
+                    }
+                });
+            self.show_errors = open;
+        }
+        if self.show_recoveries && self.access == permission::Access::Granted {
+            let mut open = true;
+            let mut restore = None;
+            egui::Window::new("恢复文件")
+                .open(&mut open)
+                .default_width(580.0)
+                .default_height(300.0)
+                .show(ctx, |ui| {
+                    ui.label(RichText::new("仅显示本应用记录的文件").small().color(MUTED));
+                    if self.recovery_rx.is_some() {
+                        ui.label("正在读取恢复记录…");
+                    }
+                    if self.recovery_records.is_empty() && self.recovery_rx.is_none() {
+                        ui.label("没有可用的恢复记录。");
+                    }
+                    egui::ScrollArea::vertical()
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .max_height(380.0)
+                        .show_rows(ui, 64.0, self.recovery_records.len(), |ui, rows| {
+                            for index in rows {
+                                let record = &self.recovery_records[index];
+                                ui.horizontal(|ui| {
+                                    ui.allocate_ui_with_layout(
+                                        Vec2::new((ui.available_width() - 110.0).max(100.0), 54.0),
+                                        egui::Layout::top_down(egui::Align::LEFT),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    record
+                                                        .original_path
+                                                        .file_name()
+                                                        .unwrap_or_default()
+                                                        .to_string_lossy(),
+                                                )
+                                                .truncate(),
+                                            );
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(
+                                                        record.original_path.to_string_lossy(),
+                                                    )
+                                                    .small()
+                                                    .color(MUTED),
+                                                )
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(record.original_path.to_string_lossy());
+                                        },
+                                    );
+                                    if ui
+                                        .add_enabled(
+                                            self.restore_rx.is_none() && self.trash_rx.is_none(),
+                                            egui::Button::new("放回原处"),
+                                        )
+                                        .clicked()
+                                    {
+                                        restore = Some(record.id.clone());
+                                    }
+                                });
+                            }
+                        });
+                });
+            self.show_recoveries = open;
+            if let Some(record) = restore {
+                self.restore(&record);
+            }
+        }
     }
     fn poll(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.permission_rx {
@@ -461,7 +766,10 @@ impl App {
                     self.job = None;
                     if cancelled {
                         defer_drop(result);
-                        self.message = Some("已取消扫描，保留上次扫描结果。".into());
+                        self.set_notice(Notice::new(
+                            "已取消扫描，保留上次扫描结果。".into(),
+                            NoticeKind::Info,
+                        ));
                     } else {
                         match result {
                             Ok(data) => self.replace_snapshot(data),
@@ -504,6 +812,7 @@ impl App {
                         Err(error) => self.message = Some(error),
                     }
                     defer_drop(output.source);
+                    self.load_recoveries();
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.trash_rx = None;
@@ -512,6 +821,63 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        if let Some(rx) = &self.restore_rx {
+            match rx.try_recv() {
+                Ok(output) => {
+                    self.restore_rx = None;
+                    match output.result {
+                        Ok(Some(data))
+                            if self
+                                .data
+                                .as_ref()
+                                .is_some_and(|current| Arc::ptr_eq(current, &output.source)) =>
+                        {
+                            let refresh = self.job.is_some();
+                            self.replace_snapshot(data);
+                            if refresh {
+                                self.start();
+                            }
+                            self.action_notice = Some("已放回原处。".into());
+                        }
+                        Ok(data) => {
+                            defer_drop(data);
+                            self.start();
+                            self.action_notice = Some("已放回原处，正在更新磁盘结果。".into());
+                        }
+                        Err(error) => self.message = Some(error),
+                    }
+                    defer_drop(output.source);
+                    self.load_recoveries();
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.restore_rx = None;
+                    self.message = Some("恢复操作未完成，请刷新恢复记录后重试。".into());
+                    self.load_recoveries();
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(rx) = &self.recovery_rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.recovery_rx = None;
+                    self.recoveries_loaded = true;
+                    match result {
+                        Ok(records) => {
+                            self.recovery_records = records;
+                        }
+                        Err(error) => self.message = Some(error),
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.recovery_rx = None;
+                    self.recoveries_loaded = true;
+                    self.message = Some("无法读取恢复记录，请重新打开恢复文件窗口。".into());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        self.pump_recoveries();
         if let Some(rx) = &self.filter_rx {
             match rx.try_recv() {
                 Ok(output) => {
@@ -564,6 +930,8 @@ impl App {
         if self.job.is_some()
             || self.reveal_rx.is_some()
             || self.trash_rx.is_some()
+            || self.restore_rx.is_some()
+            || self.recovery_rx.is_some()
             || self.permission_rx.is_some()
             || self.filter_rx.is_some()
             || self.layout_rx.is_some()
@@ -668,7 +1036,54 @@ impl App {
             let _ = tx.send(result);
         });
     }
+    fn status_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("status")
+            .exact_height(36.0)
+            .frame(egui::Frame::new().fill(PANEL).inner_margin(8.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let status = if let Some(job) = &self.job {
+                        let p = *job.progress.lock().unwrap_or_else(|e| e.into_inner());
+                        format!(
+                            "扫描中 · {} 个文件 · {} · 跳过 {} 项{}",
+                            p.files,
+                            bytes(p.bytes),
+                            p.skipped,
+                            if self.data.is_some() {
+                                " · 当前为上次扫描结果"
+                            } else {
+                                ""
+                            }
+                        )
+                    } else if let Some(data) = &self.data {
+                        format!(
+                            "启动磁盘 · {:.1} 秒 · {} 个文件 · 跳过 {} 项",
+                            data.elapsed.as_secs_f64(),
+                            data.files.len(),
+                            data.skipped
+                        )
+                    } else {
+                        "启动磁盘 · 扫描已停止".into()
+                    };
+                    ui.add(egui::Label::new(RichText::new(status).small().color(MUTED)).truncate());
+                    if self.layout_rx.is_some() {
+                        ui.spinner();
+                    }
+                    if let Some(data) = &self.data {
+                        let count = data.errors.len();
+                        if count > 0
+                            && ui
+                                .small_button(format!("无法读取的路径（{count}）"))
+                                .clicked()
+                        {
+                            self.show_errors = true;
+                        }
+                    }
+                });
+            });
+    }
     fn ui(&mut self, ctx: &egui::Context) {
+        self.canvas_rect = None;
         self.poll(ctx);
         if self.access != permission::Access::Granted {
             egui::CentralPanel::default()
@@ -704,14 +1119,16 @@ impl App {
                                 }
                             });
                         }
-                        if let Some(message) = &self.message {
-                            ui.label(RichText::new(message).color(MUTED));
-                        }
                     });
                 });
+            self.overlays(ctx);
             return;
         }
+        if !self.recoveries_loaded && self.recovery_rx.is_none() {
+            self.load_recoveries();
+        }
         egui::TopBottomPanel::top("toolbar")
+            .exact_height(68.0)
             .frame(egui::Frame::new().fill(PANEL).inner_margin(16.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -723,42 +1140,33 @@ impl App {
                     {
                         self.start();
                     }
-                    if let Some(job) = &self.job {
-                        if ui.button("取消扫描").clicked() {
+                    if ui
+                        .add_enabled(self.job.is_some(), egui::Button::new("取消扫描"))
+                        .clicked()
+                    {
+                        if let Some(job) = &self.job {
                             job.cancel.store(true, Ordering::Relaxed);
                         }
                     }
+                    if ui.button("恢复文件").clicked() {
+                        self.show_recoveries = true;
+                        self.load_recoveries();
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new("文件大小 · 逻辑字节").color(MUTED));
+                        ui.add(
+                            egui::Label::new(RichText::new("文件大小 · 逻辑字节").color(MUTED))
+                                .truncate(),
+                        );
                     });
                 });
-                if let Some(job) = &self.job {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        let p = job.progress.lock().unwrap_or_else(|e| e.into_inner());
-                        ui.label(format!(
-                            "扫描中 · {} 个文件 · {} · 跳过 {} 项",
-                            p.files,
-                            bytes(p.bytes),
-                            p.skipped
-                        ));
-                    });
-                    if self.data.is_some() {
-                        ui.label(RichText::new("下方显示上次完成的扫描结果").color(MUTED));
-                    }
-                }
-                if let Some(message) = &self.message {
-                    ui.label(RichText::new(message).color(Color32::from_rgb(235, 180, 116)));
-                }
-                if let Some(notice) = &self.action_notice {
-                    ui.label(RichText::new(notice).color(ACCENT));
-                }
             });
         self.filter();
         if self.data.is_none() {
+            self.status_bar(ctx);
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(BG))
                 .show(ctx, |ui| {
+                    self.canvas_rect = Some(ui.max_rect());
                     ui.vertical_centered(|ui| {
                         ui.add_space((ui.available_height() * 0.32).max(32.0));
                         let heading = if self.job.is_some() {
@@ -778,9 +1186,11 @@ impl App {
                         }
                     });
                 });
+            self.overlays(ctx);
             return;
         }
         egui::TopBottomPanel::top("navigation")
+            .exact_height(66.0)
             .frame(egui::Frame::new().fill(BG).inner_margin(16.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -805,12 +1215,6 @@ impl App {
                         "{} 个文件",
                         self.data.as_ref().unwrap().files.len()
                     ));
-                    if self.layout_rx.is_some() {
-                        ui.add(
-                            egui::Label::new(RichText::new("正在生成整盘视图…").color(MUTED))
-                                .truncate(),
-                        );
-                    }
                     ui.label(
                         RichText::new(if self.totals_ready {
                             bytes(self.total_bytes)
@@ -825,6 +1229,7 @@ impl App {
         self.filter();
         let mut reveal = None;
         let mut trash = None;
+        let mut restore = None;
         egui::SidePanel::right("files")
             .default_width(280.0)
             .min_width(230.0)
@@ -834,22 +1239,45 @@ impl App {
             .show(ctx, |ui| {
                 if let Some(i) = self.selected {
                     let f = &self.data.as_ref().unwrap().files[i];
-                    ui.label(
-                        RichText::new(f.path.file_name().unwrap_or_default().to_string_lossy())
-                            .size(18.0)
-                            .strong(),
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(f.path.file_name().unwrap_or_default().to_string_lossy())
+                                .size(18.0)
+                                .strong(),
+                        )
+                        .truncate(),
                     );
                     ui.label(RichText::new(bytes(f.size)).size(24.0).color(ACCENT));
-                    let path = f.path.to_string_lossy();
-                    if ui
-                        .add(
-                            egui::Label::new(RichText::new(path.as_ref()).small().color(MUTED))
-                                .wrap()
-                                .sense(Sense::click()),
-                        )
-                        .on_hover_text("点击复制完整路径")
-                        .clicked()
-                    {
+                    let mut copy_path = false;
+                    egui::ScrollArea::vertical()
+                        .id_salt("selected-path")
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            for row in path_rows(&f.path) {
+                                ui.horizontal(|ui| {
+                                    ui.add_space((row.depth as f32 * 12.0).min(60.0));
+                                    let text = RichText::new(row.text)
+                                        .size(15.0)
+                                        .color(if row.is_file { TEXT } else { MUTED });
+                                    let text = if row.is_file { text.strong() } else { text };
+                                    let label = ui.add(egui::Label::new(text).wrap());
+                                    if ui
+                                        .interact(
+                                            label.rect,
+                                            egui::Id::new("copy-selected-path").with(row.depth),
+                                            Sense::click(),
+                                        )
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        .on_hover_text("点击复制完整路径")
+                                        .clicked()
+                                    {
+                                        copy_path = true;
+                                    }
+                                });
+                            }
+                        });
+                    if copy_path {
                         if let Some(exact) = f.path.to_str() {
                             ctx.copy_text(exact.to_owned());
                             self.action_notice = Some("已复制完整路径。".into());
@@ -863,22 +1291,48 @@ impl App {
                             reveal = Some(i);
                         }
                         if ui
-                            .add_enabled(self.trash_rx.is_none(), egui::Button::new("移到废纸篓"))
+                            .add_enabled(
+                                self.trash_rx.is_none()
+                                    && self.restore_rx.is_none()
+                                    && !is_trash_path(&f.path),
+                                egui::Button::new("移到废纸篓"),
+                            )
                             .clicked()
                         {
                             trash = Some(i);
                         }
                     });
+                    if let Some(record) = self.recovery_records.iter().find(|record| {
+                        record.trash_path.as_ref() == Some(&f.path) && record.identity == f.identity
+                    }) {
+                        let id = record.id.clone();
+                        if ui
+                            .add_enabled(
+                                self.restore_rx.is_none() && self.trash_rx.is_none(),
+                                egui::Button::new("放回原处"),
+                            )
+                            .clicked()
+                        {
+                            restore = Some(id);
+                        }
+                    }
                     ui.separator();
                 }
                 ui.label(RichText::new("文件").strong());
                 ui.label(RichText::new("按大小排序 · 点击查看").small().color(MUTED));
-                if self.filter_rx.is_some() {
-                    ui.label(RichText::new("正在更新文件列表…").color(MUTED));
-                }
-                if self.filtered.is_empty() && self.filter_rx.is_none() {
-                    ui.label(RichText::new("没有匹配的文件").color(MUTED));
-                }
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(if self.filter_rx.is_some() {
+                            "正在更新文件列表…"
+                        } else if self.filtered.is_empty() {
+                            "没有匹配的文件"
+                        } else {
+                            " "
+                        })
+                        .color(MUTED),
+                    )
+                    .truncate(),
+                );
                 let row_height = 42.0;
                 egui::ScrollArea::vertical()
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -892,16 +1346,18 @@ impl App {
                                     let (r, _) =
                                         ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
                                     ui.painter().rect_filled(r, 2.0, color(&f.parent));
-                                    ui.selectable_label(
-                                        self.selected == Some(i),
-                                        format!(
+                                    ui.add(
+                                        egui::Button::new(format!(
                                             "{}\n{}",
                                             f.path
                                                 .file_name()
                                                 .unwrap_or_default()
                                                 .to_string_lossy(),
                                             bytes(f.size)
-                                        ),
+                                        ))
+                                        .selected(self.selected == Some(i))
+                                        .frame(false)
+                                        .truncate(),
                                     )
                                 })
                                 .inner;
@@ -912,47 +1368,7 @@ impl App {
                         }
                     });
             });
-        egui::TopBottomPanel::bottom("status")
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(10.0))
-            .show(ctx, |ui| {
-                let data = self.data.as_ref().unwrap();
-                if data.root == std::path::Path::new("/") {
-                    ui.label(RichText::new("启动磁盘 · 不含其他挂载磁盘与网络磁盘").small().color(MUTED));
-                }
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(format!(
-                            "扫描完成 · {:.1} 秒 · {} 个文件 · 跳过 {} 项（重复目录、链接、特殊文件或读取失败）",
-                            data.elapsed.as_secs_f64(),
-                            data.files.len(),
-                            data.skipped
-                        ))
-                        .small()
-                        .color(MUTED),
-                    );
-                    if !data.errors.is_empty() {
-                        ui.label(
-                            RichText::new(
-                                "部分项目无法读取，请展开下方路径查看原因。",
-                            )
-                            .small()
-                            .color(Color32::from_rgb(235, 180, 116)),
-                        );
-                    }
-                });
-                if !data.errors.is_empty() {
-                    egui::CollapsingHeader::new("无法读取的路径").show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                            .max_height(100.0)
-                            .show(ui, |ui| {
-                                for error in &data.errors {
-                                    ui.label(RichText::new(error).small());
-                                }
-                            });
-                    });
-                }
-            });
+        self.status_bar(ctx);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(12.0))
             .show(ctx, |ui| {
@@ -965,6 +1381,7 @@ impl App {
                 let viewport = ui.available_size().max(Vec2::splat(1.0));
                 self.layout(viewport, ctx.pixels_per_point());
                 let (canvas, response) = ui.allocate_exact_size(viewport, Sense::click());
+                self.canvas_rect = Some(canvas);
                 let painter = ui.painter_at(canvas);
                 let pointer = response.hover_pos();
                 let mut hovered = None;
@@ -1033,6 +1450,10 @@ impl App {
         if let Some(i) = trash {
             self.trash(i);
         }
+        if let Some(id) = restore {
+            self.restore(&id);
+        }
+        self.overlays(ctx);
     }
 }
 impl eframe::App for App {
@@ -1117,6 +1538,7 @@ mod tests {
         let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
     }
     fn settle(app: &mut App, ctx: &egui::Context) {
+        app.recoveries_loaded = true;
         let start = std::time::Instant::now();
         loop {
             frame(app, ctx);
@@ -1405,6 +1827,245 @@ mod tests {
         app.poll(&ctx);
         assert!(Arc::ptr_eq(app.data.as_ref().unwrap(), &current));
         assert_eq!(app.data.as_ref().unwrap().files.len(), 3);
+    }
+    #[test]
+    fn restore_result_relocates_same_snapshot_without_changing_disk_usage() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        let mut trashed = snapshot();
+        trashed.files[1].path = "/Users/test/.Trash/large".into();
+        trashed.files[1].parent = "/Users/test/.Trash".into();
+        app.data = Some(Arc::new(trashed));
+        let source = app.data.clone().unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.restore_rx = Some(rx);
+        tx.send(TrashOutput {
+            source: source.clone(),
+            result: Err("原位置存在同名文件，未覆盖。".into()),
+        })
+        .unwrap();
+        app.poll(&ctx);
+        assert!(Arc::ptr_eq(app.data.as_ref().unwrap(), &source));
+        let (tx, rx) = mpsc::channel();
+        app.restore_rx = Some(rx);
+        tx.send(TrashOutput {
+            source,
+            result: Ok(Some(snapshot())),
+        })
+        .unwrap();
+        app.poll(&ctx);
+        assert_eq!(app.data.as_ref().unwrap().files.len(), 3);
+        assert_eq!(
+            app.data
+                .as_ref()
+                .unwrap()
+                .files
+                .iter()
+                .map(|f| f.size)
+                .sum::<u64>(),
+            1_000_042
+        );
+        assert_eq!(
+            app.data.as_ref().unwrap().files[1].path,
+            PathBuf::from("/a/large")
+        );
+        assert!(app.action_notice.as_ref().unwrap().contains("放回原处"));
+        assert!(app.selected.is_none());
+    }
+    #[test]
+    fn clicking_any_hierarchy_row_copies_full_unicode_path_without_layout_change() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut data = snapshot();
+        data.files[0].path = "/用户/文档/报告.txt".into();
+        data.files[0].parent = "/用户/文档".into();
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.recoveries_loaded = true;
+        app.data = Some(Arc::new(data));
+        settle(&mut app, &ctx);
+        app.selected = Some(0);
+        frame(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        let canvas = app.canvas_rect;
+        for depth in 0..4 {
+            let response = ctx
+                .read_response(egui::Id::new("copy-selected-path").with(depth))
+                .expect("path row visible");
+            let pos = response.rect.center();
+            for pressed in [true, false] {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(1180.0, 780.0),
+                    )),
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                };
+                let output = ctx.run(input, |ctx| app.ui(ctx));
+                if !pressed {
+                    assert!(output.platform_output.commands.iter().any(|command| matches!(command,egui::OutputCommand::CopyText(text) if text=="/用户/文档/报告.txt")));
+                }
+                assert_eq!(app.canvas_rect, canvas);
+            }
+        }
+    }
+    #[test]
+    fn errors_take_priority_over_copy_feedback_until_dismissed() {
+        let mut app = App::default();
+        app.message = Some("文件无法恢复，请检查原目录权限。".into());
+        app.action_notice = Some("已复制完整路径。".into());
+        app.collect_notices();
+        assert_eq!(app.notice.as_ref().unwrap().kind, NoticeKind::Error);
+        assert!(app.notice.as_ref().unwrap().text.contains("恢复"));
+        app.action_notice = Some("已复制完整路径。".into());
+        app.collect_notices();
+        assert_eq!(app.notice.as_ref().unwrap().kind, NoticeKind::Error);
+        app.notice = None;
+        app.action_notice = Some("已复制完整路径。".into());
+        app.collect_notices();
+        assert_eq!(app.notice.as_ref().unwrap().kind, NoticeKind::Success);
+    }
+    #[test]
+    fn stopped_scan_progress_and_errors_preserve_empty_view_bounds() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.recoveries_loaded = true;
+        for _ in 0..3 {
+            frame(&mut app, &ctx);
+        }
+        let rect = app.canvas_rect;
+        let (_tx, rx) = mpsc::channel();
+        app.job = Some(Job {
+            cancel: Arc::default(),
+            progress: Arc::default(),
+            rx,
+        });
+        for _ in 0..3 {
+            frame(&mut app, &ctx);
+            assert_eq!(app.canvas_rect, rect);
+        }
+        defer_drop(app.job.take());
+        app.message = Some("无法读取磁盘，请检查权限。".repeat(30));
+        for _ in 0..3 {
+            frame(&mut app, &ctx);
+            assert_eq!(app.canvas_rect, rect);
+        }
+    }
+    #[test]
+    fn notification_lifecycle_and_background_status_never_resize_canvas() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.recoveries_loaded = true;
+        app.data = Some(Arc::new(snapshot()));
+        settle(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        let canvas = app.canvas_rect.unwrap();
+        let key = app.layout_key;
+        let generation = app.layout_generation.load(Ordering::Relaxed);
+        let check = |app: &mut App| {
+            for _ in 0..3 {
+                frame(app, &ctx);
+                assert_eq!(app.canvas_rect, Some(canvas));
+                assert_eq!(app.layout_key, key);
+                assert_eq!(app.layout_generation.load(Ordering::Relaxed), generation);
+            }
+        };
+        app.action_notice = Some("已复制完整路径。".into());
+        check(&mut app);
+        assert_eq!(app.notice.as_ref().unwrap().kind, NoticeKind::Success);
+        app.message = Some("macOS 拒绝移动文件，请检查权限。".repeat(30));
+        check(&mut app);
+        assert_eq!(app.notice.as_ref().unwrap().kind, NoticeKind::Error);
+        app.notice = Some(Notice {
+            text: "正在移到废纸篓…".into(),
+            kind: NoticeKind::Info,
+            expires: None,
+        });
+        check(&mut app);
+        app.notice.as_mut().unwrap().expires = Some(Instant::now() - Duration::from_secs(1));
+        check(&mut app);
+        assert!(app.notice.is_none());
+        let (_scan_tx, scan_rx) = mpsc::channel();
+        app.job = Some(Job {
+            cancel: Arc::default(),
+            progress: Arc::new(Mutex::new(scan::ScanProgress {
+                files: 3_500_000,
+                bytes: 900_000_000_000,
+                skipped: 12345,
+            })),
+            rx: scan_rx,
+        });
+        check(&mut app);
+        defer_drop(app.job.take());
+        let (_filter_tx, filter_rx) = mpsc::channel();
+        app.filter_rx = Some(filter_rx);
+        check(&mut app);
+        app.filter_rx = None;
+        let (_layout_tx, layout_rx) = mpsc::channel();
+        app.layout_rx = Some(layout_rx);
+        check(&mut app);
+        app.layout_rx = None;
+        let mut with_errors = snapshot();
+        with_errors.errors = vec!["/System/受保护文件：无访问权限".repeat(12)];
+        app.data = Some(Arc::new(with_errors));
+        check(&mut app);
+        app.show_errors = true;
+        check(&mut app);
+        app.show_errors = false;
+        app.show_recoveries = true;
+        check(&mut app);
+        app.show_recoveries = false;
+    }
+    #[test]
+    fn hierarchical_selected_path_does_not_expand_sidebar_or_canvas() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut data = snapshot();
+        data.files[0].path = PathBuf::from(format!(
+            "/{}/{}",
+            (0..25)
+                .map(|i| format!("长目录{i}"))
+                .collect::<Vec<_>>()
+                .join("/"),
+            "long-file-name".repeat(30)
+        ));
+        data.files[0].parent = data.files[0].path.parent().unwrap().to_path_buf();
+        let rows = path_rows(&data.files[0].path);
+        assert_eq!(rows[0].text, "/");
+        assert!(rows.last().unwrap().is_file);
+        assert!(rows.iter().any(|row| row.text == "长目录20"));
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.recoveries_loaded = true;
+        app.data = Some(Arc::new(data));
+        settle(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        let rect = app.canvas_rect;
+        let key = app.layout_key;
+        app.selected = Some(0);
+        for _ in 0..4 {
+            frame(&mut app, &ctx);
+            assert_eq!(app.canvas_rect, rect);
+            assert_eq!(app.layout_key, key);
+        }
+        app.action_notice = Some("已复制完整路径。".into());
+        frame(&mut app, &ctx);
+        assert_eq!(app.canvas_rect, rect);
     }
     #[test]
     #[ignore = "release performance benchmark"]
