@@ -2,6 +2,7 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/windows.rc");
     println!("cargo:rerun-if-changed=assets/windows.manifest");
     println!("cargo:rerun-if-changed=assets/AppIcon.ico");
+    println!("cargo:rerun-if-changed=LICENSE");
 
     // The distributed Windows build uses the MSVC toolchain and Windows SDK.
     // GNU targets remain usable for headless cross-platform code checks.
@@ -10,7 +11,7 @@ fn main() {
     {
         embed_resource::compile(
             "assets/windows.rc",
-            embed_resource::ParamsIncludeDirs(["assets"]),
+            embed_resource::ParamsIncludeDirs([".", "assets"]),
         )
         .manifest_required()
         .expect("the Windows SDK resource compiler is required for Windows packaging");

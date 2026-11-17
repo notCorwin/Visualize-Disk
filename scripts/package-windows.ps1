@@ -35,22 +35,13 @@ try {
         throw "Release executable is missing: $Binary"
     }
 
-    $BundleName = "Visualize-SSD-$($Package.version)-$Target"
+    $Architecture = if ($Target.StartsWith('aarch64-')) { 'arm64' } else { 'x64' }
+    $BundleName = "Visualize-SSD-$($Package.version)-$Architecture.exe"
     $BundleRoot = Join-Path $Metadata.target_directory 'release/bundle'
     New-Item -ItemType Directory -Force -Path $BundleRoot | Out-Null
-    # Fresh staging prevents obsolete files from entering later packages.
-    $Stage = Join-Path $BundleRoot ([guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $Stage | Out-Null
-    try {
-        Copy-Item -LiteralPath $Binary -Destination (Join-Path $Stage 'visualize-ssd.exe')
-        Copy-Item -LiteralPath (Join-Path $Root 'LICENSE') -Destination $Stage
-        $Archive = Join-Path $BundleRoot "$BundleName.zip"
-        Compress-Archive -Path (Join-Path $Stage '*') -DestinationPath $Archive -Force
-        Write-Output "Packaged: $Archive"
-    }
-    finally {
-        Remove-Item -LiteralPath $Stage -Recurse -Force
-    }
+    $Executable = Join-Path $BundleRoot $BundleName
+    Copy-Item -LiteralPath $Binary -Destination $Executable -Force
+    Write-Output "Packaged: $Executable"
 }
 finally {
     [Environment]::SetEnvironmentVariable($RustflagsName, $PreviousRustflags, 'Process')

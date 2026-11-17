@@ -1,7 +1,9 @@
 #define RT_MANIFEST 24
+#define RT_RCDATA 10
 
 1 ICON "AppIcon.ico"
 1 RT_MANIFEST "windows.manifest"
+"LICENSE" RT_RCDATA "LICENSE"
 
 1 VERSIONINFO
 FILEVERSION 0,1,0,0
