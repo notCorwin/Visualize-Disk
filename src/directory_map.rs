@@ -119,7 +119,11 @@ pub fn layout(
                 let unary = directory.children.len() == 1 && directory.files.is_empty();
                 let platform = (below_root && !unary)
                     .then(|| Platform::new(bounds, color))
-                    .flatten();
+                    .flatten()
+                    .map(|mut platform| {
+                        platform.file_covered = directory.children.is_empty();
+                        platform
+                    });
                 // A terminal directory is a file-covered tabletop, not another
                 // empty container. Only parents of subdirectories expose a
                 // shoulder around their children.
