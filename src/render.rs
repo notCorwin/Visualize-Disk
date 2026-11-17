@@ -9,6 +9,9 @@ const MAX_SIDE: usize = 2048;
 const BAND_ROWS: usize = 128;
 const NONE: u32 = u32::MAX;
 const BACKGROUND: Color32 = Color32::from_rgb(19, 23, 29);
+const SHADE_LIGHT: f64 = 1.08;
+const SHADE_X: f64 = 0.14;
+const SHADE_Y: f64 = 0.10;
 
 #[derive(Clone, Copy)]
 pub struct RenderEntry {
@@ -55,9 +58,28 @@ pub struct RenderMap {
 impl RenderMap {
     /// File ids are dataset indices; bounding the lookup table by entry count
     /// prevents arbitrary sparse ids from creating unbounded allocations.
+    #[cfg(test)]
     pub fn build(
         entries: Vec<RenderEntry>,
         bounds: Rect,
+        token: &AtomicU64,
+        generation: u64,
+    ) -> Option<Self> {
+        Self::build_with_size(
+            entries,
+            bounds,
+            [bounds.w.ceil() as usize, bounds.h.ceil() as usize],
+            token,
+            generation,
+        )
+    }
+
+    /// Keep logical geometry and physical pixel dimensions separate for HiDPI
+    /// windows. The same raster owns both the displayed pixels and hit map.
+    pub fn build_with_size(
+        entries: Vec<RenderEntry>,
+        bounds: Rect,
+        size: [usize; 2],
         token: &AtomicU64,
         generation: u64,
     ) -> Option<Self> {
@@ -74,13 +96,7 @@ impl RenderMap {
             }
             by_id[entry.id] = index as u32;
         }
-        let mut base = rasterize(
-            &entries,
-            bounds,
-            [bounds.w.ceil() as usize, bounds.h.ceil() as usize],
-            token,
-            generation,
-        )?;
+        let mut base = rasterize(&entries, bounds, size, token, generation)?;
         let image = base.image.take();
         Some(Self {
             image,
@@ -103,6 +119,7 @@ impl RenderMap {
     /// Render just the currently visible world rectangle. The overview remains
     /// available while this cancellable detail image is produced. Never create
     /// a bitmap for an entire zoomed canvas.
+    #[cfg(test)]
     pub fn rasterize(
         &self,
         view: Rect,
@@ -122,6 +139,9 @@ struct Draw {
     y0: u16,
     y1: u16,
     color: Color32,
+    shade: f32,
+    shade_dx: f32,
+    shade_dy: f32,
 }
 
 fn valid(rect: Rect) -> bool {
@@ -176,36 +196,31 @@ fn rasterize(
         // Sample pixel centres: small files never become artificial minimum-size
         // blocks that overwrite their neighbours. Every drawn pixel has exactly
         // one original file id; further zoom renders finer original rectangles.
-        // Separate individually resolvable files even when their directory
-        // colour is identical. Inset before viewport clipping, so panning does
-        // not create spurious borders at the visible area's edges.
-        let inset_x = if r.w * sx > 5.0 && r.h * sy > 5.0 {
-            0.7 / sx
-        } else {
-            0.0
-        };
-        let inset_y = if inset_x > 0.0 { 0.7 / sy } else { 0.0 };
-        let x0 = ((((r.x + inset_x) - view.x) * sx - 0.5).ceil().max(0.0) as usize).min(width);
-        let x1 = ((((r.x + r.w - inset_x) - view.x) * sx - 0.5)
-            .ceil()
-            .max(0.0) as usize)
-            .min(width);
-        let y0 = ((((r.y + inset_y) - view.y) * sy - 0.5).ceil().max(0.0) as usize).min(height);
-        let y1 = ((((r.y + r.h - inset_y) - view.y) * sy - 0.5)
-            .ceil()
-            .max(0.0) as usize)
-            .min(height);
+        // Fill the complete file rectangle. A subtle luminance ramp restarts
+        // per file, separating same-colour neighbours without black gutters.
+        let x0 = (((r.x - view.x) * sx - 0.5).ceil().max(0.0) as usize).min(width);
+        let x1 = ((((r.x + r.w) - view.x) * sx - 0.5).ceil().max(0.0) as usize).min(width);
+        let y0 = (((r.y - view.y) * sy - 0.5).ceil().max(0.0) as usize).min(height);
+        let y1 = ((((r.y + r.h) - view.y) * sy - 0.5).ceil().max(0.0) as usize).min(height);
         if x1 <= x0 || y1 <= y0 {
             continue;
         }
         for band in y0 / BAND_ROWS..=(y1 - 1) / BAND_ROWS {
+            let band_y0 = y0.max(band * BAND_ROWS);
+            // Anchor shading to the original full file, never the viewport or
+            // clipped band. f64 subtraction avoids cancellation on tiny files.
+            let u = (view.x as f64 - r.x as f64 + (x0 as f64 + 0.5) / sx as f64) / r.w as f64;
+            let v = (view.y as f64 - r.y as f64 + (band_y0 as f64 + 0.5) / sy as f64) / r.h as f64;
             bands[band].push(Draw {
                 id: entry.id as u32,
                 x0: x0 as u16,
                 x1: x1 as u16,
-                y0: y0.max(band * BAND_ROWS) as u16,
+                y0: band_y0 as u16,
                 y1: y1.min((band + 1) * BAND_ROWS) as u16,
                 color: entry.color,
+                shade: (SHADE_LIGHT - SHADE_X * u - SHADE_Y * v) as f32,
+                shade_dx: (-SHADE_X / (sx as f64 * r.w as f64)) as f32,
+                shade_dy: (-SHADE_Y / (sy as f64 * r.h as f64)) as f32,
             });
         }
     }
@@ -227,7 +242,19 @@ fn rasterize(
                 for y in draw.y0 as usize..draw.y1 as usize {
                     let start = (y - band * BAND_ROWS) * width + draw.x0 as usize;
                     let end = start + (draw.x1 - draw.x0) as usize;
-                    pixels[start..end].fill(draw.color);
+                    let row_shade = draw.shade + (y - draw.y0 as usize) as f32 * draw.shade_dy;
+                    for (offset, pixel) in pixels[start..end].iter_mut().enumerate() {
+                        let shade = (row_shade + offset as f32 * draw.shade_dx).clamp(0.84, 1.08);
+                        let alpha = draw.color.a();
+                        let channel =
+                            |value: u8| (value as f32 * shade).round().min(alpha as f32) as u8;
+                        *pixel = Color32::from_rgba_premultiplied(
+                            channel(draw.color.r()),
+                            channel(draw.color.g()),
+                            channel(draw.color.b()),
+                            alpha,
+                        );
+                    }
                     owners[start..end].fill(draw.id);
                 }
             }
@@ -278,33 +305,128 @@ mod tests {
         assert_eq!(map.hit_test(f32::NAN, 50.0), None);
         assert_eq!(map.rect(2), Some(rect(99.999, 0.0, 0.001, 100.0)));
         let image = map.image.as_ref().unwrap();
-        assert_eq!(image.pixels[50 * 100 + 20], Color32::RED);
-        assert_eq!(image.pixels[50 * 100 + 70], Color32::BLUE);
+        let red = image.pixels[50 * 100 + 20];
+        let blue = image.pixels[50 * 100 + 70];
+        assert!(red.r() > 200 && red.g() == 0 && red.b() == 0);
+        assert!(blue.b() > 200 && blue.r() == 0 && blue.g() == 0);
     }
     #[test]
-    fn same_colour_neighbours_have_non_file_gutters() {
+    fn same_colour_files_restart_gradient_without_gaps() {
         let token = AtomicU64::new(1);
+        let base = Color32::from_rgb(65, 143, 151);
         let entries = vec![
             RenderEntry {
                 id: 0,
                 rect: rect(0.0, 0.0, 50.0, 100.0),
-                color: Color32::BLUE,
+                color: base,
             },
             RenderEntry {
                 id: 1,
                 rect: rect(50.0, 0.0, 50.0, 100.0),
-                color: Color32::BLUE,
+                color: base,
             },
         ];
         let map = RenderMap::build(entries, rect(0.0, 0.0, 100.0, 100.0), &token, 1).unwrap();
-        assert_eq!(map.hit_test(48.5, 50.5), Some(0));
-        assert_eq!(map.hit_test(49.5, 50.5), None);
-        assert_eq!(map.hit_test(50.5, 50.5), None);
-        assert_eq!(map.hit_test(51.5, 50.5), Some(1));
-        assert_eq!(
-            map.image.as_ref().unwrap().pixels[50 * 100 + 50],
-            BACKGROUND
-        );
+        let pixels = &map.image.as_ref().unwrap().pixels;
+        for y in 0..100 {
+            for x in 0..100 {
+                assert_eq!(map.hit_test(x as f32 + 0.5, y as f32 + 0.5), Some(x / 50));
+                assert_ne!(pixels[y * 100 + x], BACKGROUND);
+            }
+        }
+        assert_eq!(pixels[20 * 100 + 10], pixels[20 * 100 + 60]);
+        assert!(pixels[50 * 100 + 50].g() > pixels[50 * 100 + 49].g() + 15);
+        assert!(pixels[10 * 100 + 10].g() > pixels[90 * 100 + 40].g());
+    }
+    #[test]
+    fn crop_and_hidpi_samples_keep_original_file_shading_and_ownership() {
+        let token = AtomicU64::new(1);
+        let map = RenderMap::build(entries(), rect(0.0, 0.0, 100.0, 100.0), &token, 1).unwrap();
+        let detail = map
+            .rasterize(rect(10.0, 20.0, 60.0, 40.0), [60, 40], &token, 1)
+            .unwrap();
+        for y in 0..40 {
+            for x in 0..60 {
+                assert_eq!(
+                    detail.image.as_ref().unwrap().pixels[y * 60 + x],
+                    map.image.as_ref().unwrap().pixels[(y + 20) * 100 + x + 10]
+                );
+                assert_eq!(
+                    detail.hit_test(x as f32 + 10.5, y as f32 + 20.5),
+                    map.hit_test(x as f32 + 10.5, y as f32 + 20.5)
+                );
+            }
+        }
+        let hi = RenderMap::build_with_size(entries(), map.bounds, [200, 200], &token, 1).unwrap();
+        assert_eq!(hi.image.as_ref().unwrap().size, [200, 200]);
+        for &(x, y, id) in &[
+            (0.25, 0.25, 0),
+            (49.75, 99.75, 0),
+            (50.25, 0.25, 1),
+            (99.75, 99.75, 1),
+        ] {
+            assert_eq!(hi.hit_test(x, y), Some(id));
+        }
+    }
+    #[test]
+    fn resized_treemaps_cover_every_pixel_without_border_holes() {
+        let token = AtomicU64::new(1);
+        let items: Vec<_> = (0..5000)
+            .map(|id| (id, ((id % 31 + 1) as u64).pow(3)))
+            .collect();
+        for size in [[95, 75], [211, 93], [91, 203]] {
+            let bounds = rect(0.0, 0.0, size[0] as f32, size[1] as f32);
+            let geometry = crate::treemap::layout_with_cancel(&items, bounds, &token, 1).unwrap();
+            let entries = geometry
+                .into_iter()
+                .map(|(id, rect)| RenderEntry {
+                    id,
+                    rect,
+                    color: Color32::from_rgb(65, 143, 151),
+                })
+                .collect();
+            let map = RenderMap::build_with_size(entries, bounds, size, &token, 1).unwrap();
+            assert!(
+                map.base.owners.iter().all(|&id| id != NONE),
+                "unowned pixel after resize to {size:?}"
+            );
+        }
+    }
+    #[test]
+    fn gradient_is_continuous_across_parallel_band_boundaries() {
+        let token = AtomicU64::new(1);
+        let map = RenderMap::build(
+            vec![RenderEntry {
+                id: 0,
+                rect: rect(0.0, 0.0, 64.0, 300.0),
+                color: Color32::from_rgb(65, 143, 151),
+            }],
+            rect(0.0, 0.0, 64.0, 300.0),
+            &token,
+            1,
+        )
+        .unwrap();
+        let pixels = &map.image.as_ref().unwrap().pixels;
+        for row in [127, 128, 129, 255, 256, 257] {
+            let a = pixels[(row - 1) * 64 + 32];
+            let b = pixels[row * 64 + 32];
+            assert!(
+                (a.g() as i16 - b.g() as i16).abs() <= 1,
+                "band boundary at row {row}"
+            );
+        }
+        let cropped = map
+            .rasterize(rect(10.0, 120.0, 30.0, 40.0), [30, 40], &token, 1)
+            .unwrap();
+        for y in 0..40 {
+            for x in 0..30 {
+                let a = pixels[(y + 120) * 64 + x + 10];
+                let b = cropped.image.as_ref().unwrap().pixels[y * 30 + x];
+                assert!((a.r() as i16 - b.r() as i16).abs() <= 1);
+                assert!((a.g() as i16 - b.g() as i16).abs() <= 1);
+                assert!((a.b() as i16 - b.b() as i16).abs() <= 1);
+            }
+        }
     }
     #[test]
     fn viewport_detail_reveals_original_subpixel_file_and_translates_origin() {

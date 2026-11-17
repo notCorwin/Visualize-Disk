@@ -6,12 +6,35 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+impl FileIdentity {
+    #[cfg(unix)]
+    pub fn from_metadata(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    #[cfg(not(unix))]
+    pub fn from_metadata(_metadata: &fs::Metadata) -> Self {
+        Self::default()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FileEntry {
     pub path: PathBuf,
     /// Logical file length, including sparse regions; not allocated disk blocks.
     pub size: u64,
     pub parent: PathBuf,
+    pub identity: FileIdentity,
 }
 
 #[derive(Debug)]
@@ -213,6 +236,7 @@ fn scan_directory_batches(
                         path,
                     }),
                     Ok(meta) if meta.is_file() => EntryReport::File(FileEntry {
+                        identity: FileIdentity::from_metadata(&meta),
                         size: meta.len(),
                         path,
                         parent: directory.to_path_buf(),
@@ -394,6 +418,12 @@ mod tests {
             result.files.iter().map(|f| f.size).collect::<Vec<_>>(),
             vec![9, 4, 0]
         );
+        for file in &result.files {
+            assert_eq!(
+                file.identity,
+                FileIdentity::from_metadata(&fs::symlink_metadata(&file.path).unwrap())
+            );
+        }
         assert_eq!(result.files[0].parent, temp.0.join("child"));
         assert_eq!(result.skipped, 0);
         assert_eq!(progress.lock().unwrap().bytes, 13);

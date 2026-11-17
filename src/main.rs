@@ -1,3 +1,4 @@
+mod file_actions;
 mod permission;
 mod render;
 mod scan;
@@ -101,23 +102,13 @@ fn configure(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-fn displayed_hit(
-    map: &render::RenderMap,
-    detail: Option<&render::RenderRaster>,
-    x: f32,
-    y: f32,
-) -> Option<usize> {
-    if let Some(detail) = detail {
-        let r = detail.bounds;
-        if x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h {
-            return detail.hit_test(x, y);
-        }
-    }
-    map.hit_test(x, y)
-}
-
 fn defer_drop<T: Send + 'static>(value: T) {
     rayon::spawn(move || drop(value));
+}
+
+struct TrashOutput {
+    source: Arc<scan::ScanResult>,
+    result: Result<Option<scan::ScanResult>, String>,
 }
 
 struct FilterOutput {
@@ -125,13 +116,36 @@ struct FilterOutput {
     indices: Vec<usize>,
     bytes: u64,
 }
-struct DetailOutput {
-    generation: u64,
-    raster: render::RenderRaster,
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LayoutKey {
+    logical_size: Vec2,
+    physical_size: [usize; 2],
+}
+impl LayoutKey {
+    fn new(size: Vec2, pixels_per_point: f32) -> Self {
+        let logical_size = size.max(Vec2::splat(1.0)).ceil();
+        let scale = pixels_per_point.max(0.1);
+        Self {
+            logical_size,
+            physical_size: [
+                (logical_size.x * scale).ceil() as usize,
+                (logical_size.y * scale).ceil() as usize,
+            ],
+        }
+    }
 }
 struct LayoutOutput {
     generation: u64,
+    key: LayoutKey,
     map: render::RenderMap,
+}
+// One generation owns geometry, pixels and hit testing together. A resize may
+// stretch this entire cache while its replacement is prepared off-thread.
+struct MapCache {
+    generation: u64,
+    key: LayoutKey,
+    map: render::RenderMap,
+    texture: egui::TextureHandle,
 }
 
 fn filter_snapshot(
@@ -177,7 +191,7 @@ fn filter_snapshot(
 
 fn layout_snapshot(
     data: &scan::ScanResult,
-    size: Vec2,
+    key: LayoutKey,
     token: &AtomicU64,
     generation: u64,
 ) -> Option<render::RenderMap> {
@@ -213,8 +227,8 @@ fn layout_snapshot(
     let bounds = treemap::Rect {
         x: 0.0,
         y: 0.0,
-        w: size.x,
-        h: size.y,
+        w: key.logical_size.x,
+        h: key.logical_size.y,
     };
     let group_bounds = treemap::layout_with_cancel(&weights, bounds, token, generation)?;
     let pieces: Result<Vec<Vec<render::RenderEntry>>, ()> = group_bounds
@@ -238,7 +252,7 @@ fn layout_snapshot(
     if token.load(Ordering::Relaxed) != generation {
         return None;
     }
-    render::RenderMap::build(entries, bounds, token, generation)
+    render::RenderMap::build_with_size(entries, bounds, key.physical_size, token, generation)
 }
 
 struct Job {
@@ -253,9 +267,11 @@ struct App {
     data: Option<Arc<scan::ScanResult>>,
     job: Option<Job>,
     reveal_rx: Option<mpsc::Receiver<Result<(), String>>>,
+    trash_rx: Option<mpsc::Receiver<TrashOutput>>,
     query: String,
     selected: Option<usize>,
     message: Option<String>,
+    action_notice: Option<String>,
     filtered: Vec<usize>,
     total_bytes: u64,
     dirty: bool,
@@ -265,17 +281,8 @@ struct App {
     totals_ready: bool,
     layout_rx: Option<mpsc::Receiver<LayoutOutput>>,
     layout_generation: Arc<AtomicU64>,
-    layout_applied: u64,
-    layout_size: Vec2,
-    render_map: Option<Arc<render::RenderMap>>,
-    texture: Option<egui::TextureHandle>,
-    detail_rx: Option<mpsc::Receiver<DetailOutput>>,
-    detail_generation: Arc<AtomicU64>,
-    detail_applied: u64,
-    detail_requested: Option<(treemap::Rect, [usize; 2])>,
-    detail: Option<render::RenderRaster>,
-    detail_texture: Option<egui::TextureHandle>,
-    zoom: f32,
+    layout_key: Option<LayoutKey>,
+    map_cache: Option<MapCache>,
 }
 impl Default for App {
     fn default() -> Self {
@@ -286,9 +293,11 @@ impl Default for App {
             data: None,
             job: None,
             reveal_rx: None,
+            trash_rx: None,
             query: String::new(),
             selected: None,
             message: None,
+            action_notice: None,
             filtered: Vec::new(),
             total_bytes: 0,
             dirty: true,
@@ -298,17 +307,8 @@ impl Default for App {
             totals_ready: false,
             layout_rx: None,
             layout_generation: Arc::new(AtomicU64::new(0)),
-            layout_applied: 0,
-            layout_size: Vec2::ZERO,
-            render_map: None,
-            texture: None,
-            detail_rx: None,
-            detail_generation: Arc::new(AtomicU64::new(0)),
-            detail_applied: 0,
-            detail_requested: None,
-            detail: None,
-            detail_texture: None,
-            zoom: 1.0,
+            layout_key: None,
+            map_cache: None,
         }
     }
 }
@@ -361,6 +361,70 @@ impl App {
         });
         self.message = None;
     }
+    fn replace_snapshot(&mut self, data: scan::ScanResult) {
+        if let Some(old) = self.data.replace(Arc::new(data)) {
+            defer_drop(old);
+        }
+        self.filter_generation.fetch_add(1, Ordering::Relaxed);
+        self.layout_generation.fetch_add(1, Ordering::Relaxed);
+        if let Some(old) = self.filter_rx.take() {
+            defer_drop(old);
+        }
+        if let Some(old) = self.layout_rx.take() {
+            defer_drop(old);
+        }
+        if let Some(old) = self.map_cache.take() {
+            defer_drop(old);
+        }
+        self.filtered.clear();
+        self.total_bytes = 0;
+        self.totals_ready = false;
+        self.selected = None;
+        self.query.clear();
+        self.dirty = true;
+        self.layout_key = None;
+    }
+    fn trash(&mut self, id: usize) {
+        if self.trash_rx.is_some() {
+            return;
+        }
+        let Some(source) = self.data.clone() else {
+            return;
+        };
+        let Some(file) = source.files.get(id) else {
+            return;
+        };
+        let path = file.path.clone();
+        let identity = file.identity;
+        let (tx, rx) = mpsc::channel();
+        self.trash_rx = Some(rx);
+        self.action_notice = None;
+        self.message = Some("正在移到废纸篓…".into());
+        rayon::spawn(move || {
+            let result = file_actions::move_to_trash(&path, identity).map(|moved| {
+                let moved = moved?;
+                // This operation can clone millions of paths; never do it on the
+                // UI thread. Source identity guards against a newer scan winning.
+                let mut files: Vec<_> = source
+                    .files
+                    .par_iter()
+                    .enumerate()
+                    .map(|(i, file)| if i == id { moved.clone() } else { file.clone() })
+                    .collect();
+                files.par_sort_unstable_by(|a, b| {
+                    b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path))
+                });
+                Some(scan::ScanResult {
+                    root: source.root.clone(),
+                    files,
+                    skipped: source.skipped,
+                    errors: source.errors.clone(),
+                    elapsed: source.elapsed,
+                })
+            });
+            let _ = tx.send(TrashOutput { source, result });
+        });
+    }
     fn poll(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.permission_rx {
             match rx.try_recv() {
@@ -400,40 +464,7 @@ impl App {
                         self.message = Some("已取消扫描，保留上次扫描结果。".into());
                     } else {
                         match result {
-                            Ok(data) => {
-                                if let Some(old) = self.data.replace(Arc::new(data)) {
-                                    defer_drop(old);
-                                }
-                                self.filter_generation.fetch_add(1, Ordering::Relaxed);
-                                self.layout_generation.fetch_add(1, Ordering::Relaxed);
-                                if let Some(old) = self.filter_rx.take() {
-                                    defer_drop(old);
-                                }
-                                if let Some(old) = self.layout_rx.take() {
-                                    defer_drop(old);
-                                }
-                                if let Some(old) = self.render_map.take() {
-                                    defer_drop(old);
-                                }
-                                self.texture = None;
-                                self.detail_generation.fetch_add(1, Ordering::Relaxed);
-                                self.detail_requested = None;
-                                if let Some(old) = self.detail_rx.take() {
-                                    defer_drop(old);
-                                }
-                                if let Some(old) = self.detail.take() {
-                                    defer_drop(old);
-                                }
-                                self.detail_texture = None;
-                                self.filtered.clear();
-                                self.total_bytes = 0;
-                                self.totals_ready = false;
-                                self.selected = None;
-                                self.query.clear();
-                                self.zoom = 1.0;
-                                self.dirty = true;
-                                self.layout_size = Vec2::ZERO;
-                            }
+                            Ok(data) => self.replace_snapshot(data),
                             Err(e) => self.message = Some(e),
                         }
                     }
@@ -443,6 +474,42 @@ impl App {
                     self.message = Some("扫描任务意外结束，请重新扫描。".into());
                 }
                 _ => {}
+            }
+        }
+        if let Some(rx) = &self.trash_rx {
+            match rx.try_recv() {
+                Ok(output) => {
+                    self.trash_rx = None;
+                    self.message = None;
+                    match output.result {
+                        Ok(Some(data))
+                            if self
+                                .data
+                                .as_ref()
+                                .is_some_and(|current| Arc::ptr_eq(current, &output.source)) =>
+                        {
+                            let refresh = self.job.is_some();
+                            self.replace_snapshot(data);
+                            if refresh {
+                                self.start();
+                            }
+                            self.action_notice = Some("已移到废纸篓。".into());
+                        }
+                        Ok(data) => {
+                            defer_drop(data);
+                            self.action_notice =
+                                Some("已移到废纸篓，正在重新扫描以更新磁盘结果。".into());
+                            self.start();
+                        }
+                        Err(error) => self.message = Some(error),
+                    }
+                    defer_drop(output.source);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.trash_rx = None;
+                    self.message = Some("废纸篓操作未完成，请重新扫描后重试。".into());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
             }
         }
         if let Some(rx) = &self.filter_rx {
@@ -466,26 +533,25 @@ impl App {
             match rx.try_recv() {
                 Ok(mut output) => {
                     self.layout_rx = None;
-                    if output.generation == self.layout_generation.load(Ordering::Relaxed) {
-                        self.layout_applied = output.generation;
-                        self.detail_generation.fetch_add(1, Ordering::Relaxed);
-                        self.detail_requested = None;
-                        if let Some(old) = self.detail_rx.take() {
-                            defer_drop(old);
-                        }
-                        if let Some(old) = self.detail.take() {
-                            defer_drop(old);
-                        }
-                        self.detail_texture = None;
+                    if output.generation == self.layout_generation.load(Ordering::Relaxed)
+                        && self.layout_key == Some(output.key)
+                    {
                         if let Some(image) = output.map.image.take() {
-                            self.texture = Some(ctx.load_texture(
-                                "disk-map",
-                                image,
-                                egui::TextureOptions::NEAREST,
-                            ));
-                        }
-                        if let Some(old) = self.render_map.replace(Arc::new(output.map)) {
-                            defer_drop(old);
+                            let cache = MapCache {
+                                generation: output.generation,
+                                key: output.key,
+                                map: output.map,
+                                texture: ctx.load_texture(
+                                    "disk-map",
+                                    image,
+                                    egui::TextureOptions::NEAREST,
+                                ),
+                            };
+                            if let Some(old) = self.map_cache.replace(cache) {
+                                defer_drop(old);
+                            }
+                        } else {
+                            defer_drop(output);
                         }
                     } else {
                         defer_drop(output);
@@ -495,36 +561,12 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        if let Some(rx) = &self.detail_rx {
-            match rx.try_recv() {
-                Ok(mut output) => {
-                    self.detail_rx = None;
-                    if output.generation == self.detail_generation.load(Ordering::Relaxed) {
-                        self.detail_applied = output.generation;
-                        if let Some(image) = output.raster.image.take() {
-                            self.detail_texture = Some(ctx.load_texture(
-                                "disk-detail",
-                                image,
-                                egui::TextureOptions::NEAREST,
-                            ));
-                        }
-                        if let Some(old) = self.detail.replace(output.raster) {
-                            defer_drop(old);
-                        }
-                    } else {
-                        defer_drop(output);
-                    }
-                }
-                Err(mpsc::TryRecvError::Disconnected) => self.detail_rx = None,
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
         if self.job.is_some()
             || self.reveal_rx.is_some()
+            || self.trash_rx.is_some()
             || self.permission_rx.is_some()
             || self.filter_rx.is_some()
             || self.layout_rx.is_some()
-            || self.detail_rx.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -552,13 +594,19 @@ impl App {
             }
         });
     }
-    fn layout(&mut self, size: Vec2) {
-        if self.layout_size != size {
-            self.layout_size = size;
+    fn layout(&mut self, size: Vec2, pixels_per_point: f32) {
+        let key = LayoutKey::new(size, pixels_per_point);
+        if self.layout_key != Some(key) {
+            self.layout_key = Some(key);
             self.layout_generation.fetch_add(1, Ordering::Relaxed);
         }
         let generation = self.layout_generation.load(Ordering::Relaxed);
-        if self.layout_rx.is_some() || self.layout_applied == generation {
+        if self.layout_rx.is_some()
+            || self
+                .map_cache
+                .as_ref()
+                .is_some_and(|cache| cache.generation == generation && cache.key == key)
+        {
             return;
         }
         let Some(data) = self.data.clone() else {
@@ -568,27 +616,12 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.layout_rx = Some(rx);
         rayon::spawn(move || {
-            if let Some(map) = layout_snapshot(&data, size, &token, generation) {
-                let _ = tx.send(LayoutOutput { generation, map });
-            }
-        });
-    }
-    fn detail(&mut self, map: Arc<render::RenderMap>, view: treemap::Rect, size: [usize; 2]) {
-        let key = (view, size);
-        if self.detail_requested != Some(key) {
-            self.detail_requested = Some(key);
-            self.detail_generation.fetch_add(1, Ordering::Relaxed);
-        }
-        let generation = self.detail_generation.load(Ordering::Relaxed);
-        if self.detail_rx.is_some() || self.detail_applied == generation {
-            return;
-        }
-        let token = self.detail_generation.clone();
-        let (tx, rx) = mpsc::channel();
-        self.detail_rx = Some(rx);
-        rayon::spawn(move || {
-            if let Some(raster) = map.rasterize(view, size, &token, generation) {
-                let _ = tx.send(DetailOutput { generation, raster });
+            if let Some(map) = layout_snapshot(&data, key, &token, generation) {
+                let _ = tx.send(LayoutOutput {
+                    generation,
+                    key,
+                    map,
+                });
             }
         });
     }
@@ -717,6 +750,9 @@ impl App {
                 if let Some(message) = &self.message {
                     ui.label(RichText::new(message).color(Color32::from_rgb(235, 180, 116)));
                 }
+                if let Some(notice) = &self.action_notice {
+                    ui.label(RichText::new(notice).color(ACCENT));
+                }
             });
         self.filter();
         if self.data.is_none() {
@@ -770,7 +806,10 @@ impl App {
                         self.data.as_ref().unwrap().files.len()
                     ));
                     if self.layout_rx.is_some() {
-                        ui.label(RichText::new("正在生成整盘视图…").color(MUTED));
+                        ui.add(
+                            egui::Label::new(RichText::new("正在生成整盘视图…").color(MUTED))
+                                .truncate(),
+                        );
                     }
                     ui.label(
                         RichText::new(if self.totals_ready {
@@ -781,17 +820,11 @@ impl App {
                         .strong()
                         .color(ACCENT),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add(
-                            egui::Slider::new(&mut self.zoom, 1.0..=20.0)
-                                .logarithmic(true)
-                                .text("放大"),
-                        );
-                    });
                 });
             });
         self.filter();
         let mut reveal = None;
+        let mut trash = None;
         egui::SidePanel::right("files")
             .default_width(280.0)
             .min_width(230.0)
@@ -807,15 +840,33 @@ impl App {
                             .strong(),
                     );
                     ui.label(RichText::new(bytes(f.size)).size(24.0).color(ACCENT));
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(f.path.to_string_lossy()).small().color(MUTED),
+                    let path = f.path.to_string_lossy();
+                    if ui
+                        .add(
+                            egui::Label::new(RichText::new(path.as_ref()).small().color(MUTED))
+                                .wrap()
+                                .sense(Sense::click()),
                         )
-                        .wrap(),
-                    );
+                        .on_hover_text("点击复制完整路径")
+                        .clicked()
+                    {
+                        if let Some(exact) = f.path.to_str() {
+                            ctx.copy_text(exact.to_owned());
+                            self.action_notice = Some("已复制完整路径。".into());
+                        } else {
+                            self.message =
+                                Some("路径包含无法复制为文本的字符，请在 Finder 中查看。".into());
+                        }
+                    }
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("在 Finder 中显示").clicked() {
                             reveal = Some(i);
+                        }
+                        if ui
+                            .add_enabled(self.trash_rx.is_none(), egui::Button::new("移到废纸篓"))
+                            .clicked()
+                        {
+                            trash = Some(i);
                         }
                     });
                     ui.separator();
@@ -829,11 +880,10 @@ impl App {
                     ui.label(RichText::new("没有匹配的文件").color(MUTED));
                 }
                 let row_height = 42.0;
-                egui::ScrollArea::vertical().id_salt("file-list").show_rows(
-                    ui,
-                    row_height,
-                    self.filtered.len(),
-                    |ui, rows| {
+                egui::ScrollArea::vertical()
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .id_salt("file-list")
+                    .show_rows(ui, row_height, self.filtered.len(), |ui, rows| {
                         for row in rows {
                             let i = self.filtered[row];
                             let f = &self.data.as_ref().unwrap().files[i];
@@ -860,8 +910,7 @@ impl App {
                             }
                             response.on_hover_text(f.path.to_string_lossy());
                         }
-                    },
-                );
+                    });
             });
         egui::TopBottomPanel::bottom("status")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(10.0))
@@ -894,6 +943,7 @@ impl App {
                 if !data.errors.is_empty() {
                     egui::CollapsingHeader::new("无法读取的路径").show(ui, |ui| {
                         egui::ScrollArea::vertical()
+                            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                             .max_height(100.0)
                             .show(ui, |ui| {
                                 for error in &data.errors {
@@ -912,128 +962,76 @@ impl App {
                     });
                     return;
                 }
-                let viewport = ui.available_size().max(Vec2::splat(1.0)).ceil();
-                self.layout(viewport);
-                let size = viewport * self.zoom;
-                egui::ScrollArea::both()
-                    .id_salt("treemap-scroll")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        let (canvas, response) = ui.allocate_exact_size(size, Sense::click());
-                        let painter = ui.painter_at(canvas);
-                        let pointer = response.hover_pos();
-                        let mut hovered = None;
-                        let data = self.data.as_ref().unwrap().clone();
-                        if let (Some(map), Some(texture)) = (self.render_map.clone(), &self.texture)
-                        {
-                            painter.image(
-                                texture.id(),
-                                canvas,
-                                Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                Color32::WHITE,
+                let viewport = ui.available_size().max(Vec2::splat(1.0));
+                self.layout(viewport, ctx.pixels_per_point());
+                let (canvas, response) = ui.allocate_exact_size(viewport, Sense::click());
+                let painter = ui.painter_at(canvas);
+                let pointer = response.hover_pos();
+                let mut hovered = None;
+                let data = self.data.as_ref().unwrap();
+                if let Some(cache) = &self.map_cache {
+                    let map = &cache.map;
+                    painter.image(
+                        cache.texture.id(),
+                        canvas,
+                        Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                    let scale = Vec2::new(
+                        canvas.width() / map.bounds.w,
+                        canvas.height() / map.bounds.h,
+                    );
+                    if let Some(p) = pointer {
+                        hovered = map.hit_test(
+                            (p.x - canvas.min.x) / scale.x,
+                            (p.y - canvas.min.y) / scale.y,
+                        );
+                    }
+                    for (id, width) in [(self.selected, 2.0), (hovered, 1.5)] {
+                        if let Some(r) = id.and_then(|i| map.rect(i)) {
+                            let rect = Rect::from_min_size(
+                                canvas.min + Vec2::new(r.x * scale.x, r.y * scale.y),
+                                Vec2::new(r.w * scale.x, r.h * scale.y),
                             );
-                            let scale = Vec2::new(
-                                canvas.width() / map.bounds.w,
-                                canvas.height() / map.bounds.h,
-                            );
-                            let visible = canvas.intersect(ui.clip_rect());
-                            let view = treemap::Rect {
-                                x: (visible.min.x - canvas.min.x) / scale.x,
-                                y: (visible.min.y - canvas.min.y) / scale.y,
-                                w: visible.width() / scale.x,
-                                h: visible.height() / scale.y,
-                            };
-                            let ppp = ctx.pixels_per_point();
-                            let raster_size = [
-                                (visible.width() * ppp).ceil() as usize,
-                                (visible.height() * ppp).ceil() as usize,
-                            ];
-                            if self.zoom > 1.0 || ppp > 1.0 {
-                                self.detail(map.clone(), view, raster_size);
-                            }
-                            let current_detail = self.detail_applied
-                                == self.detail_generation.load(Ordering::Relaxed);
-                            if current_detail {
-                                if let (Some(detail), Some(texture)) =
-                                    (&self.detail, &self.detail_texture)
-                                {
-                                    let r = detail.bounds;
-                                    let rect = Rect::from_min_size(
-                                        canvas.min + Vec2::new(r.x * scale.x, r.y * scale.y),
-                                        Vec2::new(r.w * scale.x, r.h * scale.y),
-                                    );
-                                    painter.image(
-                                        texture.id(),
-                                        rect,
-                                        Rect::from_min_max(
-                                            egui::pos2(0.0, 0.0),
-                                            egui::pos2(1.0, 1.0),
-                                        ),
-                                        Color32::WHITE,
-                                    );
-                                }
-                            }
-                            if let Some(p) = pointer {
-                                let x = (p.x - canvas.min.x) / scale.x;
-                                let y = (p.y - canvas.min.y) / scale.y;
-                                hovered = displayed_hit(
-                                    &map,
-                                    if current_detail {
-                                        self.detail.as_ref()
-                                    } else {
-                                        None
-                                    },
-                                    x,
-                                    y,
+                            if rect.width() > 1.0 && rect.height() > 1.0 {
+                                painter.rect_stroke(
+                                    rect.shrink(0.5),
+                                    0.0,
+                                    egui::Stroke::new(width, Color32::WHITE),
+                                    egui::StrokeKind::Inside,
                                 );
                             }
-                            for (id, width) in [(self.selected, 2.0), (hovered, 1.5)] {
-                                if let Some(r) = id.and_then(|i| map.rect(i)) {
-                                    let rect = Rect::from_min_size(
-                                        canvas.min + Vec2::new(r.x * scale.x, r.y * scale.y),
-                                        Vec2::new(r.w * scale.x, r.h * scale.y),
-                                    );
-                                    if rect.width() > 1.0 && rect.height() > 1.0 {
-                                        painter.rect_stroke(
-                                            rect.shrink(0.5),
-                                            0.0,
-                                            egui::Stroke::new(width, Color32::WHITE),
-                                            egui::StrokeKind::Inside,
-                                        );
-                                    }
-                                }
-                            }
-                        } else {
-                            painter.text(
-                                canvas.center(),
-                                egui::Align2::CENTER_CENTER,
-                                "正在生成整盘视图…",
-                                FontId::proportional(16.0),
-                                MUTED,
-                            );
                         }
-                        if let Some(i) = hovered {
-                            let f = &data.files[i];
-                            if response.clicked() {
-                                self.selected = Some(i);
-                            }
-                            response.on_hover_ui_at_pointer(|ui| {
-                                ui.label(
-                                    RichText::new(
-                                        f.path.file_name().unwrap_or_default().to_string_lossy(),
-                                    )
-                                    .strong(),
-                                );
-                                ui.label(bytes(f.size));
-                                ui.label(
-                                    RichText::new(f.path.to_string_lossy()).small().color(MUTED),
-                                );
-                            });
-                        }
+                    }
+                } else {
+                    painter.text(
+                        canvas.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "正在生成整盘视图…",
+                        FontId::proportional(16.0),
+                        MUTED,
+                    );
+                }
+                if let Some(i) = hovered {
+                    let f = &data.files[i];
+                    if response.clicked() {
+                        self.selected = Some(i);
+                    }
+                    response.on_hover_ui_at_pointer(|ui| {
+                        ui.label(
+                            RichText::new(f.path.file_name().unwrap_or_default().to_string_lossy())
+                                .strong(),
+                        );
+                        ui.label(bytes(f.size));
+                        ui.label(RichText::new(f.path.to_string_lossy()).small().color(MUTED));
                     });
+                }
             });
         if let Some(i) = reveal {
             self.reveal(i);
+        }
+        if let Some(i) = trash {
+            self.trash(i);
         }
     }
 }
@@ -1049,14 +1047,10 @@ impl Drop for App {
         }
         self.filter_generation.fetch_add(1, Ordering::Relaxed);
         self.layout_generation.fetch_add(1, Ordering::Relaxed);
-        self.detail_generation.fetch_add(1, Ordering::Relaxed);
-        if let Some(detail) = self.detail.take() {
-            defer_drop(detail);
-        }
         if let Some(data) = self.data.take() {
             defer_drop(data);
         }
-        if let Some(map) = self.render_map.take() {
+        if let Some(map) = self.map_cache.take() {
             defer_drop(map);
         }
     }
@@ -1091,16 +1085,19 @@ mod tests {
                     path: "/a/empty".into(),
                     parent: "/a".into(),
                     size: 0,
+                    identity: scan::FileIdentity::default(),
                 },
                 scan::FileEntry {
                     path: "/a/large".into(),
                     parent: "/a".into(),
                     size: 1_000_000,
+                    identity: scan::FileIdentity::default(),
                 },
                 scan::FileEntry {
                     path: "/b/other".into(),
                     parent: "/b".into(),
                     size: 42,
+                    identity: scan::FileIdentity::default(),
                 },
             ],
             skipped: 0,
@@ -1125,9 +1122,10 @@ mod tests {
             frame(app, ctx);
             if app.filter_rx.is_none()
                 && app.layout_rx.is_none()
-                && app.detail_rx.is_none()
                 && app.filter_applied == app.filter_generation.load(Ordering::Relaxed)
-                && app.layout_applied == app.layout_generation.load(Ordering::Relaxed)
+                && app.map_cache.as_ref().is_some_and(|cache| {
+                    cache.generation == app.layout_generation.load(Ordering::Relaxed)
+                })
             {
                 break;
             }
@@ -1167,12 +1165,26 @@ mod tests {
         let list = filter_snapshot(&data, "empty", None, &token, 1).unwrap();
         assert_eq!(list.indices, vec![0]);
         assert_eq!(list.bytes, 1_000_042);
-        let map = layout_snapshot(&data, Vec2::new(800.0, 600.0), &token, 1).unwrap();
+        let map = layout_snapshot(
+            &data,
+            LayoutKey::new(Vec2::new(800.0, 600.0), 1.0),
+            &token,
+            1,
+        )
+        .unwrap();
         for id in 0..3 {
             assert!(map.rect(id).is_some());
         }
         assert!(filter_snapshot(&data, "", None, &token, 0).is_none());
-        assert!(layout_snapshot(&data, Vec2::new(800.0, 600.0), &token, 0).is_none());
+        assert!(
+            layout_snapshot(
+                &data,
+                LayoutKey::new(Vec2::new(800.0, 600.0), 1.0),
+                &token,
+                0
+            )
+            .is_none()
+        );
     }
     #[test]
     fn completed_scan_shows_all_files_and_search_only_changes_list() {
@@ -1181,7 +1193,6 @@ mod tests {
         let mut app = App::default();
         app.access = permission::Access::Granted;
         app.query = "old".into();
-        app.zoom = 5.0;
         let (tx, rx) = mpsc::channel();
         app.job = Some(Job {
             cancel: Arc::new(AtomicBool::new(false)),
@@ -1191,22 +1202,24 @@ mod tests {
         tx.send(Ok(snapshot())).unwrap();
         app.poll(&ctx);
         assert!(app.query.is_empty());
-        assert_eq!(app.zoom, 1.0);
         settle(&mut app, &ctx);
         settle(&mut app, &ctx);
         settle(&mut app, &ctx);
         assert_eq!(app.filtered.len(), 3);
         assert_eq!(app.total_bytes, 1_000_042);
-        let applied_generation = app.layout_applied;
-        let texture = app.texture.as_ref().unwrap().id();
+        let applied_generation = app.map_cache.as_ref().unwrap().generation;
+        let texture = app.map_cache.as_ref().unwrap().texture.id();
         app.query = "no-match".into();
         app.dirty = true;
         settle(&mut app, &ctx);
         assert!(app.filtered.is_empty());
-        assert_eq!(app.layout_applied, applied_generation);
-        assert_eq!(app.texture.as_ref().unwrap().id(), texture);
+        assert_eq!(
+            app.map_cache.as_ref().unwrap().generation,
+            applied_generation
+        );
+        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), texture);
         for id in 0..3 {
-            assert!(app.render_map.as_ref().unwrap().rect(id).is_some());
+            assert!(app.map_cache.as_ref().unwrap().map.rect(id).is_some());
         }
     }
     #[test]
@@ -1214,14 +1227,24 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = App::default();
         let token = AtomicU64::new(0);
-        let map = layout_snapshot(&snapshot(), Vec2::new(30.0, 30.0), &token, 0).unwrap();
+        let map = layout_snapshot(
+            &snapshot(),
+            LayoutKey::new(Vec2::new(30.0, 30.0), 1.0),
+            &token,
+            0,
+        )
+        .unwrap();
         let (tx, rx) = mpsc::channel();
         app.layout_rx = Some(rx);
         app.layout_generation.store(1, Ordering::Relaxed);
-        tx.send(LayoutOutput { generation: 0, map }).unwrap();
+        tx.send(LayoutOutput {
+            generation: 0,
+            key: LayoutKey::new(Vec2::new(30.0, 30.0), 1.0),
+            map,
+        })
+        .unwrap();
         app.poll(&ctx);
-        assert!(app.render_map.is_none());
-        assert!(app.texture.is_none());
+        assert!(app.map_cache.is_none());
     }
     #[test]
     fn blocked_and_stopped_screens_render_without_native_window() {
@@ -1233,66 +1256,155 @@ mod tests {
             frame(&mut app, &ctx);
         }
     }
-    #[test]
-    fn displayed_detail_gutter_never_falls_back_to_coarse_file() {
-        let token = AtomicU64::new(0);
-        let bounds = treemap::Rect {
-            x: 0.0,
-            y: 0.0,
-            w: 100.0,
-            h: 100.0,
-        };
-        let map = render::RenderMap::build(
-            vec![render::RenderEntry {
-                id: 0,
-                rect: bounds,
-                color: ACCENT,
-            }],
-            bounds,
-            &token,
-            0,
+    fn apply_test_map(app: &mut App, ctx: &egui::Context, key: LayoutKey, generation: u64) {
+        app.layout_key = Some(key);
+        app.layout_generation.store(generation, Ordering::Relaxed);
+        let map = layout_snapshot(
+            app.data.as_ref().unwrap(),
+            key,
+            &app.layout_generation,
+            generation,
         )
         .unwrap();
-        let view = treemap::Rect {
-            x: 40.0,
-            y: 40.0,
-            w: 10.0,
-            h: 10.0,
-        };
-        let detail = map.rasterize(view, [100, 100], &token, 0).unwrap();
-        let mut found = false;
-        for y in 0..100 {
-            for x in 0..100 {
-                let x = 40.0 + (x as f32 + 0.5) * 0.1;
-                let y = 40.0 + (y as f32 + 0.5) * 0.1;
-                if map.hit_test(x, y).is_some() && detail.hit_test(x, y).is_none() {
-                    assert!(displayed_hit(&map, Some(&detail), x, y).is_none());
-                    found = true;
-                }
+        let (tx, rx) = mpsc::channel();
+        app.layout_rx = Some(rx);
+        tx.send(LayoutOutput {
+            generation,
+            key,
+            map,
+        })
+        .unwrap();
+        app.poll(ctx);
+    }
+    #[test]
+    fn resize_keeps_one_coherent_cache_and_discards_obsolete_completion() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.data = Some(Arc::new(snapshot()));
+        let initial = LayoutKey::new(Vec2::new(800.0, 400.0), 1.0);
+        apply_test_map(&mut app, &ctx, initial, 1);
+        let texture = app.map_cache.as_ref().unwrap().texture.id();
+        let old_map = layout_snapshot(
+            app.data.as_ref().unwrap(),
+            initial,
+            &app.layout_generation,
+            1,
+        )
+        .unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.layout_rx = Some(rx);
+        app.layout(Vec2::new(400.0, 900.0), 2.0);
+        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), texture);
+        assert_eq!(app.map_cache.as_ref().unwrap().key, initial);
+        tx.send(LayoutOutput {
+            generation: 1,
+            key: initial,
+            map: old_map,
+        })
+        .unwrap();
+        app.poll(&ctx);
+        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), texture);
+        assert_ne!(app.layout_key, Some(initial));
+        let final_key = LayoutKey::new(Vec2::new(400.0, 900.0), 2.0);
+        let generation = app.layout_generation.load(Ordering::Relaxed);
+        apply_test_map(&mut app, &ctx, final_key, generation);
+        let cache = app.map_cache.as_ref().unwrap();
+        assert_eq!(cache.key, final_key);
+        assert_eq!(cache.map.bounds.w, 400.0);
+        assert_eq!(cache.map.bounds.h, 900.0);
+        for id in 0..3 {
+            let r = cache.map.rect(id).unwrap();
+            if r.w > 2.0 && r.h > 2.0 {
+                assert_eq!(
+                    cache.map.hit_test(r.x + r.w * 0.5, r.y + r.h * 0.5),
+                    Some(id)
+                );
             }
         }
-        // Detail of an interior crop has no original file edges; test a crop
-        // containing an original edge when the first crop has no gutters.
-        if !found {
-            let view = treemap::Rect {
-                x: 0.0,
-                y: 0.0,
-                w: 10.0,
-                h: 10.0,
-            };
-            let detail = map.rasterize(view, [100, 100], &token, 0).unwrap();
-            for y in 0..100 {
-                for x in 0..100 {
-                    let x = (x as f32 + 0.5) * 0.1;
-                    let y = (y as f32 + 0.5) * 0.1;
-                    if detail.hit_test(x, y).is_none() {
-                        assert!(displayed_hit(&map, Some(&detail), x, y).is_none());
-                        found = true;
-                    }
-                }
-            }
-        }
-        assert!(found);
+    }
+    #[test]
+    fn dpi_change_rebuilds_even_when_logical_window_size_is_unchanged() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.data = Some(Arc::new(snapshot()));
+        let size = Vec2::new(800.0, 600.0);
+        apply_test_map(&mut app, &ctx, LayoutKey::new(size, 1.0), 1);
+        let (_tx, rx) = mpsc::channel();
+        app.layout_rx = Some(rx);
+        app.layout(size, 2.0);
+        assert_eq!(app.layout_generation.load(Ordering::Relaxed), 2);
+        assert_eq!(app.layout_key.unwrap().physical_size, [1600, 1200]);
+        assert_eq!(app.map_cache.as_ref().unwrap().generation, 1);
+    }
+    #[test]
+    fn trash_success_updates_matching_snapshot_and_error_preserves_it() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.data = Some(Arc::new(snapshot()));
+        let source = app.data.clone().unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.trash_rx = Some(rx);
+        tx.send(TrashOutput {
+            source: source.clone(),
+            result: Err("无法移到废纸篓。".into()),
+        })
+        .unwrap();
+        app.poll(&ctx);
+        assert!(Arc::ptr_eq(app.data.as_ref().unwrap(), &source));
+        let mut updated = snapshot();
+        updated.files[1].path = "/Users/test/.Trash/large".into();
+        updated.files[1].parent = "/Users/test/.Trash".into();
+        let (tx, rx) = mpsc::channel();
+        app.trash_rx = Some(rx);
+        tx.send(TrashOutput {
+            source,
+            result: Ok(Some(updated)),
+        })
+        .unwrap();
+        app.poll(&ctx);
+        assert_eq!(app.data.as_ref().unwrap().files.len(), 3);
+        assert_eq!(
+            app.data
+                .as_ref()
+                .unwrap()
+                .files
+                .iter()
+                .map(|f| f.size)
+                .sum::<u64>(),
+            1_000_042
+        );
+        assert_eq!(
+            app.data.as_ref().unwrap().files[1].parent,
+            std::path::Path::new("/Users/test/.Trash")
+        );
+        assert!(app.selected.is_none());
+        assert!(app.map_cache.is_none());
+    }
+    #[test]
+    fn trash_completion_from_older_scan_never_removes_new_snapshot_file() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        let source = Arc::new(snapshot());
+        let current = Arc::new(snapshot());
+        app.data = Some(current.clone());
+        let (_scan_tx, scan_rx) = mpsc::channel();
+        app.job = Some(Job {
+            cancel: Arc::default(),
+            progress: Arc::default(),
+            rx: scan_rx,
+        });
+        let (tx, rx) = mpsc::channel();
+        app.trash_rx = Some(rx);
+        let mut replacement = snapshot();
+        replacement.files.remove(0);
+        tx.send(TrashOutput {
+            source,
+            result: Ok(Some(replacement)),
+        })
+        .unwrap();
+        app.poll(&ctx);
+        assert!(Arc::ptr_eq(app.data.as_ref().unwrap(), &current));
+        assert_eq!(app.data.as_ref().unwrap().files.len(), 3);
     }
     #[test]
     #[ignore = "release performance benchmark"]
@@ -1304,6 +1416,7 @@ mod tests {
                 path: format!("/group{}/file{i}", i / 1000).into(),
                 parent: format!("/group{}", i / 1000).into(),
                 size: (i % 10000 + 1) as u64,
+                identity: scan::FileIdentity::default(),
             })
             .collect();
         let data = Arc::new(scan::ScanResult {
@@ -1352,16 +1465,17 @@ mod tests {
             times.push(now.elapsed().as_secs_f64() * 1000.0);
         }
         times.sort_by(f64::total_cmp);
-        let layout_generation = app.layout_generation.load(Ordering::Relaxed);
         let now = std::time::Instant::now();
-        app.zoom = 5.0;
-        frame(&mut app, &ctx);
-        let zoom_request = now.elapsed();
-        assert_eq!(
-            app.layout_generation.load(Ordering::Relaxed),
-            layout_generation,
-            "zoom must reuse layout"
-        );
+        let resized = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(1600.0, 1000.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(resized, |ctx| app.ui(ctx));
+        let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+        let resize_request = now.elapsed();
         let now = std::time::Instant::now();
         app.query = "file123".into();
         app.dirty = true;
@@ -1370,9 +1484,9 @@ mod tests {
         app.query = "file999".into();
         app.dirty = true;
         frame(&mut app, &ctx);
-        assert!(zoom_request.as_secs_f64() * 1000.0 < 16.7);
+        assert!(resize_request.as_secs_f64() * 1000.0 < 16.7);
         assert!(search_request.as_secs_f64() * 1000.0 < 16.7);
-        eprintln!("request CPU zoom={zoom_request:?}, search={search_request:?}");
+        eprintln!("request CPU resize={resize_request:?}, search={search_request:?}");
         eprintln!(
             "3.5m build={build:?}, steady p50={:.3}ms p95={:.3}ms max={:.3}ms rayon_threads={}",
             times[30],
