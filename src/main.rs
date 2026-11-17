@@ -1,4 +1,5 @@
 mod file_actions;
+mod file_list;
 mod permission;
 mod render;
 mod scan;
@@ -107,22 +108,82 @@ fn is_trash_path(path: &std::path::Path) -> bool {
         .any(|part| matches!(part.as_os_str().to_str(), Some(".Trash" | ".Trashes")))
 }
 
-struct PathRow {
-    text: String,
-    depth: usize,
-    is_file: bool,
+fn wrapped_text(ui: &mut egui::Ui, text: String, size: f32, color: Color32) -> egui::Response {
+    let mut job = egui::text::LayoutJob::simple(
+        text,
+        FontId::proportional(size),
+        color,
+        ui.available_width(),
+    );
+    job.wrap.break_anywhere = true;
+    ui.add(egui::Label::new(job).wrap())
 }
-fn path_rows(path: &std::path::Path) -> Vec<PathRow> {
-    let components: Vec<_> = path.components().collect();
-    components
-        .iter()
-        .enumerate()
-        .map(|(index, component)| PathRow {
-            text: component.as_os_str().to_string_lossy().into_owned(),
-            depth: index,
-            is_file: index + 1 == components.len(),
-        })
-        .collect()
+
+fn path_text(ui: &mut egui::Ui, path: &std::path::Path) -> egui::Response {
+    let text = path.to_string_lossy();
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let file_start = text.len().saturating_sub(name.len());
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = ui.available_width();
+    job.wrap.break_anywhere = true;
+    job.append(
+        &text[..file_start],
+        0.0,
+        egui::TextFormat {
+            font_id: FontId::proportional(15.0),
+            color: MUTED,
+            ..Default::default()
+        },
+    );
+    job.append(
+        &text[file_start..],
+        0.0,
+        egui::TextFormat {
+            font_id: FontId::proportional(18.0),
+            color: TEXT,
+            ..Default::default()
+        },
+    );
+    ui.add(egui::Label::new(job).wrap())
+}
+
+fn selected_path(ui: &mut egui::Ui, path: &std::path::Path) -> egui::Response {
+    let label = path_text(ui, path);
+    ui.interact(
+        label.rect,
+        egui::Id::new("copy-selected-path"),
+        Sense::click(),
+    )
+    .on_hover_cursor(egui::CursorIcon::PointingHand)
+    .on_hover_text("点击复制完整路径")
+}
+
+fn show_file_tooltip(
+    response: &egui::Response,
+    file: &scan::FileEntry,
+) -> Option<egui::InnerResponse<()>> {
+    let width = (response.ctx.content_rect().width() - 32.0).clamp(1.0, 420.0);
+    egui::Tooltip::for_enabled(response)
+        .at_pointer()
+        .width(width)
+        .show(|ui| file_tooltip(ui, file))
+}
+
+fn file_tooltip(ui: &mut egui::Ui, file: &scan::FileEntry) {
+    let available = (ui.ctx().content_rect().width() - 32.0).max(1.0);
+    ui.set_width(available.min(420.0));
+    wrapped_text(
+        ui,
+        file.path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+        15.0,
+        TEXT,
+    );
+    ui.label(bytes(file.size));
+    wrapped_text(ui, file.path.to_string_lossy().into_owned(), 14.0, MUTED);
 }
 
 fn defer_drop<T: Send + 'static>(value: T) {
@@ -358,11 +419,14 @@ struct App {
     show_recoveries: bool,
     recovery_rx: Option<mpsc::Receiver<Result<Vec<file_actions::RecoveryRecord>, String>>>,
     recovery_records: Vec<file_actions::RecoveryRecord>,
+    recovery_list: file_list::WrappedFileList,
+    recovery_generation: u64,
     recoveries_loaded: bool,
     recoveries_dirty: bool,
     restore_rx: Option<mpsc::Receiver<TrashOutput>>,
     canvas_rect: Option<Rect>,
     filtered: Vec<usize>,
+    file_list: file_list::WrappedFileList,
     total_bytes: u64,
     dirty: bool,
     filter_rx: Option<mpsc::Receiver<FilterOutput>>,
@@ -393,11 +457,14 @@ impl Default for App {
             show_recoveries: false,
             recovery_rx: None,
             recovery_records: Vec::new(),
+            recovery_list: file_list::WrappedFileList::default(),
+            recovery_generation: 0,
             recoveries_loaded: false,
             recoveries_dirty: false,
             restore_rx: None,
             canvas_rect: None,
             filtered: Vec::new(),
+            file_list: file_list::WrappedFileList::default(),
             total_bytes: 0,
             dirty: true,
             filter_rx: None,
@@ -677,52 +744,35 @@ impl App {
                     if self.recovery_records.is_empty() && self.recovery_rx.is_none() {
                         ui.label("没有可用的恢复记录。");
                     }
-                    egui::ScrollArea::vertical()
-                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                        .max_height(380.0)
-                        .show_rows(ui, 64.0, self.recovery_records.len(), |ui, rows| {
-                            for index in rows {
-                                let record = &self.recovery_records[index];
-                                ui.horizontal(|ui| {
-                                    ui.allocate_ui_with_layout(
-                                        Vec2::new((ui.available_width() - 110.0).max(100.0), 54.0),
-                                        egui::Layout::top_down(egui::Align::LEFT),
-                                        |ui| {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    record
-                                                        .original_path
-                                                        .file_name()
-                                                        .unwrap_or_default()
-                                                        .to_string_lossy(),
-                                                )
-                                                .truncate(),
-                                            );
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(
-                                                        record.original_path.to_string_lossy(),
-                                                    )
-                                                    .small()
-                                                    .color(MUTED),
-                                                )
-                                                .truncate(),
-                                            )
-                                            .on_hover_text(record.original_path.to_string_lossy());
-                                        },
-                                    );
-                                    if ui
-                                        .add_enabled(
-                                            self.restore_rx.is_none() && self.trash_rx.is_none(),
-                                            egui::Button::new("放回原处"),
-                                        )
-                                        .clicked()
-                                    {
-                                        restore = Some(record.id.clone());
-                                    }
-                                });
-                            }
-                        });
+                    let records = &self.recovery_records;
+                    let busy = self.restore_rx.is_some() || self.trash_rx.is_some();
+                    restore = self.recovery_list.show_rows(
+                        ui,
+                        self.recovery_generation,
+                        records.len(),
+                        |ui, index| {
+                            let record = &records[index];
+                            let mut restore = None;
+                            ui.horizontal_top(|ui| {
+                                let width = (ui.available_width() - 110.0).max(100.0);
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(width, 0.0),
+                                    egui::Layout::top_down(egui::Align::LEFT),
+                                    |ui| {
+                                        path_text(ui, &record.original_path);
+                                    },
+                                );
+                                if ui
+                                    .add_enabled(!busy, egui::Button::new("放回原处"))
+                                    .clicked()
+                                {
+                                    restore = Some(record.id.clone());
+                                }
+                            });
+                            ui.separator();
+                            restore
+                        },
+                    );
                 });
             self.show_recoveries = open;
             if let Some(record) = restore {
@@ -805,8 +855,7 @@ impl App {
                         }
                         Ok(data) => {
                             defer_drop(data);
-                            self.action_notice =
-                                Some("已移到废纸篓，正在重新扫描以更新磁盘结果。".into());
+                            self.action_notice = Some("已移到废纸篓。".into());
                             self.start();
                         }
                         Err(error) => self.message = Some(error),
@@ -842,7 +891,7 @@ impl App {
                         Ok(data) => {
                             defer_drop(data);
                             self.start();
-                            self.action_notice = Some("已放回原处，正在更新磁盘结果。".into());
+                            self.action_notice = Some("已放回原处。".into());
                         }
                         Err(error) => self.message = Some(error),
                     }
@@ -864,7 +913,8 @@ impl App {
                     self.recoveries_loaded = true;
                     match result {
                         Ok(records) => {
-                            self.recovery_records = records;
+                            defer_drop(std::mem::replace(&mut self.recovery_records, records));
+                            self.recovery_generation = self.recovery_generation.wrapping_add(1);
                         }
                         Err(error) => self.message = Some(error),
                     }
@@ -1057,9 +1107,8 @@ impl App {
                         )
                     } else if let Some(data) = &self.data {
                         format!(
-                            "启动磁盘 · {:.1} 秒 · {} 个文件 · 跳过 {} 项",
+                            "启动磁盘 · {:.1} 秒 · 跳过 {} 项",
                             data.elapsed.as_secs_f64(),
-                            data.files.len(),
                             data.skipped
                         )
                     } else {
@@ -1091,18 +1140,16 @@ impl App {
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space((ui.available_height() * 0.28).max(24.0));
-                        ui.label(RichText::new("Visualize SSD").size(22.0).strong());
-                        ui.add_space(20.0);
                         ui.label(RichText::new("需要完全磁盘访问权限").size(28.0).strong());
                         ui.add_space(12.0);
                         if self.permission_rx.is_some() {
                             ui.spinner();
-                            ui.label("正在检查权限，检查通过后自动扫描启动磁盘。");
+                            ui.label("正在检查权限…");
                         } else {
                             let reason = if self.access == permission::Access::Denied {
-                                "macOS 尚未允许此应用读取受保护文件，扫描已阻止。"
+                                "macOS 尚未授权。"
                             } else {
-                                "尚未验证完全磁盘访问权限，扫描已阻止。"
+                                "无法确认权限。"
                             };
                             ui.label(RichText::new(reason).color(MUTED));
                             ui.add_space(12.0);
@@ -1132,10 +1179,8 @@ impl App {
             .frame(egui::Frame::new().fill(PANEL).inner_margin(16.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Visualize SSD").size(22.0).strong());
-                    ui.add_space(16.0);
                     if ui
-                        .add_enabled(self.job.is_none(), egui::Button::new("重新扫描启动磁盘"))
+                        .add_enabled(self.job.is_none(), egui::Button::new("重新扫描"))
                         .clicked()
                     {
                         self.start();
@@ -1152,12 +1197,6 @@ impl App {
                         self.show_recoveries = true;
                         self.load_recoveries();
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add(
-                            egui::Label::new(RichText::new("文件大小 · 逻辑字节").color(MUTED))
-                                .truncate(),
-                        );
-                    });
                 });
             });
         self.filter();
@@ -1170,18 +1209,13 @@ impl App {
                     ui.vertical_centered(|ui| {
                         ui.add_space((ui.available_height() * 0.32).max(32.0));
                         let heading = if self.job.is_some() {
-                            "正在扫描整个启动磁盘"
+                            "扫描中…"
                         } else {
                             "扫描已停止"
                         };
                         ui.label(RichText::new(heading).size(30.0).strong());
-                        ui.add_space(12.0);
-                        ui.label(
-                            RichText::new("每个色块是一个文件，同一文件夹使用相同颜色。")
-                                .color(MUTED),
-                        );
                         ui.add_space(20.0);
-                        if self.job.is_none() && ui.button("重新扫描启动磁盘").clicked() {
+                        if self.job.is_none() && ui.button("重新扫描").clicked() {
                             self.start();
                         }
                     });
@@ -1210,7 +1244,6 @@ impl App {
                         self.dirty = true;
                     }
                     ui.separator();
-                    ui.label("启动磁盘 /");
                     ui.label(format!(
                         "{} 个文件",
                         self.data.as_ref().unwrap().files.len()
@@ -1223,7 +1256,8 @@ impl App {
                         })
                         .strong()
                         .color(ACCENT),
-                    );
+                    )
+                    .on_hover_text("文件逻辑大小");
                 });
             });
         self.filter();
@@ -1239,53 +1273,7 @@ impl App {
             .show(ctx, |ui| {
                 if let Some(i) = self.selected {
                     let f = &self.data.as_ref().unwrap().files[i];
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(f.path.file_name().unwrap_or_default().to_string_lossy())
-                                .size(18.0)
-                                .strong(),
-                        )
-                        .truncate(),
-                    );
                     ui.label(RichText::new(bytes(f.size)).size(24.0).color(ACCENT));
-                    let mut copy_path = false;
-                    egui::ScrollArea::vertical()
-                        .id_salt("selected-path")
-                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                        .max_height(200.0)
-                        .show(ui, |ui| {
-                            for row in path_rows(&f.path) {
-                                ui.horizontal(|ui| {
-                                    ui.add_space((row.depth as f32 * 12.0).min(60.0));
-                                    let text = RichText::new(row.text)
-                                        .size(15.0)
-                                        .color(if row.is_file { TEXT } else { MUTED });
-                                    let text = if row.is_file { text.strong() } else { text };
-                                    let label = ui.add(egui::Label::new(text).wrap());
-                                    if ui
-                                        .interact(
-                                            label.rect,
-                                            egui::Id::new("copy-selected-path").with(row.depth),
-                                            Sense::click(),
-                                        )
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                                        .on_hover_text("点击复制完整路径")
-                                        .clicked()
-                                    {
-                                        copy_path = true;
-                                    }
-                                });
-                            }
-                        });
-                    if copy_path {
-                        if let Some(exact) = f.path.to_str() {
-                            ctx.copy_text(exact.to_owned());
-                            self.action_notice = Some("已复制完整路径。".into());
-                        } else {
-                            self.message =
-                                Some("路径包含无法复制为文本的字符，请在 Finder 中查看。".into());
-                        }
-                    }
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("在 Finder 中显示").clicked() {
                             reveal = Some(i);
@@ -1316,14 +1304,21 @@ impl App {
                             restore = Some(id);
                         }
                     }
+                    if selected_path(ui, &f.path).clicked() {
+                        if let Some(exact) = f.path.to_str() {
+                            ctx.copy_text(exact.to_owned());
+                            self.action_notice = Some("路径已复制。".into());
+                        } else {
+                            self.message =
+                                Some("路径包含无法复制为文本的字符，请在 Finder 中查看。".into());
+                        }
+                    }
                     ui.separator();
                 }
-                ui.label(RichText::new("文件").strong());
-                ui.label(RichText::new("按大小排序 · 点击查看").small().color(MUTED));
                 ui.add(
                     egui::Label::new(
                         RichText::new(if self.filter_rx.is_some() {
-                            "正在更新文件列表…"
+                            "更新中…"
                         } else if self.filtered.is_empty() {
                             "没有匹配的文件"
                         } else {
@@ -1333,40 +1328,17 @@ impl App {
                     )
                     .truncate(),
                 );
-                let row_height = 42.0;
-                egui::ScrollArea::vertical()
-                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-                    .id_salt("file-list")
-                    .show_rows(ui, row_height, self.filtered.len(), |ui, rows| {
-                        for row in rows {
-                            let i = self.filtered[row];
-                            let f = &self.data.as_ref().unwrap().files[i];
-                            let response = ui
-                                .horizontal(|ui| {
-                                    let (r, _) =
-                                        ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
-                                    ui.painter().rect_filled(r, 2.0, color(&f.parent));
-                                    ui.add(
-                                        egui::Button::new(format!(
-                                            "{}\n{}",
-                                            f.path
-                                                .file_name()
-                                                .unwrap_or_default()
-                                                .to_string_lossy(),
-                                            bytes(f.size)
-                                        ))
-                                        .selected(self.selected == Some(i))
-                                        .frame(false)
-                                        .truncate(),
-                                    )
-                                })
-                                .inner;
-                            if response.clicked() {
-                                self.selected = Some(i);
-                            }
-                            response.on_hover_text(f.path.to_string_lossy());
-                        }
-                    });
+                let data = self.data.as_ref().unwrap();
+                if let Some(selected) = self.file_list.show(
+                    ui,
+                    self.filter_applied,
+                    &data.files,
+                    &self.filtered,
+                    self.selected,
+                    color,
+                ) {
+                    self.selected = Some(selected);
+                }
             });
         self.status_bar(ctx);
         egui::CentralPanel::default()
@@ -1374,7 +1346,7 @@ impl App {
             .show(ctx, |ui| {
                 if self.data.as_ref().unwrap().files.is_empty() {
                     ui.centered_and_justified(|ui| {
-                        ui.label("启动磁盘中没有可显示的文件");
+                        ui.label("没有可显示的文件");
                     });
                     return;
                 }
@@ -1424,7 +1396,7 @@ impl App {
                     painter.text(
                         canvas.center(),
                         egui::Align2::CENTER_CENTER,
-                        "正在生成整盘视图…",
+                        "正在生成视图…",
                         FontId::proportional(16.0),
                         MUTED,
                     );
@@ -1434,14 +1406,7 @@ impl App {
                     if response.clicked() {
                         self.selected = Some(i);
                     }
-                    response.on_hover_ui_at_pointer(|ui| {
-                        ui.label(
-                            RichText::new(f.path.file_name().unwrap_or_default().to_string_lossy())
-                                .strong(),
-                        );
-                        ui.label(bytes(f.size));
-                        ui.label(RichText::new(f.path.to_string_lossy()).small().color(MUTED));
-                    });
+                    show_file_tooltip(&response, f);
                 }
             });
         if let Some(i) = reveal {
@@ -1897,7 +1862,7 @@ mod tests {
         assert!(app.selected.is_none());
     }
     #[test]
-    fn clicking_any_hierarchy_row_copies_full_unicode_path_without_layout_change() {
+    fn clicking_wrapped_path_copies_full_unicode_path_without_layout_change() {
         let ctx = egui::Context::default();
         configure(&ctx);
         let mut data = snapshot();
@@ -1912,10 +1877,10 @@ mod tests {
         frame(&mut app, &ctx);
         frame(&mut app, &ctx);
         let canvas = app.canvas_rect;
-        for depth in 0..4 {
+        {
             let response = ctx
-                .read_response(egui::Id::new("copy-selected-path").with(depth))
-                .expect("path row visible");
+                .read_response(egui::Id::new("copy-selected-path"))
+                .expect("complete path visible");
             let pos = response.rect.center();
             for pressed in [true, false] {
                 let input = egui::RawInput {
@@ -2055,7 +2020,7 @@ mod tests {
         app.show_recoveries = false;
     }
     #[test]
-    fn hierarchical_selected_path_does_not_expand_sidebar_or_canvas() {
+    fn wrapped_selected_path_does_not_expand_sidebar_or_canvas() {
         let ctx = egui::Context::default();
         configure(&ctx);
         let mut data = snapshot();
@@ -2068,10 +2033,6 @@ mod tests {
             "long-file-name".repeat(30)
         ));
         data.files[0].parent = data.files[0].path.parent().unwrap().to_path_buf();
-        let rows = path_rows(&data.files[0].path);
-        assert_eq!(rows[0].text, "/");
-        assert!(rows.last().unwrap().is_file);
-        assert!(rows.iter().any(|row| row.text == "长目录20"));
         let mut app = App::default();
         app.access = permission::Access::Granted;
         app.recoveries_loaded = true;
@@ -2091,6 +2052,167 @@ mod tests {
         frame(&mut app, &ctx);
         assert_eq!(app.canvas_rect, rect);
     }
+    fn text_shape<'a>(
+        output: &'a egui::FullOutput,
+        text: &str,
+    ) -> (&'a egui::epaint::TextShape, Rect) {
+        fn find<'a>(shape: &'a egui::Shape, text: &str) -> Option<&'a egui::epaint::TextShape> {
+            match shape {
+                egui::Shape::Text(shape) if shape.galley.job.text == text => Some(shape),
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, text)),
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|clipped| find(&clipped.shape, text).map(|shape| (shape, clipped.clip_rect)))
+            .expect("complete text must be painted")
+    }
+
+    #[test]
+    fn realistic_paths_and_long_file_names_wrap_fully_without_a_scroll_view() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let paths = [
+            "/Users/Corwin/Library/Application Support/Google/Chrome/Default/Service Worker/CacheStorage/https_www.example.com_0/8b92f63e36ca904bce67a92cdb6ac9ea/8b3bb59860c2cf7266ab9f7b0e4fd756ad86ef8f6fc59e3640b57849fb103c7a".to_owned(),
+            format!("/Users/Corwin/Downloads/{}", "a".repeat(255)),
+        ];
+        for size in [Vec2::new(1180.0, 780.0), Vec2::new(860.0, 560.0)] {
+            for path in &paths {
+                let mut data = snapshot();
+                data.files[0].path = path.into();
+                data.files[0].parent = data.files[0].path.parent().unwrap().into();
+                let mut app = App::default();
+                app.access = permission::Access::Granted;
+                app.recoveries_loaded = true;
+                app.data = Some(Arc::new(data));
+                app.selected = Some(0);
+                let mut last = None;
+                for _ in 0..5 {
+                    last = Some(ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
+                            ..Default::default()
+                        },
+                        |ctx| app.ui(ctx),
+                    ));
+                }
+                let (shape, clip) = text_shape(last.as_ref().unwrap(), path);
+                assert!(!shape.galley.elided);
+                assert!(shape.galley.rows.len() > 1);
+                let rect = shape.galley.rect.translate(shape.pos.to_vec2());
+                assert!(
+                    rect.left() >= clip.left() - 1.0 && rect.right() <= clip.right() + 1.0,
+                    "path escaped horizontal bounds: {rect:?} / {clip:?}"
+                );
+                assert!(
+                    rect.bottom() <= clip.bottom() + 1.0,
+                    "realistic path should be fully visible: {rect:?} / {clip:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_rows_wrap_complete_paths_without_overlapping_next_record() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let paths = [
+            format!(
+                "/Users/Corwin/Library/Application Support/ChromeCache/{}",
+                "a".repeat(200)
+            ),
+            "/Users/Corwin/Documents/第二个恢复文件.pdf".to_owned(),
+        ];
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.recoveries_loaded = true;
+        app.data = Some(Arc::new(snapshot()));
+        settle(&mut app, &ctx);
+        app.show_recoveries = true;
+        app.recovery_records = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| file_actions::RecoveryRecord {
+                id: format!("fixture-{index}"),
+                original_path: path.into(),
+                trash_path: None,
+                identity: scan::FileIdentity::default(),
+                original_links: 1,
+            })
+            .collect();
+        let mut output = None;
+        for _ in 0..5 {
+            output = Some(ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(1180.0, 780.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| app.ui(ctx),
+            ));
+        }
+        let output = output.as_ref().unwrap();
+        let (first, first_clip) = text_shape(output, &paths[0]);
+        let (second, _) = text_shape(output, &paths[1]);
+        assert!(!first.galley.elided && !second.galley.elided);
+        assert!(first.galley.rows.len() > 1);
+        let first_rect = first.galley.rect.translate(first.pos.to_vec2());
+        let second_rect = second.galley.rect.translate(second.pos.to_vec2());
+        assert!(first_rect.right() <= first_clip.right() + 1.0);
+        assert!(
+            second_rect.top() >= first_rect.bottom(),
+            "wrapped recovery rows overlap"
+        );
+    }
+
+    #[test]
+    fn hover_near_right_edge_keeps_a_readable_full_text_tooltip_on_screen() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        ctx.style_mut(|style| style.interaction.tooltip_delay = 0.0);
+        let mut file = snapshot().files.remove(0);
+        file.path = format!("/Users/Corwin/Downloads/{}.pdf", "长文件名".repeat(30)).into();
+        let mut last = None;
+        let mut tooltip_rect = None;
+        for pass in 0..6 {
+            last = Some(ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(860.0, 560.0),
+                    )),
+                    time: Some(pass as f64),
+                    events: vec![egui::Event::PointerMoved(egui::pos2(844.0, 200.0))],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let response = ui.allocate_rect(ui.max_rect(), Sense::hover());
+                        tooltip_rect = show_file_tooltip(&response, &file)
+                            .map(|response| response.response.rect);
+                    });
+                },
+            ));
+        }
+        let rect = tooltip_rect.expect("hover must open the tooltip");
+        assert!(
+            rect.width() >= 350.0 && rect.width() <= 460.0,
+            "tooltip width: {rect:?}"
+        );
+        assert!(
+            rect.left() >= 0.0 && rect.right() <= 860.0,
+            "tooltip escaped screen: {rect:?}"
+        );
+        let path = file.path.to_string_lossy();
+        let (shape, _) = text_shape(last.as_ref().unwrap(), &path);
+        assert!(!shape.galley.elided);
+        assert!(shape.galley.rows.len() > 1);
+    }
+
     #[test]
     #[ignore = "release performance benchmark"]
     fn full_app_3_5m_steady_frame() {
