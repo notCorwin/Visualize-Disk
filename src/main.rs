@@ -12,7 +12,7 @@ mod treemap;
 use eframe::egui::{self, Color32, FontId, Rect, RichText, Sense, Vec2};
 use rayon::prelude::*;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeSet, HashMap},
     hash::{Hash, Hasher},
     sync::{
         Arc, Mutex,
@@ -357,11 +357,11 @@ fn layout_snapshot(
     token: &AtomicU64,
     generation: u64,
 ) -> Option<render::RenderMap> {
-    let grouped: Result<BTreeMap<&std::path::Path, Vec<(usize, u64)>>, ()> = data
+    let grouped: Result<HashMap<&std::path::Path, Vec<(usize, u64)>>, ()> = data
         .files
         .par_iter()
         .enumerate()
-        .try_fold(BTreeMap::new, |mut groups, (i, file)| {
+        .try_fold(HashMap::new, |mut groups, (i, file)| {
             if i % 1024 == 0 && token.load(Ordering::Relaxed) != generation {
                 return Err(());
             }
@@ -371,8 +371,11 @@ fn layout_snapshot(
                 .push((i, file.size.max(1)));
             Ok(groups)
         })
-        .try_reduce(BTreeMap::new, |mut a, b| {
-            for (path, mut files) in b {
+        .try_reduce(HashMap::new, |mut a, b| {
+            for (index, (path, mut files)) in b.into_iter().enumerate() {
+                if index % 1024 == 0 && token.load(Ordering::Relaxed) != generation {
+                    return Err(());
+                }
                 a.entry(path).or_insert_with(Vec::new).append(&mut files);
             }
             Ok(a)
@@ -994,17 +997,6 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        if self.job.is_some()
-            || self.reveal_rx.is_some()
-            || self.trash_rx.is_some()
-            || self.restore_rx.is_some()
-            || self.recovery_rx.is_some()
-            || self.permission_rx.is_some()
-            || self.filter_rx.is_some()
-            || self.layout_rx.is_some()
-        {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
     }
     fn hide_file(&mut self, id: usize) {
         if self.data.as_ref().is_none_or(|data| id >= data.files.len())
@@ -1031,7 +1023,7 @@ impl App {
             cache.hide(id);
         }
     }
-    fn filter(&mut self) {
+    fn filter(&mut self, ctx: &egui::Context) {
         if self.dirty {
             self.dirty = false;
             self.filter_generation.fetch_add(1, Ordering::Relaxed);
@@ -1049,14 +1041,18 @@ impl App {
         let token = self.filter_generation.clone();
         let (tx, rx) = mpsc::channel();
         self.filter_rx = Some(rx);
+        let ctx = ctx.clone();
         rayon::spawn(move || {
             if let Some(output) = filter_snapshot(&data, &query, known, &hidden, &token, generation)
             {
                 let _ = tx.send(output);
             }
+            // Publish data (or channel closure) before waking an idle event loop.
+            drop(tx);
+            ctx.request_repaint();
         });
     }
-    fn layout(&mut self, size: Vec2, pixels_per_point: f32) {
+    fn layout(&mut self, size: Vec2, pixels_per_point: f32, ctx: &egui::Context) {
         let key = LayoutKey::new(size, pixels_per_point);
         if self.layout_key != Some(key) {
             self.layout_key = Some(key);
@@ -1077,6 +1073,7 @@ impl App {
         let token = self.layout_generation.clone();
         let (tx, rx) = mpsc::channel();
         self.layout_rx = Some(rx);
+        let ctx = ctx.clone();
         rayon::spawn(move || {
             if let Some(map) = layout_snapshot(&data, key, &token, generation) {
                 let _ = tx.send(LayoutOutput {
@@ -1085,6 +1082,8 @@ impl App {
                     map,
                 });
             }
+            drop(tx);
+            ctx.request_repaint();
         });
     }
     fn reveal(&mut self, i: usize) {
@@ -1185,6 +1184,20 @@ impl App {
             });
     }
     fn ui(&mut self, ctx: &egui::Context) {
+        self.ui_contents(ctx);
+        if self.job.is_some()
+            || self.reveal_rx.is_some()
+            || self.trash_rx.is_some()
+            || self.restore_rx.is_some()
+            || self.recovery_rx.is_some()
+            || self.permission_rx.is_some()
+            || self.filter_rx.is_some()
+            || self.layout_rx.is_some()
+        {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+    }
+    fn ui_contents(&mut self, ctx: &egui::Context) {
         self.canvas_rect = None;
         self.poll(ctx);
         if self.access != permission::Access::Granted {
@@ -1330,7 +1343,7 @@ impl App {
                     }
                 });
             });
-        self.filter();
+        self.filter(ctx);
         if self.data.is_none() {
             self.status_bar(ctx);
             egui::CentralPanel::default()
@@ -1446,7 +1459,7 @@ impl App {
                     return;
                 }
                 let viewport = ui.available_size().max(Vec2::splat(1.0));
-                self.layout(viewport, ctx.pixels_per_point());
+                self.layout(viewport, ctx.pixels_per_point(), ctx);
                 let (canvas, response) = ui.allocate_exact_size(viewport, Sense::click());
                 self.canvas_rect = Some(canvas);
                 let painter = ui.painter_at(canvas);
@@ -1743,6 +1756,108 @@ mod tests {
             .is_none()
         );
     }
+    fn idle_context_with_wake_receiver() -> (egui::Context, mpsc::Receiver<()>) {
+        let ctx = egui::Context::default();
+        for _ in 0..5 {
+            drop(ctx.run(egui::RawInput::default(), |_| {}));
+        }
+        let (tx, rx) = mpsc::channel();
+        ctx.set_request_repaint_callback(move |info| {
+            if info.delay.is_zero() {
+                let _ = tx.send(());
+            }
+        });
+        (ctx, rx)
+    }
+    #[test]
+    fn completed_scan_schedules_jobs_started_after_poll() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.recoveries_loaded = true;
+        for _ in 0..5 {
+            frame(&mut app, &ctx);
+        }
+        let (tx, rx) = mpsc::channel();
+        tx.send(Ok(snapshot())).unwrap();
+        app.job = Some(Job {
+            cancel: Arc::new(AtomicBool::new(false)),
+            progress: Arc::default(),
+            rx,
+        });
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1180.0, 780.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.ui(ctx),
+        );
+        assert!(app.job.is_none());
+        assert!(app.filter_rx.is_some());
+        assert!(app.layout_rx.is_some());
+        assert!(
+            output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+                <= Duration::from_millis(100),
+            "newly queued jobs must schedule their next frame"
+        );
+    }
+    #[test]
+    fn completed_workers_wake_idle_ui_without_input_or_polling_frames() {
+        for layout in [false, true] {
+            let (ctx, wake) = idle_context_with_wake_receiver();
+            let mut app = App::default();
+            app.data = Some(Arc::new(snapshot()));
+            if layout {
+                app.layout(Vec2::new(800.0, 600.0), 1.0, &ctx);
+            } else {
+                app.filter(&ctx);
+            }
+            // No UI frames run while the worker computes. Its completion must
+            // wake the host before the result can be consumed by the next frame.
+            wake.recv_timeout(Duration::from_secs(5))
+                .expect("completed worker must wake the idle event loop");
+            app.poll(&ctx);
+            if layout {
+                assert!(app.layout_rx.is_none());
+                assert!(app.map_cache.is_some());
+            } else {
+                assert!(app.filter_rx.is_none());
+                assert!(app.totals_ready);
+                assert_eq!(app.filtered.len(), 3);
+            }
+        }
+    }
+    #[test]
+    fn cancelled_workers_close_their_channels_before_waking_idle_ui() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        for layout in [false, true] {
+            let (ctx, wake) = idle_context_with_wake_receiver();
+            let mut app = App::default();
+            app.data = Some(Arc::new(snapshot()));
+            pool.install(|| {
+                if layout {
+                    app.layout(Vec2::new(800.0, 600.0), 1.0, &ctx);
+                    app.layout_generation.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    app.filter(&ctx);
+                    app.filter_generation.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            wake.recv_timeout(Duration::from_secs(5))
+                .expect("cancelled worker must wake the idle event loop");
+            app.poll(&ctx);
+            assert!(app.filter_rx.is_none());
+            assert!(app.layout_rx.is_none());
+            assert!(!app.totals_ready);
+            assert!(app.map_cache.is_none());
+        }
+    }
     #[test]
     fn completed_scan_shows_all_files_and_search_only_changes_list() {
         let ctx = egui::Context::default();
@@ -1850,7 +1965,7 @@ mod tests {
         .unwrap();
         let (tx, rx) = mpsc::channel();
         app.layout_rx = Some(rx);
-        app.layout(Vec2::new(400.0, 900.0), 2.0);
+        app.layout(Vec2::new(400.0, 900.0), 2.0, &ctx);
         assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), texture);
         assert_eq!(app.map_cache.as_ref().unwrap().key, initial);
         tx.send(LayoutOutput {
@@ -1888,7 +2003,7 @@ mod tests {
         apply_test_map(&mut app, &ctx, LayoutKey::new(size, 1.0), 1);
         let (_tx, rx) = mpsc::channel();
         app.layout_rx = Some(rx);
-        app.layout(size, 2.0);
+        app.layout(size, 2.0, &ctx);
         assert_eq!(app.layout_generation.load(Ordering::Relaxed), 2);
         assert_eq!(app.layout_key.unwrap().physical_size, [1600, 1200]);
         assert_eq!(app.map_cache.as_ref().unwrap().generation, 1);
@@ -1931,7 +2046,7 @@ mod tests {
         })
         .unwrap();
         app.poll(&ctx);
-        app.filter();
+        app.filter(&ctx);
         assert!(Arc::ptr_eq(app.data.as_ref().unwrap(), &source));
         assert_eq!(app.data.as_ref().unwrap().files.len(), 3);
         assert_eq!(app.total_bytes, 1_000_042); // Trash still occupies disk space.

@@ -6,7 +6,7 @@ use crate::{
 use eframe::egui::Color32;
 use rayon::prelude::*;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -25,8 +25,8 @@ pub struct DirectoryLayout {
     pub platforms: Vec<Platform>,
 }
 
-pub fn layout(
-    groups: BTreeMap<&Path, Vec<(usize, u64)>>,
+pub fn layout<'a>(
+    groups: impl IntoIterator<Item = (&'a Path, Vec<(usize, u64)>)>,
     root: &Path,
     bounds: Rect,
     pixel_size: f32,
@@ -34,9 +34,22 @@ pub fn layout(
     generation: u64,
 ) -> Option<DirectoryLayout> {
     let cancelled = || token.load(Ordering::Relaxed) != generation;
+    if cancelled() {
+        return None;
+    }
     let mut directories = vec![Directory::default()];
     let mut indices: HashMap<&Path, usize> = HashMap::new();
     let mut file_count = 0;
+    // Group files with hashing, then order only distinct paths so terrace
+    // placement remains deterministic regardless of hash/Rayon iteration order.
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    if cancelled() {
+        return None;
+    }
+    groups.par_sort_unstable_by(|a, b| a.0.cmp(b.0));
+    if cancelled() {
+        return None;
+    }
     for (path, files) in groups {
         if cancelled() {
             return None;
@@ -181,6 +194,7 @@ pub fn layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     fn bounds() -> Rect {
         Rect {
             x: 0.0,
@@ -196,6 +210,49 @@ mod tests {
         r.w * r.h
     }
 
+    #[test]
+    fn hashed_and_ordered_groups_keep_identical_geometry_pixels_and_owners() {
+        let paths: Vec<_> = (0..48)
+            .map(|id| std::path::PathBuf::from(format!("/root/branch{}/group{id}", id % 6)))
+            .collect();
+        let groups = || {
+            paths
+                .iter()
+                .enumerate()
+                .map(|(id, path)| (path.as_path(), vec![(id * 2, 100), (id * 2 + 1, 100)]))
+        };
+        let ordered: BTreeMap<_, _> = groups().collect();
+        let hashed: HashMap<_, _> = groups().rev().collect();
+        let token = AtomicU64::new(1);
+        let build = |scene: DirectoryLayout| {
+            crate::render::RenderMap::build_with_platforms(
+                scene.entries,
+                scene.platforms,
+                bounds(),
+                [240, 152],
+                &token,
+                1,
+            )
+            .unwrap()
+        };
+        let ordered = build(layout(ordered, Path::new("/root"), bounds(), 5.0, &token, 1).unwrap());
+        let hashed = build(layout(hashed, Path::new("/root"), bounds(), 5.0, &token, 1).unwrap());
+        for id in 0..96 {
+            assert_eq!(ordered.rect(id), hashed.rect(id));
+            assert_eq!(ordered.color(id), hashed.color(id));
+        }
+        assert_eq!(
+            ordered.image.as_ref().unwrap().pixels,
+            hashed.image.as_ref().unwrap().pixels
+        );
+        for y in 0..152 {
+            for x in 0..240 {
+                let x = (x as f32 + 0.5) * 5.0;
+                let y = (y as f32 + 0.5) * 5.0;
+                assert_eq!(ordered.hit_test(x, y), hashed.hit_test(x, y));
+            }
+        }
+    }
     #[test]
     fn files_use_their_direct_parent_palette_and_fit_inside_weighted_platforms() {
         let token = AtomicU64::new(1);
@@ -318,7 +375,7 @@ mod tests {
         let paths: Vec<_> = (0..2000)
             .map(|id| std::path::PathBuf::from(format!("/root/group{id}")))
             .collect();
-        let groups = paths
+        let groups: Vec<_> = paths
             .iter()
             .enumerate()
             .map(|(id, path)| (path.as_path(), vec![(id, 1)]))
@@ -408,7 +465,7 @@ mod tests {
 #[cfg(test)]
 mod compact_depth_tests {
     use super::*;
-    use std::{io::Write, path::PathBuf};
+    use std::{collections::BTreeMap, io::Write, path::PathBuf};
 
     fn scene(mode: &str) -> DirectoryLayout {
         let mut owned = BTreeMap::<PathBuf, Vec<(usize, u64)>>::new();
@@ -447,7 +504,7 @@ mod compact_depth_tests {
             owned.insert(PathBuf::from("/root/mixed/tiny"), files(3, 1));
             owned.insert(PathBuf::from("/root/other"), files(100, 1000));
         }
-        let groups = owned
+        let groups: Vec<_> = owned
             .iter()
             .map(|(path, files)| (path.as_path(), files.clone()))
             .collect();
