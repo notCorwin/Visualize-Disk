@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,12 +45,30 @@ pub fn scan(
     let mut errors = Vec::new();
     let mut state = ScanProgress::default();
     *progress.lock().unwrap_or_else(|e| e.into_inner()) = state;
+    let startup_disk = root == std::path::Path::new("/");
+    let mut visited = HashSet::new();
     let mut pending = vec![root.clone()];
+    let mut deferred_data = None;
     let mut published = Instant::now();
     let mut processed = 0usize;
-    while let Some(directory) = pending.pop() {
+    while let Some(directory) = pending.pop().or_else(|| deferred_data.take()) {
         if cancel.load(Ordering::Relaxed) {
             return Err("扫描已取消。".into());
+        }
+        // Firmlinks expose the Data volume through /Users, /Applications, etc.
+        // A per-scan identity cache prevents traversing those trees twice; it is
+        // discarded on refresh, so filesystem changes never reuse stale state.
+        match directory_identity(&directory) {
+            Ok(identity) if !visited.insert(identity) => {
+                state.skipped += 1;
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) if directory == root => return Err(root_error(&error)),
+            Err(error) => {
+                record_error(&mut state, &mut errors, &directory, &error);
+                continue;
+            }
         }
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
@@ -73,7 +92,19 @@ pub fn scan(
                     match fs::symlink_metadata(&path) {
                         Err(e) => record_error(&mut state, &mut errors, &path, &e),
                         Ok(meta) if meta.file_type().is_symlink() => state.skipped += 1,
-                        Ok(meta) if meta.is_dir() => pending.push(path),
+                        Ok(meta) if meta.is_dir() => {
+                            if startup_disk && excluded_from_startup_disk(&path) {
+                                state.skipped += 1;
+                            } else if startup_disk
+                                && path == std::path::Path::new("/System/Volumes/Data")
+                            {
+                                // Visit canonical root/firmlink paths first, then
+                                // retain Data-only directories hidden from root.
+                                deferred_data = Some(path);
+                            } else {
+                                pending.push(path);
+                            }
+                        }
                         Ok(meta) if meta.is_file() => {
                             let size = meta.len();
                             state.files += 1;
@@ -110,6 +141,30 @@ pub fn scan(
         errors,
         elapsed: started.elapsed(),
     })
+}
+
+#[cfg(unix)]
+fn directory_identity(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+// This application targets macOS; keeping a fallback makes headless core tests
+// portable without introducing filesystem traversal dependencies.
+#[cfg(not(unix))]
+fn directory_identity(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    fs::canonicalize(path)
+}
+
+fn excluded_from_startup_disk(path: &std::path::Path) -> bool {
+    // These are device or other-disk/network mount namespaces, not files on the
+    // startup disk. Do not apply this policy when explicitly scanning a folder.
+    let path = path.strip_prefix("/System/Volumes/Data").unwrap_or(path);
+    matches!(
+        path.to_str(),
+        Some("/dev" | "/Volumes" | "/Network" | "dev" | "Volumes" | "Network")
+    )
 }
 
 fn root_error(error: &std::io::Error) -> String {
@@ -166,6 +221,41 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn startup_scope_excludes_only_other_mount_namespaces() {
+        for path in [
+            "/dev",
+            "/Volumes",
+            "/Network",
+            "/System/Volumes/Data/Volumes",
+            "/System/Volumes/Data/Network",
+            "/System/Volumes/Data/dev",
+        ] {
+            assert!(excluded_from_startup_disk(std::path::Path::new(path)));
+        }
+        for path in [
+            "/Users",
+            "/Applications",
+            "/System/Volumes/Data",
+            "/Users/a/Volumes",
+        ] {
+            assert!(!excluded_from_startup_disk(std::path::Path::new(path)));
+        }
+    }
+
+    #[test]
+    fn directory_identity_cache_distinguishes_directories_and_is_per_scan() {
+        let temp = Temp::new();
+        let child = temp.0.join("child");
+        fs::create_dir(&child).unwrap();
+        let mut visited = HashSet::new();
+        assert!(visited.insert(directory_identity(&temp.0).unwrap()));
+        assert!(!visited.insert(directory_identity(&temp.0).unwrap()));
+        assert!(visited.insert(directory_identity(&child).unwrap()));
+        let mut next_scan = HashSet::new();
+        assert!(next_scan.insert(directory_identity(&temp.0).unwrap()));
     }
 
     #[test]

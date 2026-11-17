@@ -1,3 +1,4 @@
+mod permission;
 mod scan;
 mod treemap;
 
@@ -105,6 +106,9 @@ struct Job {
     path: PathBuf,
 }
 struct App {
+    access: permission::Access,
+    permission_rx: Option<mpsc::Receiver<permission::Access>>,
+    pending_scan: Option<PathBuf>,
     data: Option<scan::ScanResult>,
     job: Option<Job>,
     picker: Option<mpsc::Receiver<Option<PathBuf>>>,
@@ -123,6 +127,9 @@ struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
+            access: permission::Access::Unverified,
+            permission_rx: None,
+            pending_scan: None,
             data: None,
             job: None,
             picker: None,
@@ -142,6 +149,35 @@ impl Default for App {
 }
 impl App {
     fn start(&mut self, path: PathBuf) {
+        let (tx, rx) = mpsc::channel();
+        self.queue_permission_check(path, rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(permission::check());
+        });
+    }
+    fn queue_permission_check(&mut self, path: PathBuf, rx: mpsc::Receiver<permission::Access>) {
+        if let Some(job) = self.job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        self.picker = None;
+        self.pending_scan = Some(path);
+        self.access = permission::Access::Unverified;
+        self.permission_rx = Some(rx);
+        self.message = None;
+    }
+    fn permission_result(&mut self, access: permission::Access) -> Option<PathBuf> {
+        self.access = access;
+        self.permission_rx = None;
+        if access == permission::Access::Granted {
+            self.pending_scan.take()
+        } else {
+            None
+        }
+    }
+    fn launch_scan(&mut self, path: PathBuf) {
+        if self.access != permission::Access::Granted {
+            return;
+        }
         if let Some(job) = self.job.take() {
             job.cancel.store(true, Ordering::Relaxed);
         }
@@ -165,7 +201,7 @@ impl App {
         self.message = None;
     }
     fn choose(&mut self) {
-        if self.picker.is_some() {
+        if self.access != permission::Access::Granted || self.picker.is_some() {
             return;
         }
         let (tx, rx) = mpsc::channel();
@@ -179,6 +215,19 @@ impl App {
         });
     }
     fn poll(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.permission_rx {
+            match rx.try_recv() {
+                Ok(access) => {
+                    if let Some(path) = self.permission_result(access) {
+                        self.launch_scan(path);
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.permission_result(permission::Access::Unverified);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if let Some(rx) = &self.reveal_rx {
             match rx.try_recv() {
                 Ok(result) => {
@@ -237,7 +286,11 @@ impl App {
                 _ => {}
             }
         }
-        if self.job.is_some() || self.picker.is_some() || self.reveal_rx.is_some() {
+        if self.job.is_some()
+            || self.picker.is_some()
+            || self.reveal_rx.is_some()
+            || self.permission_rx.is_some()
+        {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
@@ -341,8 +394,70 @@ impl App {
             let _ = tx.send(result);
         });
     }
+    fn open_permissions(&mut self) {
+        if self.reveal_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.reveal_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = std::process::Command::new("/usr/bin/open")
+                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+                .output();
+            let result = match result {
+                Ok(output) if output.status.success() => Ok(()),
+                _ => Err("无法打开系统设置，请手动前往隐私与安全性 > 完全磁盘访问权限。".into()),
+            };
+            let _ = tx.send(result);
+        });
+    }
     fn ui(&mut self, ctx: &egui::Context) {
         self.poll(ctx);
+        if self.access != permission::Access::Granted {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(BG))
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space((ui.available_height() * 0.28).max(24.0));
+                        ui.label(RichText::new("Visualize SSD").size(22.0).strong());
+                        ui.add_space(20.0);
+                        ui.label(RichText::new("需要完全磁盘访问权限").size(28.0).strong());
+                        ui.add_space(12.0);
+                        if self.permission_rx.is_some() {
+                            ui.spinner();
+                            ui.label("正在检查权限，检查通过后自动扫描启动磁盘。");
+                        } else {
+                            let reason = if self.access == permission::Access::Denied {
+                                "macOS 尚未允许此应用读取受保护文件，扫描已阻止。"
+                            } else {
+                                "尚未验证完全磁盘访问权限，扫描已阻止。"
+                            };
+                            ui.label(RichText::new(reason).color(MUTED));
+                            ui.add_space(12.0);
+                            ui.label("在系统设置中添加并开启 /Applications/Visualize SSD.app。");
+                            ui.label("授权后点击重新检查；若系统要求，请退出并重新打开应用。");
+                            ui.add_space(20.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space((ui.available_width() * 0.5 - 150.0).max(0.0));
+                                if ui.button("打开完全磁盘访问权限设置").clicked() {
+                                    self.open_permissions();
+                                }
+                                if ui.button("重新检查").clicked() {
+                                    self.start(
+                                        self.pending_scan
+                                            .clone()
+                                            .unwrap_or_else(|| PathBuf::from("/")),
+                                    );
+                                }
+                            });
+                        }
+                        if let Some(message) = &self.message {
+                            ui.label(RichText::new(message).color(MUTED));
+                        }
+                    });
+                });
+            return;
+        }
         egui::TopBottomPanel::top("toolbar")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(16.0))
             .show(ctx, |ui| {
@@ -356,13 +471,10 @@ impl App {
                         self.choose();
                     }
                     if ui
-                        .add_enabled(
-                            self.data.is_some() && self.job.is_none(),
-                            egui::Button::new("重新扫描"),
-                        )
+                        .add_enabled(self.job.is_none(), egui::Button::new("重新扫描启动磁盘"))
                         .clicked()
                     {
-                        self.start(self.data.as_ref().unwrap().root.clone());
+                        self.start(PathBuf::from("/"));
                     }
                     if let Some(job) = &self.job {
                         if ui.button("取消扫描").clicked() {
@@ -404,7 +516,12 @@ impl App {
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space((ui.available_height() * 0.32).max(32.0));
-                        ui.label(RichText::new("选择要分析的文件夹").size(30.0).strong());
+                        let heading = if self.job.is_some() {
+                            "正在扫描文件"
+                        } else {
+                            "扫描已停止"
+                        };
+                        ui.label(RichText::new(heading).size(30.0).strong());
                         ui.add_space(12.0);
                         ui.label(
                             RichText::new("每个色块是一个文件，同一文件夹使用相同颜色。")
@@ -555,10 +672,13 @@ impl App {
             .frame(egui::Frame::new().fill(PANEL).inner_margin(10.0))
             .show(ctx, |ui| {
                 let data = self.data.as_ref().unwrap();
+                if data.root == std::path::Path::new("/") {
+                    ui.label(RichText::new("启动磁盘 · 不含其他挂载磁盘与网络磁盘").small().color(MUTED));
+                }
                 ui.horizontal_wrapped(|ui| {
                     ui.label(
                         RichText::new(format!(
-                            "扫描完成 · {:.1} 秒 · {} 个文件 · 跳过 {} 项（链接、特殊文件或读取失败）",
+                            "扫描完成 · {:.1} 秒 · {} 个文件 · 跳过 {} 项（重复目录、链接、特殊文件或读取失败）",
                             data.elapsed.as_secs_f64(),
                             data.files.len(),
                             data.skipped
@@ -700,7 +820,6 @@ impl Drop for App {
     }
 }
 fn main() -> eframe::Result {
-    let initial = std::env::args_os().nth(1).map(PathBuf::from);
     eframe::run_native(
         "Visualize SSD",
         eframe::NativeOptions {
@@ -713,9 +832,7 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             configure(&cc.egui_ctx);
             let mut app = App::default();
-            if let Some(p) = initial {
-                app.start(p);
-            }
+            app.start(PathBuf::from("/"));
             Ok(Box::new(app))
         }),
     )
@@ -739,9 +856,78 @@ mod tests {
         }
     }
     #[test]
+    fn permission_gate_blocks_scanning_and_folder_picker() {
+        let mut app = App::default();
+        app.launch_scan(PathBuf::from("/"));
+        app.choose();
+        assert!(app.job.is_none());
+        assert!(app.picker.is_none());
+        app.pending_scan = Some(PathBuf::from("/"));
+        assert!(app.permission_result(permission::Access::Denied).is_none());
+        assert!(
+            app.permission_result(permission::Access::Unverified)
+                .is_none()
+        );
+        assert!(app.job.is_none());
+        assert_eq!(app.pending_scan.as_deref(), Some(std::path::Path::new("/")));
+    }
+    #[test]
+    fn disconnected_permission_check_fails_closed() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        let (tx, rx) = mpsc::channel();
+        app.queue_permission_check(PathBuf::from("/"), rx);
+        drop(tx);
+        app.poll(&ctx);
+        assert_eq!(app.access, permission::Access::Unverified);
+        assert!(app.job.is_none());
+        assert!(app.permission_rx.is_none());
+        assert_eq!(app.pending_scan, Some(PathBuf::from("/")));
+    }
+    #[test]
+    fn permission_grant_consumes_startup_request_only_once() {
+        let mut app = App::default();
+        app.pending_scan = Some(PathBuf::from("/"));
+        assert_eq!(
+            app.permission_result(permission::Access::Granted),
+            Some(PathBuf::from("/"))
+        );
+        assert!(app.permission_result(permission::Access::Granted).is_none());
+        app.permission_result(permission::Access::Denied);
+        assert!(app.permission_result(permission::Access::Granted).is_none());
+    }
+    #[test]
+    fn every_scan_rechecks_permission_and_invalidates_old_probe() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = mpsc::channel();
+        app.job = Some(Job {
+            cancel: cancel.clone(),
+            progress: Arc::default(),
+            rx,
+            path: PathBuf::from("/old"),
+        });
+        let (old_tx, old_rx) = mpsc::channel();
+        app.queue_permission_check(PathBuf::from("/"), old_rx);
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(app.job.is_none());
+        assert_eq!(app.access, permission::Access::Unverified);
+        let (new_tx, new_rx) = mpsc::channel();
+        app.queue_permission_check(PathBuf::from("/new"), new_rx);
+        assert!(old_tx.send(permission::Access::Granted).is_err());
+        new_tx.send(permission::Access::Denied).unwrap();
+        app.poll(&ctx);
+        assert_eq!(app.access, permission::Access::Denied);
+        assert!(app.job.is_none());
+        assert_eq!(app.pending_scan, Some(PathBuf::from("/new")));
+    }
+    #[test]
     fn cancelled_result_keeps_previous_snapshot() {
         let ctx = egui::Context::default();
         let mut app = App::default();
+        app.access = permission::Access::Granted;
         app.data = Some(snapshot("/old"));
         let (tx, rx) = mpsc::channel();
         app.job = Some(Job {
@@ -788,6 +974,7 @@ mod tests {
         let ctx = egui::Context::default();
         configure(&ctx);
         let mut app = App::default();
+        app.access = permission::Access::Granted;
         app.data = Some(scan::ScanResult {
             root: PathBuf::from("/data"),
             files: vec![

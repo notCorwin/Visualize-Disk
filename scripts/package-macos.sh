@@ -28,7 +28,14 @@ cp "$ROOT/assets/Info.plist" "$BUNDLE/Contents/Info.plist"
 cp "$ROOT/assets/AppIcon.icns" "$BUNDLE/Contents/Resources/AppIcon.icns"
 printf 'APPL????' > "$BUNDLE/Contents/PkgInfo"
 /usr/bin/plutil -lint "$BUNDLE/Contents/Info.plist"
-/usr/bin/codesign --force --sign - "$BUNDLE"
+# A certificate-backed designated requirement preserves Full Disk Access across
+# rebuilds. Ad-hoc signatures are tied to a changing executable hash.
+SIGNING_IDENTITY="${CODESIGN_IDENTITY:-}"
+if [[ -z "$SIGNING_IDENTITY" ]]; then
+    SIGNING_IDENTITY="$(/usr/bin/security find-identity -v -p codesigning | /usr/bin/awk '/"Apple Development:/ { print $2; exit }')"
+    SIGNING_IDENTITY="${SIGNING_IDENTITY:--}"
+fi
+/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" "$BUNDLE"
 /usr/bin/codesign --verify --deep --strict "$BUNDLE"
 
 if [[ "$INSTALL" == 1 ]]; then
