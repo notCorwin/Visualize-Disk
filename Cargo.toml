@@ -15,6 +15,7 @@ lto = "thin"
 strip = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSFileManager", "NSURL", "NSError", "NSString", "NSAppleEventDescriptor", "NSProcessInfo", "NSPathUtilities", "NSData", "NSDate", "objc2-core-services"] }
 

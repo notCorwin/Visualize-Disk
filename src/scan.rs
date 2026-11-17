@@ -1,10 +1,13 @@
 use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FileIdentity {
@@ -82,78 +85,53 @@ pub fn scan(
     if !metadata.is_dir() || is_link_or_reparse(&metadata) {
         return Err("扫描位置不是可读取的真实目录；不扫描符号链接。".into());
     }
-    let mut files = Vec::new();
-    let mut errors = Vec::new();
     *progress.lock().unwrap_or_else(|e| e.into_inner()) = ScanProgress::default();
-    let startup_disk = cfg!(target_os = "macos") && root == std::path::Path::new("/");
     let root_identity = FileIdentity::from_path(&root, &metadata).map_err(|e| root_error(&e))?;
-    let mut visited = HashSet::new();
-    let mut pending = vec![PendingDirectory {
+    let traversal = Traversal {
+        root: &root,
+        root_device: root_identity.device,
+        startup_disk: cfg!(target_os = "macos") && root == Path::new("/"),
+        cancel: &cancel,
+        progress: &progress,
+        state: Mutex::new(TraversalState::default()),
+    };
+    let mut next = Some(PendingDirectory {
         identity: root_identity,
         path: root.clone(),
-    }];
-    let mut deferred_data = None;
-    // Only this many directory jobs can be active, regardless of tree size.
-    // All jobs and metadata batches share Rayon's process-wide worker pool.
-    let batch_limit = rayon::current_num_threads().max(1).saturating_mul(4);
-    while !pending.is_empty() || deferred_data.is_some() {
+    });
+    while let Some(directory) = next {
         if cancel.load(Ordering::Relaxed) {
-            return Err("扫描已取消。".into());
+            break;
         }
-        if pending.is_empty() {
-            pending.push(deferred_data.take().unwrap());
+        let new_identity = traversal
+            .state
+            .lock()
+            .unwrap()
+            .visited
+            .insert(directory.identity);
+        if !new_identity {
+            publish(
+                &progress,
+                ScanProgress {
+                    skipped: 1,
+                    ..Default::default()
+                },
+            );
+            break;
         }
-        let mut batch = Vec::with_capacity(batch_limit);
-        while batch.len() < batch_limit {
-            let Some(directory) = pending.pop() else {
-                break;
-            };
-            if visited.insert(directory.identity) {
-                batch.push(directory.path);
-            } else {
-                let mut state = progress.lock().unwrap_or_else(|e| e.into_inner());
-                state.skipped = state.skipped.saturating_add(1);
-            }
-        }
-        let reports: Vec<_> = batch
-            .into_par_iter()
-            .map(|directory| {
-                let report = scan_directory(&directory, &cancel, &progress);
-                (directory, report)
-            })
-            .collect();
-        for (directory, mut report) in reports {
-            if let Some(error) = report.unreadable {
-                if directory == root {
-                    return Err(root_error(&error));
-                }
-            }
-            if files.is_empty() {
-                files = report.files;
-            } else {
-                files.append(&mut report.files);
-            }
-            for error in report.errors {
-                if errors.len() < 24 {
-                    errors.push(error);
-                }
-            }
-            for child in report.directories {
-                if (cfg!(windows) && child.identity.device != root_identity.device)
-                    || (startup_disk && excluded_from_startup_disk(&child.path))
-                {
-                    let mut state = progress.lock().unwrap_or_else(|e| e.into_inner());
-                    state.skipped = state.skipped.saturating_add(1);
-                } else if startup_disk && child.path == std::path::Path::new("/System/Volumes/Data")
-                {
-                    // The complete canonical tree finishes before Data aliases
-                    // enter the same per-scan identity cache.
-                    deferred_data = Some(child);
-                } else {
-                    pending.push(child);
-                }
-            }
-        }
+        // Schedule descendants immediately, giving earlier discoveries priority
+        // on each worker. Finish this phase before the Data aliases can claim identities.
+        rayon::scope_fifo(|scope| traversal.spawn(scope, directory));
+        next = traversal.state.lock().unwrap().deferred_data.take();
+    }
+    let TraversalState {
+        mut files,
+        errors,
+        root_failure,
+        ..
+    } = traversal.state.into_inner().unwrap();
+    if let Some(error) = root_failure {
+        return Err(error);
     }
     if cancel.load(Ordering::Relaxed) {
         return Err("扫描已取消。".into());
@@ -170,6 +148,94 @@ pub fn scan(
         errors,
         elapsed: started.elapsed(),
     })
+}
+
+#[derive(Default)]
+struct TraversalState {
+    visited: HashSet<DirectoryIdentity>,
+    files: Vec<FileEntry>,
+    errors: Vec<String>,
+    deferred_data: Option<PendingDirectory>,
+    root_failure: Option<String>,
+}
+
+struct Traversal<'a> {
+    root: &'a Path,
+    root_device: u64,
+    startup_disk: bool,
+    cancel: &'a AtomicBool,
+    progress: &'a Mutex<ScanProgress>,
+    state: Mutex<TraversalState>,
+}
+
+impl Traversal<'_> {
+    fn spawn<'scope>(&'scope self, scope: &rayon::ScopeFifo<'scope>, directory: PendingDirectory) {
+        scope.spawn_fifo(move |scope| {
+            if self.cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let mut report = scan_directory(&directory, self.cancel, self.progress);
+            let mut skipped = 0;
+            let children: Vec<_> = {
+                let mut state = self.state.lock().unwrap();
+                if let Some(error) = report.unreadable
+                    && directory.path == self.root
+                {
+                    state.root_failure = Some(root_error(&error));
+                    return;
+                }
+                if state.files.is_empty() {
+                    state.files = report.files;
+                } else {
+                    state.files.append(&mut report.files);
+                }
+                let retain_errors = 24usize.saturating_sub(state.errors.len());
+                state
+                    .errors
+                    .extend(report.errors.into_iter().take(retain_errors));
+                report
+                    .directories
+                    .into_iter()
+                    .filter_map(|child| self.queue_child(&mut state, child, &mut skipped))
+                    .collect()
+            };
+            if skipped != 0 {
+                publish(
+                    self.progress,
+                    ScanProgress {
+                        skipped,
+                        ..Default::default()
+                    },
+                );
+            }
+            for child in children {
+                if self.cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                self.spawn(scope, child);
+            }
+        });
+    }
+
+    fn queue_child(
+        &self,
+        state: &mut TraversalState,
+        child: PendingDirectory,
+        skipped: &mut u64,
+    ) -> Option<PendingDirectory> {
+        if (cfg!(windows) && child.identity.device != self.root_device)
+            || (self.startup_disk && excluded_from_startup_disk(&child.path))
+        {
+            *skipped += 1;
+        } else if self.startup_disk && child.path == Path::new("/System/Volumes/Data") {
+            state.deferred_data = Some(child);
+        } else if state.visited.insert(child.identity) {
+            return Some(child);
+        } else {
+            *skipped += 1;
+        }
+        None
+    }
 }
 
 type DirectoryIdentity = FileIdentity;
@@ -196,11 +262,15 @@ enum EntryReport {
 }
 
 fn scan_directory(
-    directory: &std::path::Path,
+    directory: &PendingDirectory,
     cancel: &AtomicBool,
     progress: &Mutex<ScanProgress>,
 ) -> DirectoryReport {
-    scan_directory_batches(directory, cancel, progress, || {})
+    #[cfg(target_os = "macos")]
+    if let Some(report) = macos::scan_directory(directory, cancel, progress) {
+        return report;
+    }
+    scan_directory_batches(&directory.path, cancel, progress, || {})
 }
 
 fn scan_directory_batches(
@@ -540,6 +610,76 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn startup_data_root_does_not_claim_identity_before_canonical_phase() {
+        let cancel = AtomicBool::new(false);
+        let progress = Mutex::new(ScanProgress::default());
+        let traversal = Traversal {
+            root: Path::new("/"),
+            root_device: 1,
+            startup_disk: true,
+            cancel: &cancel,
+            progress: &progress,
+            state: Mutex::default(),
+        };
+        let identity = FileIdentity {
+            device: 1,
+            inode: 42,
+        };
+        let child = |path: &str| PendingDirectory {
+            path: path.into(),
+            identity,
+        };
+        let mut state = traversal.state.lock().unwrap();
+        let mut skipped = 0;
+        assert!(
+            traversal
+                .queue_child(&mut state, child("/System/Volumes/Data"), &mut skipped)
+                .is_none()
+        );
+        assert!(
+            traversal
+                .queue_child(&mut state, child("/canonical"), &mut skipped)
+                .is_some()
+        );
+        assert_eq!(skipped, 0);
+        let deferred = state.deferred_data.take().unwrap();
+        assert!(!state.visited.insert(deferred.identity));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn traversal_skips_other_windows_volumes_before_claiming_identity() {
+        let cancel = AtomicBool::new(false);
+        let progress = Mutex::new(ScanProgress::default());
+        let traversal = Traversal {
+            root: Path::new(r"C:\"),
+            root_device: 1,
+            startup_disk: false,
+            cancel: &cancel,
+            progress: &progress,
+            state: Mutex::default(),
+        };
+        let identity = FileIdentity {
+            device: 2,
+            inode: 42,
+        };
+        let child = PendingDirectory {
+            path: r"C:\mount".into(),
+            identity,
+        };
+        let mut state = traversal.state.lock().unwrap();
+        let mut skipped = 0;
+        assert!(
+            traversal
+                .queue_child(&mut state, child, &mut skipped)
+                .is_none()
+        );
+        assert_eq!(skipped, 1);
+        assert!(!state.visited.contains(&identity));
+    }
+
     #[test]
     fn directory_identity_cache_distinguishes_directories_and_is_per_scan() {
         let temp = Temp::new();
@@ -599,6 +739,50 @@ mod tests {
         .unwrap();
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.skipped, 2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bulk_metadata_matches_portable_scan_for_sparse_files_and_hard_links() {
+        let temp = Temp::new();
+        let sparse = temp.0.join("稀疏文件");
+        fs::File::create(&sparse).unwrap().set_len(1 << 24).unwrap();
+        fs::hard_link(&sparse, temp.0.join("hard-link")).unwrap();
+        std::os::unix::fs::symlink(&sparse, temp.0.join("symlink")).unwrap();
+        fs::create_dir(temp.0.join("child")).unwrap();
+
+        let pending = PendingDirectory {
+            identity: directory_identity(&temp.0).unwrap(),
+            path: temp.0.clone(),
+        };
+        let cancel = AtomicBool::new(false);
+        let native_progress = Mutex::new(ScanProgress::default());
+        let portable_progress = Mutex::new(ScanProgress::default());
+        let bulk = macos::scan_directory(&pending, &cancel, &native_progress)
+            .expect("native enumeration should work on the temporary filesystem");
+        let portable = scan_directory_batches(&temp.0, &cancel, &portable_progress, || {});
+        let files = |report: DirectoryReport| {
+            let mut files: Vec<_> = report
+                .files
+                .into_iter()
+                .map(|file| (file.path, file.parent, file.size, file.identity))
+                .collect();
+            files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            files
+        };
+        assert!(bulk.errors.is_empty());
+        assert_eq!(bulk.directories.len(), 1);
+        assert_eq!(bulk.directories[0].path, portable.directories[0].path);
+        assert_eq!(
+            bulk.directories[0].identity,
+            portable.directories[0].identity
+        );
+        assert_eq!(files(bulk), files(portable));
+        let progress = native_progress.into_inner().unwrap();
+        assert_eq!(
+            (progress.files, progress.bytes, progress.skipped),
+            (2, 1 << 25, 1)
+        );
     }
 
     #[cfg(windows)]
