@@ -11,7 +11,7 @@ mod treemap;
 use eframe::egui::{self, Color32, FontId, Rect, RichText, Sense, Vec2};
 use rayon::prelude::*;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     hash::{Hash, Hasher},
     sync::{
         Arc, Mutex,
@@ -221,6 +221,12 @@ impl Notice {
 
 struct TrashOutput {
     source: Arc<scan::ScanResult>,
+    id: usize,
+    result: Result<(), String>,
+}
+
+struct RestoreOutput {
+    source: Arc<scan::ScanResult>,
     result: Result<Option<scan::ScanResult>, String>,
 }
 
@@ -292,12 +298,20 @@ struct MapCache {
     key: LayoutKey,
     map: render::RenderMap,
     texture: egui::TextureHandle,
+    // Pixel-aligned holes reuse the existing texture without a full upload.
+    holes: Vec<treemap::Rect>,
+}
+impl MapCache {
+    fn hide(&mut self, id: usize) {
+        self.holes.extend(self.map.erase(id));
+    }
 }
 
 fn filter_snapshot(
     data: &scan::ScanResult,
     query: &str,
     known_bytes: Option<u64>,
+    hidden: &BTreeSet<usize>,
     token: &AtomicU64,
     generation: u64,
 ) -> Option<FilterOutput> {
@@ -314,8 +328,9 @@ fn filter_snapshot(
                 .iter()
                 .enumerate()
                 .filter_map(|(offset, file)| {
-                    (query.is_empty()
-                        || file.path.to_string_lossy().to_lowercase().contains(&query))
+                    (!hidden.contains(&(chunk * 4096 + offset))
+                        && (query.is_empty()
+                            || file.path.to_string_lossy().to_lowercase().contains(&query)))
                     .then_some(chunk * 4096 + offset)
                 })
                 .collect())
@@ -411,6 +426,7 @@ struct App {
     permission_rx: Option<mpsc::Receiver<permission::Access>>,
     pending_scan: bool,
     data: Option<Arc<scan::ScanResult>>,
+    hidden: Arc<BTreeSet<usize>>,
     job: Option<Job>,
     reveal_rx: Option<mpsc::Receiver<Result<(), String>>>,
     trash_rx: Option<mpsc::Receiver<TrashOutput>>,
@@ -427,7 +443,7 @@ struct App {
     recovery_generation: u64,
     recoveries_loaded: bool,
     recoveries_dirty: bool,
-    restore_rx: Option<mpsc::Receiver<TrashOutput>>,
+    restore_rx: Option<mpsc::Receiver<RestoreOutput>>,
     canvas_rect: Option<Rect>,
     filtered: Vec<usize>,
     file_list: file_list::WrappedFileList,
@@ -449,6 +465,7 @@ impl Default for App {
             permission_rx: None,
             pending_scan: false,
             data: None,
+            hidden: Arc::default(),
             job: None,
             reveal_rx: None,
             trash_rx: None,
@@ -532,6 +549,7 @@ impl App {
         self.message = None;
     }
     fn replace_snapshot(&mut self, data: scan::ScanResult) {
+        defer_drop(std::mem::take(&mut self.hidden));
         if let Some(old) = self.data.replace(Arc::new(data)) {
             defer_drop(old);
         }
@@ -558,6 +576,7 @@ impl App {
         if self.access != permission::Access::Granted
             || self.trash_rx.is_some()
             || self.restore_rx.is_some()
+            || self.hidden.contains(&id)
         {
             return;
         }
@@ -578,9 +597,8 @@ impl App {
             expires: None,
         });
         rayon::spawn(move || {
-            let result = file_actions::move_to_trash(&path, identity)
-                .map(|moved| relocate_snapshot(&source, &path, identity, moved));
-            let _ = tx.send(TrashOutput { source, result });
+            let result = file_actions::move_to_trash(&path, identity).map(|_| ());
+            let _ = tx.send(TrashOutput { source, id, result });
         });
     }
     fn load_recoveries(&mut self) {
@@ -648,7 +666,7 @@ impl App {
                     elapsed: Duration::ZERO,
                 })
             });
-            let _ = tx.send(TrashOutput { source, result });
+            let _ = tx.send(RestoreOutput { source, result });
         });
     }
     fn set_notice(&mut self, notice: Notice) {
@@ -844,23 +862,22 @@ impl App {
                     self.trash_rx = None;
                     self.message = None;
                     match output.result {
-                        Ok(Some(data))
+                        Ok(()) => {
                             if self
                                 .data
                                 .as_ref()
-                                .is_some_and(|current| Arc::ptr_eq(current, &output.source)) =>
-                        {
-                            let refresh = self.job.is_some();
-                            self.replace_snapshot(data);
-                            if refresh {
-                                self.start();
+                                .is_some_and(|current| Arc::ptr_eq(current, &output.source))
+                            {
+                                self.hide_file(output.id);
+                                // A running scan may have read the old path already.
+                                if self.job.is_some() {
+                                    self.launch_scan();
+                                }
+                            } else {
+                                // Never apply an old slot id to a newer scan.
+                                self.launch_scan();
                             }
                             self.action_notice = Some(format!("已移到{}。", platform::TRASH_NAME));
-                        }
-                        Ok(data) => {
-                            defer_drop(data);
-                            self.action_notice = Some(format!("已移到{}。", platform::TRASH_NAME));
-                            self.start();
                         }
                         Err(error) => self.message = Some(error),
                     }
@@ -962,7 +979,7 @@ impl App {
                         && self.layout_key == Some(output.key)
                     {
                         if let Some(image) = output.map.image.take() {
-                            let cache = MapCache {
+                            let mut cache = MapCache {
                                 generation: output.generation,
                                 key: output.key,
                                 map: output.map,
@@ -971,7 +988,13 @@ impl App {
                                     image,
                                     egui::TextureOptions::NEAREST,
                                 ),
+                                holes: Vec::new(),
                             };
+                            // Resize work can finish after a deletion. Apply the
+                            // current holes before displaying its replacement.
+                            for &id in self.hidden.iter() {
+                                cache.hide(id);
+                            }
                             if let Some(old) = self.map_cache.replace(cache) {
                                 defer_drop(old);
                             }
@@ -998,6 +1021,31 @@ impl App {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
+    fn hide_file(&mut self, id: usize) {
+        if self.data.as_ref().is_none_or(|data| id >= data.files.len())
+            || !Arc::make_mut(&mut self.hidden).insert(id)
+        {
+            return;
+        }
+        let current = self.filter_rx.is_none()
+            && !self.dirty
+            && self.filter_applied == self.filter_generation.load(Ordering::Relaxed);
+        let generation = self.filter_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(old) = self.filter_rx.take() {
+            defer_drop(old);
+        }
+        // Reuse an applied query; an in-flight query is restarted with hidden ids.
+        self.filtered.retain(|&file| file != id);
+        if current {
+            self.filter_applied = generation;
+        }
+        if self.selected == Some(id) {
+            self.selected = None;
+        }
+        if let Some(cache) = &mut self.map_cache {
+            cache.hide(id);
+        }
+    }
     fn filter(&mut self) {
         if self.dirty {
             self.dirty = false;
@@ -1012,11 +1060,13 @@ impl App {
         };
         let query = self.query.clone();
         let known = self.totals_ready.then_some(self.total_bytes);
+        let hidden = self.hidden.clone();
         let token = self.filter_generation.clone();
         let (tx, rx) = mpsc::channel();
         self.filter_rx = Some(rx);
         rayon::spawn(move || {
-            if let Some(output) = filter_snapshot(&data, &query, known, &token, generation) {
+            if let Some(output) = filter_snapshot(&data, &query, known, &hidden, &token, generation)
+            {
                 let _ = tx.send(output);
             }
         });
@@ -1425,6 +1475,20 @@ impl App {
                         canvas.width() / map.bounds.w,
                         canvas.height() / map.bounds.h,
                     );
+                    let mut holes = egui::Mesh::default();
+                    for hole in &cache.holes {
+                        // Solid quads have no antialiased fringe over neighbors.
+                        holes.add_colored_rect(
+                            Rect::from_min_size(
+                                canvas.min + Vec2::new(hole.x * scale.x, hole.y * scale.y),
+                                Vec2::new(hole.w * scale.x, hole.h * scale.y),
+                            ),
+                            BG,
+                        );
+                    }
+                    if !holes.is_empty() {
+                        painter.add(holes);
+                    }
                     if let Some(p) = pointer {
                         hovered = map.hit_test(
                             (p.x - canvas.min.x) / scale.x,
@@ -1665,7 +1729,7 @@ mod tests {
     fn workers_preserve_all_files_and_cancel_stale_generations() {
         let data = snapshot();
         let token = AtomicU64::new(1);
-        let list = filter_snapshot(&data, "empty", None, &token, 1).unwrap();
+        let list = filter_snapshot(&data, "empty", None, &BTreeSet::new(), &token, 1).unwrap();
         assert_eq!(list.indices, vec![0]);
         assert_eq!(list.bytes, 1_000_042);
         let map = layout_snapshot(
@@ -1678,7 +1742,7 @@ mod tests {
         for id in 0..3 {
             assert!(map.rect(id).is_some());
         }
-        assert!(filter_snapshot(&data, "", None, &token, 0).is_none());
+        assert!(filter_snapshot(&data, "", None, &BTreeSet::new(), &token, 0).is_none());
         assert!(
             layout_snapshot(
                 &data,
@@ -1840,48 +1904,142 @@ mod tests {
         assert_eq!(app.map_cache.as_ref().unwrap().generation, 1);
     }
     #[test]
-    fn trash_success_updates_matching_snapshot_and_error_preserves_it() {
+    fn trash_success_leaves_a_hole_without_rebuilding_the_snapshot_or_texture() {
         let ctx = egui::Context::default();
+        configure(&ctx);
         let mut app = App::default();
+        app.access = permission::Access::Granted;
         app.data = Some(Arc::new(snapshot()));
+        app.query = "large".into();
+        settle(&mut app, &ctx);
         let source = app.data.clone().unwrap();
+        let cache = app.map_cache.as_ref().unwrap();
+        let texture = cache.texture.id();
+        let generation = cache.generation;
+        let key = cache.key;
+        let neighbor = cache.map.rect(2);
+        let removed = cache.map.rect(1).unwrap();
+        app.selected = Some(1);
         let (tx, rx) = mpsc::channel();
         app.trash_rx = Some(rx);
         tx.send(TrashOutput {
             source: source.clone(),
+            id: 1,
             result: Err("无法移到废纸篓。".into()),
         })
         .unwrap();
         app.poll(&ctx);
-        assert!(Arc::ptr_eq(app.data.as_ref().unwrap(), &source));
-        let mut updated = snapshot();
-        updated.files[1].path = "/Users/test/.Trash/large".into();
-        updated.files[1].parent = "/Users/test/.Trash".into();
+        assert!(app.hidden.is_empty());
+        assert!(app.map_cache.as_ref().unwrap().holes.is_empty());
+        assert_eq!(app.selected, Some(1));
         let (tx, rx) = mpsc::channel();
         app.trash_rx = Some(rx);
         tx.send(TrashOutput {
-            source,
-            result: Ok(Some(updated)),
+            source: source.clone(),
+            id: 1,
+            result: Ok(()),
         })
         .unwrap();
         app.poll(&ctx);
+        app.filter();
+        assert!(Arc::ptr_eq(app.data.as_ref().unwrap(), &source));
         assert_eq!(app.data.as_ref().unwrap().files.len(), 3);
+        assert_eq!(app.total_bytes, 1_000_042); // Trash still occupies disk space.
+        assert_eq!(app.query, "large");
+        assert!(app.filtered.is_empty());
+        assert_eq!(app.selected, None);
+        assert!(app.filter_rx.is_none());
+        assert!(app.layout_rx.is_none());
+        let cache = app.map_cache.as_ref().unwrap();
+        assert_eq!(cache.texture.id(), texture);
+        assert_eq!(cache.generation, generation);
+        assert_eq!(cache.key, key);
+        assert_eq!(cache.map.rect(1), None);
+        assert_eq!(cache.map.rect(2), neighbor);
         assert_eq!(
-            app.data
-                .as_ref()
-                .unwrap()
-                .files
+            cache
+                .map
+                .hit_test(removed.x + removed.w * 0.5, removed.y + removed.h * 0.5),
+            None
+        );
+        assert_eq!(cache.holes.len(), 1);
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1180.0, 780.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.ui(ctx),
+        );
+        assert!(
+            !output
+                .textures_delta
+                .set
                 .iter()
-                .map(|f| f.size)
-                .sum::<u64>(),
-            1_000_042
+                .any(|(id, _)| *id == texture)
         );
-        assert_eq!(
-            app.data.as_ref().unwrap().files[1].parent,
-            std::path::Path::new("/Users/test/.Trash")
-        );
-        assert!(app.selected.is_none());
-        assert!(app.map_cache.is_none());
+        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), texture);
+        assert_eq!(app.layout_generation.load(Ordering::Relaxed), generation);
+        assert!(app.layout_rx.is_none());
+        assert!(app.filter_rx.is_none());
+    }
+    #[test]
+    fn deletions_invalidate_inflight_filters_and_mask_inflight_resizes() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.data = Some(Arc::new(snapshot()));
+        settle(&mut app, &ctx);
+        let stale_generation = app.filter_generation.load(Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        app.filter_rx = Some(rx);
+        tx.send(FilterOutput {
+            generation: stale_generation,
+            indices: vec![0, 1, 2],
+            bytes: 1_000_042,
+        })
+        .unwrap();
+        app.hide_file(1);
+        settle(&mut app, &ctx);
+        assert!(!app.filtered.contains(&1));
+        app.query = "large".into();
+        app.dirty = true;
+        settle(&mut app, &ctx);
+        assert!(app.filtered.is_empty());
+        let key = LayoutKey::new(Vec2::new(700.0, 400.0), 2.0);
+        let generation = app.layout_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let map = layout_snapshot(
+            app.data.as_ref().unwrap(),
+            key,
+            &app.layout_generation,
+            generation,
+        )
+        .unwrap();
+        app.layout_key = Some(key);
+        let (tx, rx) = mpsc::channel();
+        app.layout_rx = Some(rx);
+        tx.send(LayoutOutput {
+            generation,
+            key,
+            map,
+        })
+        .unwrap();
+        app.poll(&ctx);
+        let cache = app.map_cache.as_ref().unwrap();
+        assert_eq!(cache.key, key);
+        assert_eq!(cache.map.rect(1), None);
+        assert!(!cache.holes.is_empty());
+        app.hide_file(1);
+        assert_eq!(app.map_cache.as_ref().unwrap().holes.len(), 1);
+        // A fresh scan (also used after restore) resets holes and slot identities.
+        app.replace_snapshot(snapshot());
+        assert!(app.hidden.is_empty());
+        settle(&mut app, &ctx);
+        assert_eq!(app.filtered.len(), 3);
+        assert!(app.map_cache.as_ref().unwrap().map.rect(1).is_some());
     }
     #[test]
     fn trash_completion_from_older_scan_never_removes_new_snapshot_file() {
@@ -1898,16 +2056,16 @@ mod tests {
         });
         let (tx, rx) = mpsc::channel();
         app.trash_rx = Some(rx);
-        let mut replacement = snapshot();
-        replacement.files.remove(0);
         tx.send(TrashOutput {
             source,
-            result: Ok(Some(replacement)),
+            id: 0,
+            result: Ok(()),
         })
         .unwrap();
         app.poll(&ctx);
         assert!(Arc::ptr_eq(app.data.as_ref().unwrap(), &current));
         assert_eq!(app.data.as_ref().unwrap().files.len(), 3);
+        assert!(app.hidden.is_empty());
     }
     #[test]
     fn restore_result_relocates_same_snapshot_without_changing_disk_usage() {
@@ -1920,7 +2078,7 @@ mod tests {
         let source = app.data.clone().unwrap();
         let (tx, rx) = mpsc::channel();
         app.restore_rx = Some(rx);
-        tx.send(TrashOutput {
+        tx.send(RestoreOutput {
             source: source.clone(),
             result: Err("原位置存在同名文件，未覆盖。".into()),
         })
@@ -1929,7 +2087,7 @@ mod tests {
         assert!(Arc::ptr_eq(app.data.as_ref().unwrap(), &source));
         let (tx, rx) = mpsc::channel();
         app.restore_rx = Some(rx);
-        tx.send(TrashOutput {
+        tx.send(RestoreOutput {
             source,
             result: Ok(Some(snapshot())),
         })

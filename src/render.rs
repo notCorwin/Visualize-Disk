@@ -116,6 +116,66 @@ impl RenderMap {
         self.base.hit_test(x, y)
     }
 
+    /// Remove just this file's sampled pixels. Geometry and the original GPU
+    /// texture stay valid; returned rectangles cover precisely the cleared
+    /// owners and can be painted as background over that texture.
+    pub fn erase(&mut self, id: usize) -> Vec<Rect> {
+        let Some(rect) = self.rect(id) else {
+            return Vec::new();
+        };
+        self.by_id[id] = NONE;
+        let [width, height] = self.base.size;
+        let sx = width as f32 / self.bounds.w;
+        let sy = height as f32 / self.bounds.h;
+        let x0 = (((rect.x - self.bounds.x) * sx - 0.5).ceil().max(0.0) as usize).min(width);
+        let x1 = ((((rect.x + rect.w) - self.bounds.x) * sx - 0.5)
+            .ceil()
+            .max(0.0) as usize)
+            .min(width);
+        let y0 = (((rect.y - self.bounds.y) * sy - 0.5).ceil().max(0.0) as usize).min(height);
+        let y1 = ((((rect.y + rect.h) - self.bounds.y) * sy - 0.5)
+            .ceil()
+            .max(0.0) as usize)
+            .min(height);
+        let mut runs: Vec<[usize; 4]> = Vec::new();
+        let mut previous: std::collections::BTreeMap<(usize, usize), usize> =
+            std::collections::BTreeMap::new();
+        for y in y0..y1 {
+            let mut current = std::collections::BTreeMap::new();
+            let row = &mut self.base.owners[y * width..(y + 1) * width];
+            let mut x = x0;
+            while x < x1 {
+                if row[x] != id as u32 {
+                    x += 1;
+                    continue;
+                }
+                let start = x;
+                while x < x1 && row[x] == id as u32 {
+                    row[x] = NONE;
+                    x += 1;
+                }
+                let key = (start, x);
+                let index = if let Some(&index) = previous.get(&key) {
+                    runs[index][3] += 1;
+                    index
+                } else {
+                    runs.push([start, y, x - start, 1]);
+                    runs.len() - 1
+                };
+                current.insert(key, index);
+            }
+            previous = current;
+        }
+        runs.into_iter()
+            .map(|[x, y, w, h]| Rect {
+                x: self.bounds.x + x as f32 / sx,
+                y: self.bounds.y + y as f32 / sy,
+                w: w as f32 / sx,
+                h: h as f32 / sy,
+            })
+            .collect()
+    }
+
     /// Render just the currently visible world rectangle. The overview remains
     /// available while this cancellable detail image is produced. Never create
     /// a bitmap for an entire zoomed canvas.
@@ -294,6 +354,68 @@ mod tests {
                 color: Color32::GREEN,
             },
         ]
+    }
+    #[test]
+    fn erase_masks_only_owned_pixels_at_hidpi_and_subpixel_boundaries() {
+        let token = AtomicU64::new(1);
+        for size in [[100, 100], [231, 177], [4096, 3000]] {
+            let mut map = RenderMap::build_with_size(
+                entries(),
+                rect(0.0, 0.0, 100.0, 100.0),
+                size,
+                &token,
+                1,
+            )
+            .unwrap();
+            let before = map.base.owners.clone();
+            let pixels = map.image.as_ref().unwrap().pixels.clone();
+            let [w, h] = map.base.size;
+            let holes = map.erase(1);
+            assert_eq!(holes.len(), 1);
+            assert_eq!(map.rect(1), None);
+            assert!(map.erase(1).is_empty());
+            assert!(map.erase(2).is_empty()); // No overview pixel belongs to this subpixel file.
+            assert_eq!(map.image.as_ref().unwrap().pixels, pixels); // Original texture is reusable.
+            for y in 0..h {
+                for x in 0..w {
+                    let p = (
+                        100.0 * (x as f32 + 0.5) / w as f32,
+                        100.0 * (y as f32 + 0.5) / h as f32,
+                    );
+                    let covered = holes
+                        .iter()
+                        .any(|r| p.0 >= r.x && p.0 < r.x + r.w && p.1 >= r.y && p.1 < r.y + r.h);
+                    assert_eq!(covered, before[y * w + x] == 1);
+                    let expected = (before[y * w + x] == 0).then_some(0);
+                    assert_eq!(map.hit_test(p.0, p.1), expected);
+                }
+            }
+        }
+    }
+    #[test]
+    fn erase_large_file_coalesces_all_rows_into_one_hole() {
+        let token = AtomicU64::new(1);
+        let mut map = RenderMap::build_with_size(
+            vec![RenderEntry {
+                id: 0,
+                rect: rect(0.0, 0.0, 2048.0, 2048.0),
+                color: Color32::RED,
+            }],
+            rect(0.0, 0.0, 2048.0, 2048.0),
+            [2048, 2048],
+            &token,
+            1,
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        let holes = map.erase(0);
+        eprintln!(
+            "erase 2048x2048 owners: {:?}, {} cached mask",
+            start.elapsed(),
+            holes.len()
+        );
+        assert_eq!(holes, vec![rect(0.0, 0.0, 2048.0, 2048.0)]);
+        assert!(map.base.owners.iter().all(|&owner| owner == NONE));
     }
     #[test]
     fn raster_pixel_and_hit_have_same_original_file_owner() {
