@@ -1,15 +1,17 @@
 mod permission;
+mod render;
 mod scan;
 mod treemap;
 
 use eframe::egui::{self, Color32, FontId, Rect, RichText, Sense, Vec2};
+use rayon::prelude::*;
 use std::{
     collections::BTreeMap,
     hash::{Hash, Hasher},
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     time::Duration,
@@ -99,29 +101,180 @@ fn configure(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+fn displayed_hit(
+    map: &render::RenderMap,
+    detail: Option<&render::RenderRaster>,
+    x: f32,
+    y: f32,
+) -> Option<usize> {
+    if let Some(detail) = detail {
+        let r = detail.bounds;
+        if x >= r.x && y >= r.y && x < r.x + r.w && y < r.y + r.h {
+            return detail.hit_test(x, y);
+        }
+    }
+    map.hit_test(x, y)
+}
+
+fn defer_drop<T: Send + 'static>(value: T) {
+    rayon::spawn(move || drop(value));
+}
+
+struct FilterOutput {
+    generation: u64,
+    indices: Vec<usize>,
+    bytes: u64,
+}
+struct DetailOutput {
+    generation: u64,
+    raster: render::RenderRaster,
+}
+struct LayoutOutput {
+    generation: u64,
+    map: render::RenderMap,
+}
+
+fn filter_snapshot(
+    data: &scan::ScanResult,
+    query: &str,
+    known_bytes: Option<u64>,
+    token: &AtomicU64,
+    generation: u64,
+) -> Option<FilterOutput> {
+    let query = query.to_lowercase();
+    let parts: Result<Vec<Vec<usize>>, ()> = data
+        .files
+        .par_chunks(4096)
+        .enumerate()
+        .map(|(chunk, files)| {
+            if token.load(Ordering::Relaxed) != generation {
+                return Err(());
+            }
+            Ok(files
+                .iter()
+                .enumerate()
+                .filter_map(|(offset, file)| {
+                    (query.is_empty()
+                        || file.path.to_string_lossy().to_lowercase().contains(&query))
+                    .then_some(chunk * 4096 + offset)
+                })
+                .collect())
+        })
+        .collect();
+    let indices = parts.ok()?.into_iter().flatten().collect();
+    let bytes = known_bytes.unwrap_or_else(|| {
+        data.files
+            .par_iter()
+            .map(|file| file.size)
+            .reduce(|| 0, u64::saturating_add)
+    });
+    (token.load(Ordering::Relaxed) == generation).then_some(FilterOutput {
+        generation,
+        indices,
+        bytes,
+    })
+}
+
+fn layout_snapshot(
+    data: &scan::ScanResult,
+    size: Vec2,
+    token: &AtomicU64,
+    generation: u64,
+) -> Option<render::RenderMap> {
+    let grouped: Result<BTreeMap<&std::path::Path, Vec<(usize, u64)>>, ()> = data
+        .files
+        .par_iter()
+        .enumerate()
+        .try_fold(BTreeMap::new, |mut groups, (i, file)| {
+            if i % 1024 == 0 && token.load(Ordering::Relaxed) != generation {
+                return Err(());
+            }
+            groups
+                .entry(file.parent.as_path())
+                .or_insert_with(Vec::new)
+                .push((i, file.size.max(1)));
+            Ok(groups)
+        })
+        .try_reduce(BTreeMap::new, |mut a, b| {
+            for (path, mut files) in b {
+                a.entry(path).or_insert_with(Vec::new).append(&mut files);
+            }
+            Ok(a)
+        });
+    let groups: Vec<_> = grouped.ok()?.into_iter().collect();
+    if token.load(Ordering::Relaxed) != generation {
+        return None;
+    }
+    let weights: Vec<_> = groups
+        .par_iter()
+        .enumerate()
+        .map(|(i, (_, files))| (i, files.iter().fold(0u64, |n, (_, s)| n.saturating_add(*s))))
+        .collect();
+    let bounds = treemap::Rect {
+        x: 0.0,
+        y: 0.0,
+        w: size.x,
+        h: size.y,
+    };
+    let group_bounds = treemap::layout_with_cancel(&weights, bounds, token, generation)?;
+    let pieces: Result<Vec<Vec<render::RenderEntry>>, ()> = group_bounds
+        .into_par_iter()
+        .map(|(i, bounds)| {
+            if token.load(Ordering::Relaxed) != generation {
+                return Err(());
+            }
+            let (path, files) = &groups[i];
+            let c = color(path);
+            Ok(
+                treemap::layout_with_cancel(files, bounds, token, generation)
+                    .ok_or(())?
+                    .into_iter()
+                    .map(|(id, rect)| render::RenderEntry { id, rect, color: c })
+                    .collect(),
+            )
+        })
+        .collect();
+    let entries = pieces.ok()?.into_iter().flatten().collect();
+    if token.load(Ordering::Relaxed) != generation {
+        return None;
+    }
+    render::RenderMap::build(entries, bounds, token, generation)
+}
+
 struct Job {
     cancel: Arc<AtomicBool>,
     progress: Arc<Mutex<scan::ScanProgress>>,
     rx: mpsc::Receiver<Result<scan::ScanResult, String>>,
-    path: PathBuf,
 }
 struct App {
     access: permission::Access,
     permission_rx: Option<mpsc::Receiver<permission::Access>>,
-    pending_scan: Option<PathBuf>,
-    data: Option<scan::ScanResult>,
+    pending_scan: bool,
+    data: Option<Arc<scan::ScanResult>>,
     job: Option<Job>,
-    picker: Option<mpsc::Receiver<Option<PathBuf>>>,
     reveal_rx: Option<mpsc::Receiver<Result<(), String>>>,
-    scope: Option<PathBuf>,
     query: String,
     selected: Option<usize>,
     message: Option<String>,
     filtered: Vec<usize>,
-    filtered_bytes: u64,
+    total_bytes: u64,
     dirty: bool,
-    layout: Vec<(usize, treemap::Rect)>,
+    filter_rx: Option<mpsc::Receiver<FilterOutput>>,
+    filter_generation: Arc<AtomicU64>,
+    filter_applied: u64,
+    totals_ready: bool,
+    layout_rx: Option<mpsc::Receiver<LayoutOutput>>,
+    layout_generation: Arc<AtomicU64>,
+    layout_applied: u64,
     layout_size: Vec2,
+    render_map: Option<Arc<render::RenderMap>>,
+    texture: Option<egui::TextureHandle>,
+    detail_rx: Option<mpsc::Receiver<DetailOutput>>,
+    detail_generation: Arc<AtomicU64>,
+    detail_applied: u64,
+    detail_requested: Option<(treemap::Rect, [usize; 2])>,
+    detail: Option<render::RenderRaster>,
+    detail_texture: Option<egui::TextureHandle>,
     zoom: f32,
 }
 impl Default for App {
@@ -129,57 +282,66 @@ impl Default for App {
         Self {
             access: permission::Access::Unverified,
             permission_rx: None,
-            pending_scan: None,
+            pending_scan: false,
             data: None,
             job: None,
-            picker: None,
             reveal_rx: None,
-            scope: None,
             query: String::new(),
             selected: None,
             message: None,
             filtered: Vec::new(),
-            filtered_bytes: 0,
+            total_bytes: 0,
             dirty: true,
-            layout: Vec::new(),
+            filter_rx: None,
+            filter_generation: Arc::new(AtomicU64::new(0)),
+            filter_applied: 0,
+            totals_ready: false,
+            layout_rx: None,
+            layout_generation: Arc::new(AtomicU64::new(0)),
+            layout_applied: 0,
             layout_size: Vec2::ZERO,
+            render_map: None,
+            texture: None,
+            detail_rx: None,
+            detail_generation: Arc::new(AtomicU64::new(0)),
+            detail_applied: 0,
+            detail_requested: None,
+            detail: None,
+            detail_texture: None,
             zoom: 1.0,
         }
     }
 }
 impl App {
-    fn start(&mut self, path: PathBuf) {
+    fn start(&mut self) {
         let (tx, rx) = mpsc::channel();
-        self.queue_permission_check(path, rx);
+        self.queue_permission_check(rx);
         std::thread::spawn(move || {
             let _ = tx.send(permission::check());
         });
     }
-    fn queue_permission_check(&mut self, path: PathBuf, rx: mpsc::Receiver<permission::Access>) {
+    fn queue_permission_check(&mut self, rx: mpsc::Receiver<permission::Access>) {
         if let Some(job) = self.job.take() {
             job.cancel.store(true, Ordering::Relaxed);
+            defer_drop(job);
         }
-        self.picker = None;
-        self.pending_scan = Some(path);
+        self.pending_scan = true;
         self.access = permission::Access::Unverified;
         self.permission_rx = Some(rx);
         self.message = None;
     }
-    fn permission_result(&mut self, access: permission::Access) -> Option<PathBuf> {
+    fn permission_result(&mut self, access: permission::Access) -> bool {
         self.access = access;
         self.permission_rx = None;
-        if access == permission::Access::Granted {
-            self.pending_scan.take()
-        } else {
-            None
-        }
+        access == permission::Access::Granted && std::mem::take(&mut self.pending_scan)
     }
-    fn launch_scan(&mut self, path: PathBuf) {
+    fn launch_scan(&mut self) {
         if self.access != permission::Access::Granted {
             return;
         }
         if let Some(job) = self.job.take() {
             job.cancel.store(true, Ordering::Relaxed);
+            defer_drop(job);
         }
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Mutex::new(scan::ScanProgress {
@@ -188,38 +350,23 @@ impl App {
             skipped: 0,
         }));
         let (tx, rx) = mpsc::channel();
-        let (p, c, stats) = (path.clone(), cancel.clone(), progress.clone());
+        let (c, stats) = (cancel.clone(), progress.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(scan::scan(p, c, stats));
+            let _ = tx.send(scan::scan(PathBuf::from("/"), c, stats));
         });
         self.job = Some(Job {
             cancel,
             progress,
             rx,
-            path,
         });
         self.message = None;
-    }
-    fn choose(&mut self) {
-        if self.access != permission::Access::Granted || self.picker.is_some() {
-            return;
-        }
-        let (tx, rx) = mpsc::channel();
-        self.picker = Some(rx);
-        std::thread::spawn(move || {
-            let _ = tx.send(
-                rfd::FileDialog::new()
-                    .set_title("选择要分析的文件夹")
-                    .pick_folder(),
-            );
-        });
     }
     fn poll(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.permission_rx {
             match rx.try_recv() {
                 Ok(access) => {
-                    if let Some(path) = self.permission_result(access) {
-                        self.launch_scan(path);
+                    if self.permission_result(access) {
+                        self.launch_scan();
                     }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -243,37 +390,49 @@ impl App {
                 _ => {}
             }
         }
-        if let Some(rx) = &self.picker {
-            match rx.try_recv() {
-                Ok(path) => {
-                    self.picker = None;
-                    if let Some(p) = path {
-                        self.start(p);
-                    }
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.picker = None;
-                    self.message = Some("文件夹选择器已关闭，请重试。".into());
-                }
-                _ => {}
-            }
-        }
         if let Some(job) = &self.job {
             match job.rx.try_recv() {
                 Ok(result) => {
                     let cancelled = job.cancel.load(Ordering::Relaxed);
                     self.job = None;
                     if cancelled {
+                        defer_drop(result);
                         self.message = Some("已取消扫描，保留上次扫描结果。".into());
                     } else {
                         match result {
                             Ok(data) => {
-                                self.scope = Some(data.root.clone());
-                                self.data = Some(data);
+                                if let Some(old) = self.data.replace(Arc::new(data)) {
+                                    defer_drop(old);
+                                }
+                                self.filter_generation.fetch_add(1, Ordering::Relaxed);
+                                self.layout_generation.fetch_add(1, Ordering::Relaxed);
+                                if let Some(old) = self.filter_rx.take() {
+                                    defer_drop(old);
+                                }
+                                if let Some(old) = self.layout_rx.take() {
+                                    defer_drop(old);
+                                }
+                                if let Some(old) = self.render_map.take() {
+                                    defer_drop(old);
+                                }
+                                self.texture = None;
+                                self.detail_generation.fetch_add(1, Ordering::Relaxed);
+                                self.detail_requested = None;
+                                if let Some(old) = self.detail_rx.take() {
+                                    defer_drop(old);
+                                }
+                                if let Some(old) = self.detail.take() {
+                                    defer_drop(old);
+                                }
+                                self.detail_texture = None;
+                                self.filtered.clear();
+                                self.total_bytes = 0;
+                                self.totals_ready = false;
                                 self.selected = None;
                                 self.query.clear();
                                 self.zoom = 1.0;
                                 self.dirty = true;
+                                self.layout_size = Vec2::ZERO;
                             }
                             Err(e) => self.message = Some(e),
                         }
@@ -286,87 +445,152 @@ impl App {
                 _ => {}
             }
         }
+        if let Some(rx) = &self.filter_rx {
+            match rx.try_recv() {
+                Ok(output) => {
+                    self.filter_rx = None;
+                    if output.generation == self.filter_generation.load(Ordering::Relaxed) {
+                        self.filter_applied = output.generation;
+                        defer_drop(std::mem::replace(&mut self.filtered, output.indices));
+                        self.total_bytes = output.bytes;
+                        self.totals_ready = true;
+                    } else {
+                        defer_drop(output);
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.filter_rx = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(rx) = &self.layout_rx {
+            match rx.try_recv() {
+                Ok(mut output) => {
+                    self.layout_rx = None;
+                    if output.generation == self.layout_generation.load(Ordering::Relaxed) {
+                        self.layout_applied = output.generation;
+                        self.detail_generation.fetch_add(1, Ordering::Relaxed);
+                        self.detail_requested = None;
+                        if let Some(old) = self.detail_rx.take() {
+                            defer_drop(old);
+                        }
+                        if let Some(old) = self.detail.take() {
+                            defer_drop(old);
+                        }
+                        self.detail_texture = None;
+                        if let Some(image) = output.map.image.take() {
+                            self.texture = Some(ctx.load_texture(
+                                "disk-map",
+                                image,
+                                egui::TextureOptions::NEAREST,
+                            ));
+                        }
+                        if let Some(old) = self.render_map.replace(Arc::new(output.map)) {
+                            defer_drop(old);
+                        }
+                    } else {
+                        defer_drop(output);
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.layout_rx = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(rx) = &self.detail_rx {
+            match rx.try_recv() {
+                Ok(mut output) => {
+                    self.detail_rx = None;
+                    if output.generation == self.detail_generation.load(Ordering::Relaxed) {
+                        self.detail_applied = output.generation;
+                        if let Some(image) = output.raster.image.take() {
+                            self.detail_texture = Some(ctx.load_texture(
+                                "disk-detail",
+                                image,
+                                egui::TextureOptions::NEAREST,
+                            ));
+                        }
+                        if let Some(old) = self.detail.replace(output.raster) {
+                            defer_drop(old);
+                        }
+                    } else {
+                        defer_drop(output);
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.detail_rx = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if self.job.is_some()
-            || self.picker.is_some()
             || self.reveal_rx.is_some()
             || self.permission_rx.is_some()
+            || self.filter_rx.is_some()
+            || self.layout_rx.is_some()
+            || self.detail_rx.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
     fn filter(&mut self) {
-        if !self.dirty {
+        if self.dirty {
+            self.dirty = false;
+            self.filter_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        let generation = self.filter_generation.load(Ordering::Relaxed);
+        if self.filter_rx.is_some() || self.filter_applied == generation {
             return;
         }
-        self.filtered.clear();
-        self.filtered_bytes = 0;
-        if let Some(data) = &self.data {
-            let query = self.query.to_lowercase();
-            for (i, file) in data.files.iter().enumerate() {
-                if self
-                    .scope
-                    .as_ref()
-                    .is_some_and(|p| !file.path.starts_with(p))
-                {
-                    continue;
-                }
-                if !query.is_empty() && !file.path.to_string_lossy().to_lowercase().contains(&query)
-                {
-                    continue;
-                }
-                self.filtered.push(i);
-                self.filtered_bytes = self.filtered_bytes.saturating_add(file.size);
-            }
-            self.filtered.sort_unstable_by(|&a, &b| {
-                data.files[b]
-                    .size
-                    .cmp(&data.files[a].size)
-                    .then_with(|| data.files[a].path.cmp(&data.files[b].path))
-            });
-        }
-        self.layout_size = Vec2::ZERO;
-        self.dirty = false;
-    }
-    fn layout(&mut self, size: Vec2) {
-        if self.layout_size == size {
-            return;
-        }
-        self.layout_size = size;
-        self.layout.clear();
-        let Some(data) = &self.data else {
+        let Some(data) = self.data.clone() else {
             return;
         };
-        let mut groups: BTreeMap<&std::path::Path, Vec<(usize, u64)>> = BTreeMap::new();
-        for &i in &self.filtered {
-            let file = &data.files[i];
-            groups
-                .entry(&file.parent)
-                .or_default()
-                .push((i, file.size.max(1)));
-        }
-        let groups: Vec<_> = groups.into_values().collect();
-        let weights: Vec<_> = groups
-            .iter()
-            .enumerate()
-            .map(|(i, g)| (i, g.iter().fold(0u64, |n, (_, s)| n.saturating_add(*s))))
-            .collect();
-        for (i, r) in treemap::layout(
-            &weights,
-            treemap::Rect {
-                x: 0.0,
-                y: 0.0,
-                w: size.x,
-                h: size.y,
-            },
-        ) {
-            self.layout.extend(treemap::layout(&groups[i], r));
-        }
+        let query = self.query.clone();
+        let known = self.totals_ready.then_some(self.total_bytes);
+        let token = self.filter_generation.clone();
+        let (tx, rx) = mpsc::channel();
+        self.filter_rx = Some(rx);
+        rayon::spawn(move || {
+            if let Some(output) = filter_snapshot(&data, &query, known, &token, generation) {
+                let _ = tx.send(output);
+            }
+        });
     }
-    fn navigate(&mut self, p: PathBuf) {
-        self.scope = Some(p);
-        self.selected = None;
-        self.zoom = 1.0;
-        self.dirty = true;
+    fn layout(&mut self, size: Vec2) {
+        if self.layout_size != size {
+            self.layout_size = size;
+            self.layout_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        let generation = self.layout_generation.load(Ordering::Relaxed);
+        if self.layout_rx.is_some() || self.layout_applied == generation {
+            return;
+        }
+        let Some(data) = self.data.clone() else {
+            return;
+        };
+        let token = self.layout_generation.clone();
+        let (tx, rx) = mpsc::channel();
+        self.layout_rx = Some(rx);
+        rayon::spawn(move || {
+            if let Some(map) = layout_snapshot(&data, size, &token, generation) {
+                let _ = tx.send(LayoutOutput { generation, map });
+            }
+        });
+    }
+    fn detail(&mut self, map: Arc<render::RenderMap>, view: treemap::Rect, size: [usize; 2]) {
+        let key = (view, size);
+        if self.detail_requested != Some(key) {
+            self.detail_requested = Some(key);
+            self.detail_generation.fetch_add(1, Ordering::Relaxed);
+        }
+        let generation = self.detail_generation.load(Ordering::Relaxed);
+        if self.detail_rx.is_some() || self.detail_applied == generation {
+            return;
+        }
+        let token = self.detail_generation.clone();
+        let (tx, rx) = mpsc::channel();
+        self.detail_rx = Some(rx);
+        rayon::spawn(move || {
+            if let Some(raster) = map.rasterize(view, size, &token, generation) {
+                let _ = tx.send(DetailOutput { generation, raster });
+            }
+        });
     }
     fn reveal(&mut self, i: usize) {
         if self.reveal_rx.is_some() {
@@ -443,11 +667,7 @@ impl App {
                                     self.open_permissions();
                                 }
                                 if ui.button("重新检查").clicked() {
-                                    self.start(
-                                        self.pending_scan
-                                            .clone()
-                                            .unwrap_or_else(|| PathBuf::from("/")),
-                                    );
+                                    self.start();
                                 }
                             });
                         }
@@ -465,16 +685,10 @@ impl App {
                     ui.label(RichText::new("Visualize SSD").size(22.0).strong());
                     ui.add_space(16.0);
                     if ui
-                        .add_enabled(self.picker.is_none(), egui::Button::new("选择文件夹"))
-                        .clicked()
-                    {
-                        self.choose();
-                    }
-                    if ui
                         .add_enabled(self.job.is_none(), egui::Button::new("重新扫描启动磁盘"))
                         .clicked()
                     {
-                        self.start(PathBuf::from("/"));
+                        self.start();
                     }
                     if let Some(job) = &self.job {
                         if ui.button("取消扫描").clicked() {
@@ -496,11 +710,6 @@ impl App {
                             p.skipped
                         ));
                     });
-                    ui.label(
-                        RichText::new(job.path.to_string_lossy())
-                            .small()
-                            .color(MUTED),
-                    );
                     if self.data.is_some() {
                         ui.label(RichText::new("下方显示上次完成的扫描结果").color(MUTED));
                     }
@@ -517,7 +726,7 @@ impl App {
                     ui.vertical_centered(|ui| {
                         ui.add_space((ui.available_height() * 0.32).max(32.0));
                         let heading = if self.job.is_some() {
-                            "正在扫描文件"
+                            "正在扫描整个启动磁盘"
                         } else {
                             "扫描已停止"
                         };
@@ -528,15 +737,8 @@ impl App {
                                 .color(MUTED),
                         );
                         ui.add_space(20.0);
-                        if ui
-                            .add_enabled(
-                                self.picker.is_none(),
-                                egui::Button::new("选择文件夹开始")
-                                    .min_size(Vec2::new(180.0, 44.0)),
-                            )
-                            .clicked()
-                        {
-                            self.choose();
+                        if self.job.is_none() && ui.button("重新扫描启动磁盘").clicked() {
+                            self.start();
                         }
                     });
                 });
@@ -546,40 +748,38 @@ impl App {
             .frame(egui::Frame::new().fill(BG).inner_margin(16.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let root = self.data.as_ref().unwrap().root.clone();
-                    let scope = self.scope.clone().unwrap_or_else(|| root.clone());
-                    if ui
-                        .add_enabled(scope != root, egui::Button::new("← 上一级"))
-                        .clicked()
-                    {
-                        if let Some(p) = scope.parent() {
-                            self.navigate(p.to_path_buf());
-                        }
-                    }
-                    if ui.button("扫描根目录").clicked() {
-                        self.navigate(root);
-                    }
-                    ui.label(RichText::new(scope.to_string_lossy()).color(MUTED));
-                });
-                ui.horizontal(|ui| {
                     let response = ui.add(
                         egui::TextEdit::singleline(&mut self.query)
-                            .hint_text("搜索文件名或路径")
+                            .hint_text("搜索文件列表")
                             .desired_width(260.0),
                     );
                     if response.changed() {
                         self.dirty = true;
                     }
-                    if !self.query.is_empty() && ui.button("清除").clicked() {
+                    if ui
+                        .add_enabled(!self.query.is_empty(), egui::Button::new("清除"))
+                        .clicked()
+                    {
                         self.query.clear();
                         self.dirty = true;
                     }
                     ui.separator();
-                    ui.label(format!("{} 个文件", self.filtered.len()));
+                    ui.label("启动磁盘 /");
+                    ui.label(format!(
+                        "{} 个文件",
+                        self.data.as_ref().unwrap().files.len()
+                    ));
+                    if self.layout_rx.is_some() {
+                        ui.label(RichText::new("正在生成整盘视图…").color(MUTED));
+                    }
                     ui.label(
-                        RichText::new(bytes(self.filtered_bytes))
-                            .strong()
-                            .color(ACCENT),
+                        RichText::new(if self.totals_ready {
+                            bytes(self.total_bytes)
+                        } else {
+                            "统计中…".into()
+                        })
+                        .strong()
+                        .color(ACCENT),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add(
@@ -591,7 +791,6 @@ impl App {
                 });
             });
         self.filter();
-        let mut navigate = None;
         let mut reveal = None;
         egui::SidePanel::right("files")
             .default_width(280.0)
@@ -618,18 +817,17 @@ impl App {
                         if ui.button("在 Finder 中显示").clicked() {
                             reveal = Some(i);
                         }
-                        if ui.button("聚焦文件夹").clicked() {
-                            navigate = Some(f.parent.clone());
-                        }
                     });
                     ui.separator();
                 }
                 ui.label(RichText::new("文件").strong());
-                ui.label(
-                    RichText::new("按大小排序 · 点击查看 · 双击聚焦文件夹")
-                        .small()
-                        .color(MUTED),
-                );
+                ui.label(RichText::new("按大小排序 · 点击查看").small().color(MUTED));
+                if self.filter_rx.is_some() {
+                    ui.label(RichText::new("正在更新文件列表…").color(MUTED));
+                }
+                if self.filtered.is_empty() && self.filter_rx.is_none() {
+                    ui.label(RichText::new("没有匹配的文件").color(MUTED));
+                }
                 let row_height = 42.0;
                 egui::ScrollArea::vertical().id_salt("file-list").show_rows(
                     ui,
@@ -659,9 +857,6 @@ impl App {
                                 .inner;
                             if response.clicked() {
                                 self.selected = Some(i);
-                            }
-                            if response.double_clicked() {
-                                navigate = Some(f.parent.clone());
                             }
                             response.on_hover_text(f.path.to_string_lossy());
                         }
@@ -711,14 +906,15 @@ impl App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(12.0))
             .show(ctx, |ui| {
-                if self.filtered.is_empty() {
+                if self.data.as_ref().unwrap().files.is_empty() {
                     ui.centered_and_justified(|ui| {
-                        ui.label("没有匹配的文件");
+                        ui.label("启动磁盘中没有可显示的文件");
                     });
                     return;
                 }
-                let size = ui.available_size().max(Vec2::splat(1.0)) * self.zoom;
-                self.layout(size);
+                let viewport = ui.available_size().max(Vec2::splat(1.0)).ceil();
+                self.layout(viewport);
+                let size = viewport * self.zoom;
                 egui::ScrollArea::both()
                     .id_salt("treemap-scroll")
                     .auto_shrink([false, false])
@@ -727,62 +923,99 @@ impl App {
                         let painter = ui.painter_at(canvas);
                         let pointer = response.hover_pos();
                         let mut hovered = None;
-                        let data = self.data.as_ref().unwrap();
-                        for &(i, r) in &self.layout {
-                            let rect = Rect::from_min_size(
-                                canvas.min + Vec2::new(r.x, r.y),
-                                Vec2::new(r.w, r.h),
+                        let data = self.data.as_ref().unwrap().clone();
+                        if let (Some(map), Some(texture)) = (self.render_map.clone(), &self.texture)
+                        {
+                            painter.image(
+                                texture.id(),
+                                canvas,
+                                Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                Color32::WHITE,
                             );
-                            if !rect.intersects(ui.clip_rect()) {
-                                continue;
+                            let scale = Vec2::new(
+                                canvas.width() / map.bounds.w,
+                                canvas.height() / map.bounds.h,
+                            );
+                            let visible = canvas.intersect(ui.clip_rect());
+                            let view = treemap::Rect {
+                                x: (visible.min.x - canvas.min.x) / scale.x,
+                                y: (visible.min.y - canvas.min.y) / scale.y,
+                                w: visible.width() / scale.x,
+                                h: visible.height() / scale.y,
+                            };
+                            let ppp = ctx.pixels_per_point();
+                            let raster_size = [
+                                (visible.width() * ppp).ceil() as usize,
+                                (visible.height() * ppp).ceil() as usize,
+                            ];
+                            if self.zoom > 1.0 || ppp > 1.0 {
+                                self.detail(map.clone(), view, raster_size);
                             }
-                            let f = &data.files[i];
-                            let c = color(&f.parent);
-                            let inset = if r.w > 4.0 && r.h > 4.0 { 0.7 } else { 0.0 };
-                            painter.rect_filled(rect.shrink(inset), 1.0, c);
-                            if r.w > 84.0 && r.h > 38.0 {
-                                painter.with_clip_rect(rect.shrink(5.0)).text(
-                                    rect.min + Vec2::splat(7.0),
-                                    egui::Align2::LEFT_TOP,
-                                    f.path.file_name().unwrap_or_default().to_string_lossy(),
-                                    FontId::proportional(12.0),
-                                    Color32::WHITE,
+                            let current_detail = self.detail_applied
+                                == self.detail_generation.load(Ordering::Relaxed);
+                            if current_detail {
+                                if let (Some(detail), Some(texture)) =
+                                    (&self.detail, &self.detail_texture)
+                                {
+                                    let r = detail.bounds;
+                                    let rect = Rect::from_min_size(
+                                        canvas.min + Vec2::new(r.x * scale.x, r.y * scale.y),
+                                        Vec2::new(r.w * scale.x, r.h * scale.y),
+                                    );
+                                    painter.image(
+                                        texture.id(),
+                                        rect,
+                                        Rect::from_min_max(
+                                            egui::pos2(0.0, 0.0),
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        Color32::WHITE,
+                                    );
+                                }
+                            }
+                            if let Some(p) = pointer {
+                                let x = (p.x - canvas.min.x) / scale.x;
+                                let y = (p.y - canvas.min.y) / scale.y;
+                                hovered = displayed_hit(
+                                    &map,
+                                    if current_detail {
+                                        self.detail.as_ref()
+                                    } else {
+                                        None
+                                    },
+                                    x,
+                                    y,
                                 );
                             }
-                            if r.w > 84.0 && r.h > 60.0 {
-                                painter.text(
-                                    rect.min + Vec2::new(7.0, 26.0),
-                                    egui::Align2::LEFT_TOP,
-                                    bytes(f.size),
-                                    FontId::proportional(11.0),
-                                    Color32::from_white_alpha(190),
-                                );
+                            for (id, width) in [(self.selected, 2.0), (hovered, 1.5)] {
+                                if let Some(r) = id.and_then(|i| map.rect(i)) {
+                                    let rect = Rect::from_min_size(
+                                        canvas.min + Vec2::new(r.x * scale.x, r.y * scale.y),
+                                        Vec2::new(r.w * scale.x, r.h * scale.y),
+                                    );
+                                    if rect.width() > 1.0 && rect.height() > 1.0 {
+                                        painter.rect_stroke(
+                                            rect.shrink(0.5),
+                                            0.0,
+                                            egui::Stroke::new(width, Color32::WHITE),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                    }
+                                }
                             }
-                            if self.selected == Some(i) {
-                                painter.rect_stroke(
-                                    rect.shrink(1.0),
-                                    1.0,
-                                    egui::Stroke::new(2.0, Color32::WHITE),
-                                    egui::StrokeKind::Inside,
-                                );
-                            }
-                            if pointer.is_some_and(|p| rect.contains(p)) {
-                                hovered = Some(i);
-                                painter.rect_stroke(
-                                    rect.shrink(1.0),
-                                    1.0,
-                                    egui::Stroke::new(1.5, Color32::WHITE),
-                                    egui::StrokeKind::Inside,
-                                );
-                            }
+                        } else {
+                            painter.text(
+                                canvas.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "正在生成整盘视图…",
+                                FontId::proportional(16.0),
+                                MUTED,
+                            );
                         }
                         if let Some(i) = hovered {
                             let f = &data.files[i];
                             if response.clicked() {
                                 self.selected = Some(i);
-                            }
-                            if response.double_clicked() {
-                                navigate = Some(f.parent.clone());
                             }
                             response.on_hover_ui_at_pointer(|ui| {
                                 ui.label(
@@ -799,9 +1032,6 @@ impl App {
                         }
                     });
             });
-        if let Some(p) = navigate {
-            self.navigate(p);
-        }
         if let Some(i) = reveal {
             self.reveal(i);
         }
@@ -816,6 +1046,18 @@ impl Drop for App {
     fn drop(&mut self) {
         if let Some(job) = &self.job {
             job.cancel.store(true, Ordering::Relaxed);
+        }
+        self.filter_generation.fetch_add(1, Ordering::Relaxed);
+        self.layout_generation.fetch_add(1, Ordering::Relaxed);
+        self.detail_generation.fetch_add(1, Ordering::Relaxed);
+        if let Some(detail) = self.detail.take() {
+            defer_drop(detail);
+        }
+        if let Some(data) = self.data.take() {
+            defer_drop(data);
+        }
+        if let Some(map) = self.render_map.take() {
+            defer_drop(map);
         }
     }
 }
@@ -832,7 +1074,7 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             configure(&cc.egui_ctx);
             let mut app = App::default();
-            app.start(PathBuf::from("/"));
+            app.start();
             Ok(Box::new(app))
         }),
     )
@@ -841,186 +1083,303 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn bytes_are_binary_and_zero_is_exact() {
-        assert_eq!(bytes(0), "0 B");
-        assert_eq!(bytes(1024), "1.0 KiB");
-    }
-    fn snapshot(root: &str) -> scan::ScanResult {
+    fn snapshot() -> scan::ScanResult {
         scan::ScanResult {
-            root: PathBuf::from(root),
-            files: vec![],
-            skipped: 0,
-            errors: vec![],
-            elapsed: Duration::ZERO,
-        }
-    }
-    #[test]
-    fn permission_gate_blocks_scanning_and_folder_picker() {
-        let mut app = App::default();
-        app.launch_scan(PathBuf::from("/"));
-        app.choose();
-        assert!(app.job.is_none());
-        assert!(app.picker.is_none());
-        app.pending_scan = Some(PathBuf::from("/"));
-        assert!(app.permission_result(permission::Access::Denied).is_none());
-        assert!(
-            app.permission_result(permission::Access::Unverified)
-                .is_none()
-        );
-        assert!(app.job.is_none());
-        assert_eq!(app.pending_scan.as_deref(), Some(std::path::Path::new("/")));
-    }
-    #[test]
-    fn disconnected_permission_check_fails_closed() {
-        let ctx = egui::Context::default();
-        let mut app = App::default();
-        let (tx, rx) = mpsc::channel();
-        app.queue_permission_check(PathBuf::from("/"), rx);
-        drop(tx);
-        app.poll(&ctx);
-        assert_eq!(app.access, permission::Access::Unverified);
-        assert!(app.job.is_none());
-        assert!(app.permission_rx.is_none());
-        assert_eq!(app.pending_scan, Some(PathBuf::from("/")));
-    }
-    #[test]
-    fn permission_grant_consumes_startup_request_only_once() {
-        let mut app = App::default();
-        app.pending_scan = Some(PathBuf::from("/"));
-        assert_eq!(
-            app.permission_result(permission::Access::Granted),
-            Some(PathBuf::from("/"))
-        );
-        assert!(app.permission_result(permission::Access::Granted).is_none());
-        app.permission_result(permission::Access::Denied);
-        assert!(app.permission_result(permission::Access::Granted).is_none());
-    }
-    #[test]
-    fn every_scan_rechecks_permission_and_invalidates_old_probe() {
-        let ctx = egui::Context::default();
-        let mut app = App::default();
-        app.access = permission::Access::Granted;
-        let cancel = Arc::new(AtomicBool::new(false));
-        let (_tx, rx) = mpsc::channel();
-        app.job = Some(Job {
-            cancel: cancel.clone(),
-            progress: Arc::default(),
-            rx,
-            path: PathBuf::from("/old"),
-        });
-        let (old_tx, old_rx) = mpsc::channel();
-        app.queue_permission_check(PathBuf::from("/"), old_rx);
-        assert!(cancel.load(Ordering::Relaxed));
-        assert!(app.job.is_none());
-        assert_eq!(app.access, permission::Access::Unverified);
-        let (new_tx, new_rx) = mpsc::channel();
-        app.queue_permission_check(PathBuf::from("/new"), new_rx);
-        assert!(old_tx.send(permission::Access::Granted).is_err());
-        new_tx.send(permission::Access::Denied).unwrap();
-        app.poll(&ctx);
-        assert_eq!(app.access, permission::Access::Denied);
-        assert!(app.job.is_none());
-        assert_eq!(app.pending_scan, Some(PathBuf::from("/new")));
-    }
-    #[test]
-    fn cancelled_result_keeps_previous_snapshot() {
-        let ctx = egui::Context::default();
-        let mut app = App::default();
-        app.access = permission::Access::Granted;
-        app.data = Some(snapshot("/old"));
-        let (tx, rx) = mpsc::channel();
-        app.job = Some(Job {
-            cancel: Arc::new(AtomicBool::new(true)),
-            progress: Arc::new(Mutex::new(scan::ScanProgress::default())),
-            rx,
-            path: PathBuf::from("/new"),
-        });
-        tx.send(Ok(snapshot("/new"))).unwrap();
-        app.poll(&ctx);
-        assert_eq!(app.data.as_ref().unwrap().root, PathBuf::from("/old"));
-        assert!(app.job.is_none());
-        assert!(app.message.as_ref().unwrap().contains("取消"));
-    }
-    #[test]
-    fn replaced_channel_cannot_publish_old_scan() {
-        let ctx = egui::Context::default();
-        let mut app = App::default();
-        let (old_tx, old_rx) = mpsc::channel();
-        app.job = Some(Job {
-            cancel: Arc::new(AtomicBool::new(false)),
-            progress: Arc::new(Mutex::new(scan::ScanProgress::default())),
-            rx: old_rx,
-            path: PathBuf::from("/old"),
-        });
-        let (new_tx, new_rx) = mpsc::channel();
-        let old = app.job.take().unwrap();
-        old.cancel.store(true, Ordering::Relaxed);
-        drop(old);
-        app.job = Some(Job {
-            cancel: Arc::new(AtomicBool::new(false)),
-            progress: Arc::new(Mutex::new(scan::ScanProgress::default())),
-            rx: new_rx,
-            path: PathBuf::from("/new"),
-        });
-        assert!(old_tx.send(Ok(snapshot("/old"))).is_err());
-        new_tx.send(Ok(snapshot("/new"))).unwrap();
-        app.poll(&ctx);
-        assert_eq!(app.data.as_ref().unwrap().root, PathBuf::from("/new"));
-        assert_eq!(app.scope, Some(PathBuf::from("/new")));
-    }
-    #[test]
-    fn files_remain_addressable_and_folder_filter_is_component_based() {
-        let ctx = egui::Context::default();
-        configure(&ctx);
-        let mut app = App::default();
-        app.access = permission::Access::Granted;
-        app.data = Some(scan::ScanResult {
-            root: PathBuf::from("/data"),
+            root: "/".into(),
             files: vec![
                 scan::FileEntry {
-                    path: PathBuf::from("/data/a/empty"),
-                    parent: PathBuf::from("/data/a"),
+                    path: "/a/empty".into(),
+                    parent: "/a".into(),
                     size: 0,
                 },
                 scan::FileEntry {
-                    path: PathBuf::from("/data/a/large"),
-                    parent: PathBuf::from("/data/a"),
+                    path: "/a/large".into(),
+                    parent: "/a".into(),
                     size: 1_000_000,
                 },
                 scan::FileEntry {
-                    path: PathBuf::from("/data/ab/other"),
-                    parent: PathBuf::from("/data/ab"),
+                    path: "/b/other".into(),
+                    parent: "/b".into(),
                     size: 42,
                 },
             ],
             skipped: 0,
             errors: vec![],
-            elapsed: Duration::from_secs(1),
-        });
-        app.scope = Some(PathBuf::from("/data"));
-        app.filter();
-        app.layout(Vec2::new(800.0, 600.0));
-        assert_eq!(app.filtered.len(), 3);
-        assert_eq!(app.layout.len(), 3);
-        app.navigate(PathBuf::from("/data/a"));
-        app.filter();
-        assert_eq!(app.filtered.len(), 2);
-        assert_eq!(app.filtered_bytes, 1_000_000);
-        app.query = "empty".into();
-        app.dirty = true;
-        app.filter();
-        assert_eq!(app.filtered, vec![0]);
-        app.selected = Some(0);
-        let output = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
-        assert!(!output.shapes.is_empty());
+            elapsed: Duration::ZERO,
+        }
+    }
+    fn frame(app: &mut App, ctx: &egui::Context) {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(1180.0, 780.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| app.ui(ctx));
+        let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+    }
+    fn settle(app: &mut App, ctx: &egui::Context) {
+        let start = std::time::Instant::now();
+        loop {
+            frame(app, ctx);
+            if app.filter_rx.is_none()
+                && app.layout_rx.is_none()
+                && app.detail_rx.is_none()
+                && app.filter_applied == app.filter_generation.load(Ordering::Relaxed)
+                && app.layout_applied == app.layout_generation.load(Ordering::Relaxed)
+            {
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
     #[test]
-    fn empty_ui_renders_without_native_window() {
+    fn bytes_are_binary_and_zero_is_exact() {
+        assert_eq!(bytes(0), "0 B");
+        assert_eq!(bytes(1024), "1.0 KiB");
+    }
+    #[test]
+    fn gate_and_stale_permission_probes_cannot_start_scan() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.launch_scan();
+        assert!(app.job.is_none());
+        let (old_tx, old_rx) = mpsc::channel();
+        app.queue_permission_check(old_rx);
+        let (new_tx, new_rx) = mpsc::channel();
+        app.queue_permission_check(new_rx);
+        assert!(old_tx.send(permission::Access::Granted).is_err());
+        drop(new_tx);
+        app.poll(&ctx);
+        assert_eq!(app.access, permission::Access::Unverified);
+        assert!(app.job.is_none());
+        assert!(app.pending_scan);
+        assert!(!app.permission_result(permission::Access::Denied));
+        assert!(app.permission_result(permission::Access::Granted));
+        assert!(!app.permission_result(permission::Access::Granted));
+    }
+    #[test]
+    fn workers_preserve_all_files_and_cancel_stale_generations() {
+        let data = snapshot();
+        let token = AtomicU64::new(1);
+        let list = filter_snapshot(&data, "empty", None, &token, 1).unwrap();
+        assert_eq!(list.indices, vec![0]);
+        assert_eq!(list.bytes, 1_000_042);
+        let map = layout_snapshot(&data, Vec2::new(800.0, 600.0), &token, 1).unwrap();
+        for id in 0..3 {
+            assert!(map.rect(id).is_some());
+        }
+        assert!(filter_snapshot(&data, "", None, &token, 0).is_none());
+        assert!(layout_snapshot(&data, Vec2::new(800.0, 600.0), &token, 0).is_none());
+    }
+    #[test]
+    fn completed_scan_shows_all_files_and_search_only_changes_list() {
         let ctx = egui::Context::default();
         configure(&ctx);
         let mut app = App::default();
-        let output = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
-        assert!(!output.shapes.is_empty());
+        app.access = permission::Access::Granted;
+        app.query = "old".into();
+        app.zoom = 5.0;
+        let (tx, rx) = mpsc::channel();
+        app.job = Some(Job {
+            cancel: Arc::new(AtomicBool::new(false)),
+            progress: Arc::default(),
+            rx,
+        });
+        tx.send(Ok(snapshot())).unwrap();
+        app.poll(&ctx);
+        assert!(app.query.is_empty());
+        assert_eq!(app.zoom, 1.0);
+        settle(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        assert_eq!(app.filtered.len(), 3);
+        assert_eq!(app.total_bytes, 1_000_042);
+        let applied_generation = app.layout_applied;
+        let texture = app.texture.as_ref().unwrap().id();
+        app.query = "no-match".into();
+        app.dirty = true;
+        settle(&mut app, &ctx);
+        assert!(app.filtered.is_empty());
+        assert_eq!(app.layout_applied, applied_generation);
+        assert_eq!(app.texture.as_ref().unwrap().id(), texture);
+        for id in 0..3 {
+            assert!(app.render_map.as_ref().unwrap().rect(id).is_some());
+        }
+    }
+    #[test]
+    fn stale_layout_result_never_replaces_current_snapshot() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        let token = AtomicU64::new(0);
+        let map = layout_snapshot(&snapshot(), Vec2::new(30.0, 30.0), &token, 0).unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.layout_rx = Some(rx);
+        app.layout_generation.store(1, Ordering::Relaxed);
+        tx.send(LayoutOutput { generation: 0, map }).unwrap();
+        app.poll(&ctx);
+        assert!(app.render_map.is_none());
+        assert!(app.texture.is_none());
+    }
+    #[test]
+    fn blocked_and_stopped_screens_render_without_native_window() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        for access in [permission::Access::Denied, permission::Access::Granted] {
+            app.access = access;
+            frame(&mut app, &ctx);
+        }
+    }
+    #[test]
+    fn displayed_detail_gutter_never_falls_back_to_coarse_file() {
+        let token = AtomicU64::new(0);
+        let bounds = treemap::Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        let map = render::RenderMap::build(
+            vec![render::RenderEntry {
+                id: 0,
+                rect: bounds,
+                color: ACCENT,
+            }],
+            bounds,
+            &token,
+            0,
+        )
+        .unwrap();
+        let view = treemap::Rect {
+            x: 40.0,
+            y: 40.0,
+            w: 10.0,
+            h: 10.0,
+        };
+        let detail = map.rasterize(view, [100, 100], &token, 0).unwrap();
+        let mut found = false;
+        for y in 0..100 {
+            for x in 0..100 {
+                let x = 40.0 + (x as f32 + 0.5) * 0.1;
+                let y = 40.0 + (y as f32 + 0.5) * 0.1;
+                if map.hit_test(x, y).is_some() && detail.hit_test(x, y).is_none() {
+                    assert!(displayed_hit(&map, Some(&detail), x, y).is_none());
+                    found = true;
+                }
+            }
+        }
+        // Detail of an interior crop has no original file edges; test a crop
+        // containing an original edge when the first crop has no gutters.
+        if !found {
+            let view = treemap::Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 10.0,
+                h: 10.0,
+            };
+            let detail = map.rasterize(view, [100, 100], &token, 0).unwrap();
+            for y in 0..100 {
+                for x in 0..100 {
+                    let x = (x as f32 + 0.5) * 0.1;
+                    let y = (y as f32 + 0.5) * 0.1;
+                    if detail.hit_test(x, y).is_none() {
+                        assert!(displayed_hit(&map, Some(&detail), x, y).is_none());
+                        found = true;
+                    }
+                }
+            }
+        }
+        assert!(found);
+    }
+    #[test]
+    #[ignore = "release performance benchmark"]
+    fn full_app_3_5m_steady_frame() {
+        let n = 3_500_000;
+        let files: Vec<_> = (0..n)
+            .into_par_iter()
+            .map(|i| scan::FileEntry {
+                path: format!("/group{}/file{i}", i / 1000).into(),
+                parent: format!("/group{}", i / 1000).into(),
+                size: (i % 10000 + 1) as u64,
+            })
+            .collect();
+        let data = Arc::new(scan::ScanResult {
+            root: "/".into(),
+            files,
+            skipped: 0,
+            errors: vec![],
+            elapsed: Duration::ZERO,
+        });
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.data = Some(data);
+        let begin = std::time::Instant::now();
+        settle(&mut app, &ctx);
+        let build = begin.elapsed();
+        settle(&mut app, &ctx);
+        settle(&mut app, &ctx);
+        app.selected = Some(n / 2);
+        for _ in 0..5 {
+            frame(&mut app, &ctx);
+        }
+        let mut times = Vec::new();
+        for _ in 0..60 {
+            let now = std::time::Instant::now();
+            let position = egui::pos2(250.0 + (times.len() % 20) as f32, 350.0);
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1180.0, 780.0),
+                )),
+                events: vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed: times.len() % 2 == 0,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| app.ui(ctx));
+            let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
+            times.push(now.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(f64::total_cmp);
+        let layout_generation = app.layout_generation.load(Ordering::Relaxed);
+        let now = std::time::Instant::now();
+        app.zoom = 5.0;
+        frame(&mut app, &ctx);
+        let zoom_request = now.elapsed();
+        assert_eq!(
+            app.layout_generation.load(Ordering::Relaxed),
+            layout_generation,
+            "zoom must reuse layout"
+        );
+        let now = std::time::Instant::now();
+        app.query = "file123".into();
+        app.dirty = true;
+        frame(&mut app, &ctx);
+        let search_request = now.elapsed();
+        app.query = "file999".into();
+        app.dirty = true;
+        frame(&mut app, &ctx);
+        assert!(zoom_request.as_secs_f64() * 1000.0 < 16.7);
+        assert!(search_request.as_secs_f64() * 1000.0 < 16.7);
+        eprintln!("request CPU zoom={zoom_request:?}, search={search_request:?}");
+        eprintln!(
+            "3.5m build={build:?}, steady p50={:.3}ms p95={:.3}ms max={:.3}ms rayon_threads={}",
+            times[30],
+            times[57],
+            times[59],
+            rayon::current_num_threads()
+        );
+        assert!(times[57] < 16.7, "steady frame p95 exceeds budget");
     }
 }

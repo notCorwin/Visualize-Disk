@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
@@ -39,101 +40,86 @@ pub fn scan(
     let started = Instant::now();
     let metadata = fs::symlink_metadata(&root).map_err(|e| root_error(&e))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err("请选择真实文件夹；不扫描符号链接。".into());
+        return Err("扫描位置不是可读取的真实目录；不扫描符号链接。".into());
     }
     let mut files = Vec::new();
     let mut errors = Vec::new();
-    let mut state = ScanProgress::default();
-    *progress.lock().unwrap_or_else(|e| e.into_inner()) = state;
+    *progress.lock().unwrap_or_else(|e| e.into_inner()) = ScanProgress::default();
     let startup_disk = root == std::path::Path::new("/");
     let mut visited = HashSet::new();
-    let mut pending = vec![root.clone()];
+    let mut pending = vec![PendingDirectory {
+        identity: identity_from_metadata(&metadata, &root),
+        path: root.clone(),
+    }];
     let mut deferred_data = None;
-    let mut published = Instant::now();
-    let mut processed = 0usize;
-    while let Some(directory) = pending.pop().or_else(|| deferred_data.take()) {
+    // Only this many directory jobs can be active, regardless of tree size.
+    // All jobs and metadata batches share Rayon's process-wide worker pool.
+    let batch_limit = rayon::current_num_threads().max(1).saturating_mul(4);
+    while !pending.is_empty() || deferred_data.is_some() {
         if cancel.load(Ordering::Relaxed) {
             return Err("扫描已取消。".into());
         }
-        // Firmlinks expose the Data volume through /Users, /Applications, etc.
-        // A per-scan identity cache prevents traversing those trees twice; it is
-        // discarded on refresh, so filesystem changes never reuse stale state.
-        match directory_identity(&directory) {
-            Ok(identity) if !visited.insert(identity) => {
-                state.skipped += 1;
-                continue;
-            }
-            Ok(_) => {}
-            Err(error) if directory == root => return Err(root_error(&error)),
-            Err(error) => {
-                record_error(&mut state, &mut errors, &directory, &error);
-                continue;
+        if pending.is_empty() {
+            pending.push(deferred_data.take().unwrap());
+        }
+        let mut batch = Vec::with_capacity(batch_limit);
+        while batch.len() < batch_limit {
+            let Some(directory) = pending.pop() else {
+                break;
+            };
+            if visited.insert(directory.identity) {
+                batch.push(directory.path);
+            } else {
+                let mut state = progress.lock().unwrap_or_else(|e| e.into_inner());
+                state.skipped = state.skipped.saturating_add(1);
             }
         }
-        let entries = match fs::read_dir(&directory) {
-            Ok(entries) => entries,
-            Err(e) if directory == root => {
-                return Err(root_error(&e));
-            }
-            Err(e) => {
-                record_error(&mut state, &mut errors, &directory, &e);
-                continue;
-            }
-        };
-        for entry in entries {
-            if cancel.load(Ordering::Relaxed) {
-                return Err("扫描已取消。".into());
-            }
-            processed += 1;
-            match entry {
-                Err(e) => record_error(&mut state, &mut errors, &directory, &e),
-                Ok(entry) => {
-                    let path = entry.path();
-                    match fs::symlink_metadata(&path) {
-                        Err(e) => record_error(&mut state, &mut errors, &path, &e),
-                        Ok(meta) if meta.file_type().is_symlink() => state.skipped += 1,
-                        Ok(meta) if meta.is_dir() => {
-                            if startup_disk && excluded_from_startup_disk(&path) {
-                                state.skipped += 1;
-                            } else if startup_disk
-                                && path == std::path::Path::new("/System/Volumes/Data")
-                            {
-                                // Visit canonical root/firmlink paths first, then
-                                // retain Data-only directories hidden from root.
-                                deferred_data = Some(path);
-                            } else {
-                                pending.push(path);
-                            }
-                        }
-                        Ok(meta) if meta.is_file() => {
-                            let size = meta.len();
-                            state.files += 1;
-                            state.bytes = state.bytes.saturating_add(size);
-                            files.push(FileEntry {
-                                path,
-                                size,
-                                parent: directory.clone(),
-                            });
-                        }
-                        Ok(_) => state.skipped += 1,
-                    }
+        let reports: Vec<_> = batch
+            .into_par_iter()
+            .map(|directory| {
+                let report = scan_directory(&directory, &cancel, &progress);
+                (directory, report)
+            })
+            .collect();
+        for (directory, mut report) in reports {
+            if let Some(error) = report.unreadable {
+                if directory == root {
+                    return Err(root_error(&error));
                 }
             }
-            if processed % 128 == 0 || published.elapsed() >= Duration::from_millis(100) {
-                *progress.lock().unwrap_or_else(|e| e.into_inner()) = state;
-                published = Instant::now();
+            if files.is_empty() {
+                files = report.files;
+            } else {
+                files.append(&mut report.files);
+            }
+            for error in report.errors {
+                if errors.len() < 24 {
+                    errors.push(error);
+                }
+            }
+            for child in report.directories {
+                if startup_disk && excluded_from_startup_disk(&child.path) {
+                    let mut state = progress.lock().unwrap_or_else(|e| e.into_inner());
+                    state.skipped = state.skipped.saturating_add(1);
+                } else if startup_disk && child.path == std::path::Path::new("/System/Volumes/Data")
+                {
+                    // The complete canonical tree finishes before Data aliases
+                    // enter the same per-scan identity cache.
+                    deferred_data = Some(child);
+                } else {
+                    pending.push(child);
+                }
             }
         }
     }
     if cancel.load(Ordering::Relaxed) {
         return Err("扫描已取消。".into());
     }
-    // Sorting once makes repeat scans stable without sorting every directory.
-    files.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+    files.par_sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
     if cancel.load(Ordering::Relaxed) {
         return Err("扫描已取消。".into());
     }
-    *progress.lock().unwrap_or_else(|e| e.into_inner()) = state;
+    let state = *progress.lock().unwrap_or_else(|e| e.into_inner());
     Ok(ScanResult {
         root,
         files,
@@ -144,6 +130,138 @@ pub fn scan(
 }
 
 #[cfg(unix)]
+type DirectoryIdentity = (u64, u64);
+#[cfg(not(unix))]
+type DirectoryIdentity = PathBuf;
+
+struct PendingDirectory {
+    path: PathBuf,
+    identity: DirectoryIdentity,
+}
+
+#[derive(Default)]
+struct DirectoryReport {
+    files: Vec<FileEntry>,
+    directories: Vec<PendingDirectory>,
+    errors: Vec<String>,
+    unreadable: Option<std::io::Error>,
+}
+
+enum EntryReport {
+    File(FileEntry),
+    Directory(PendingDirectory),
+    Skipped,
+    Error(PathBuf, std::io::Error),
+    Cancelled,
+}
+
+fn scan_directory(
+    directory: &std::path::Path,
+    cancel: &AtomicBool,
+    progress: &Mutex<ScanProgress>,
+) -> DirectoryReport {
+    scan_directory_batches(directory, cancel, progress, || {})
+}
+
+fn scan_directory_batches(
+    directory: &std::path::Path,
+    cancel: &AtomicBool,
+    progress: &Mutex<ScanProgress>,
+    after_batch: impl Fn(),
+) -> DirectoryReport {
+    let mut report = DirectoryReport::default();
+    if cancel.load(Ordering::Relaxed) {
+        return report;
+    }
+    let mut entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            let mut delta = ScanProgress::default();
+            record_error(&mut delta, &mut report.errors, directory, &error);
+            publish(progress, delta);
+            report.unreadable = Some(error);
+            return report;
+        }
+    };
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        // Enumeration stays streaming and bounded; metadata work in even a
+        // single large directory can use every available worker.
+        let entries: Vec<_> = entries.by_ref().take(512).collect();
+        if entries.is_empty() {
+            break;
+        }
+        let batch: Vec<_> = entries
+            .into_par_iter()
+            .with_min_len(32)
+            .map(|entry| {
+                if cancel.load(Ordering::Relaxed) {
+                    return EntryReport::Cancelled;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => return EntryReport::Error(directory.to_path_buf(), error),
+                };
+                let path = entry.path();
+                match fs::symlink_metadata(&path) {
+                    Err(error) => EntryReport::Error(path, error),
+                    Ok(meta) if meta.file_type().is_symlink() => EntryReport::Skipped,
+                    Ok(meta) if meta.is_dir() => EntryReport::Directory(PendingDirectory {
+                        identity: identity_from_metadata(&meta, &path),
+                        path,
+                    }),
+                    Ok(meta) if meta.is_file() => EntryReport::File(FileEntry {
+                        size: meta.len(),
+                        path,
+                        parent: directory.to_path_buf(),
+                    }),
+                    Ok(_) => EntryReport::Skipped,
+                }
+            })
+            .collect();
+        let mut delta = ScanProgress::default();
+        for entry in batch {
+            match entry {
+                EntryReport::File(file) => {
+                    delta.files += 1;
+                    delta.bytes = delta.bytes.saturating_add(file.size);
+                    report.files.push(file);
+                }
+                EntryReport::Directory(directory) => report.directories.push(directory),
+                EntryReport::Skipped => delta.skipped += 1,
+                EntryReport::Error(path, error) => {
+                    record_error(&mut delta, &mut report.errors, &path, &error)
+                }
+                EntryReport::Cancelled => {}
+            }
+        }
+        publish(progress, delta);
+        after_batch();
+    }
+    report
+}
+
+fn publish(progress: &Mutex<ScanProgress>, delta: ScanProgress) {
+    let mut state = progress.lock().unwrap_or_else(|e| e.into_inner());
+    state.files = state.files.saturating_add(delta.files);
+    state.bytes = state.bytes.saturating_add(delta.bytes);
+    state.skipped = state.skipped.saturating_add(delta.skipped);
+}
+
+#[cfg(unix)]
+fn identity_from_metadata(metadata: &fs::Metadata, _path: &std::path::Path) -> DirectoryIdentity {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+
+#[cfg(not(unix))]
+fn identity_from_metadata(_metadata: &fs::Metadata, path: &std::path::Path) -> DirectoryIdentity {
+    path.to_path_buf()
+}
+
+#[cfg(all(test, unix))]
 fn directory_identity(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let metadata = fs::symlink_metadata(path)?;
@@ -152,7 +270,7 @@ fn directory_identity(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
 
 // This application targets macOS; keeping a fallback makes headless core tests
 // portable without introducing filesystem traversal dependencies.
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn directory_identity(path: &std::path::Path) -> std::io::Result<PathBuf> {
     fs::canonicalize(path)
 }
@@ -170,10 +288,10 @@ fn excluded_from_startup_disk(path: &std::path::Path) -> bool {
 fn root_error(error: &std::io::Error) -> String {
     match error.kind() {
         std::io::ErrorKind::PermissionDenied => {
-            "macOS 拒绝访问此文件夹。请重新选择文件夹，或前往系统设置 > 隐私与安全性 > 完全磁盘访问权限，允许此应用访问。".into()
+            "macOS 拒绝访问扫描位置。请前往系统设置 > 隐私与安全性 > 完全磁盘访问权限，允许此应用访问后重新扫描。".into()
         }
-        std::io::ErrorKind::NotFound => "所选文件夹已不存在。请重新选择文件夹。".into(),
-        _ => "无法读取所选文件夹。请确认磁盘已连接，并重新选择文件夹。".into(),
+        std::io::ErrorKind::NotFound => "扫描位置已不存在。请确认磁盘已连接后重新扫描。".into(),
+        _ => "无法读取扫描位置。请确认磁盘已连接且可访问后重新扫描。".into(),
     }
 }
 
@@ -331,5 +449,72 @@ mod tests {
         assert!(!error.contains("os error"));
         let permission = root_error(&std::io::Error::from(std::io::ErrorKind::PermissionDenied));
         assert!(permission.contains("完全磁盘访问权限"));
+    }
+    #[test]
+    fn parallel_and_single_worker_scans_match_with_exact_progress() {
+        let temp = Temp::new();
+        for directory in 0..64 {
+            let path = temp.0.join(format!("dir-{directory}"));
+            fs::create_dir(&path).unwrap();
+            for file in 0..32 {
+                fs::write(path.join(format!("file-{file}")), vec![0; file]).unwrap();
+            }
+        }
+        // Include a large flat directory so metadata batching is exercised too.
+        for file in 0..1024 {
+            fs::write(temp.0.join(format!("flat-{file}")), []).unwrap();
+        }
+        let run = |threads| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let progress = Arc::new(Mutex::new(ScanProgress::default()));
+            let start = Instant::now();
+            let result = pool
+                .install(|| {
+                    scan(
+                        temp.0.clone(),
+                        Arc::new(AtomicBool::new(false)),
+                        progress.clone(),
+                    )
+                })
+                .unwrap();
+            eprintln!(
+                "synthetic cached scan: {threads} workers, {} files, {:?}",
+                result.files.len(),
+                start.elapsed()
+            );
+            let actual = *progress.lock().unwrap();
+            assert_eq!(actual.files, result.files.len() as u64);
+            assert_eq!(
+                actual.bytes,
+                result.files.iter().map(|file| file.size).sum::<u64>()
+            );
+            (
+                result
+                    .files
+                    .into_iter()
+                    .map(|file| (file.path, file.size))
+                    .collect::<Vec<_>>(),
+                result.skipped,
+            )
+        };
+        assert_eq!(run(1), run(4));
+    }
+    #[test]
+    fn cancellation_stops_after_the_current_bounded_metadata_batch() {
+        let temp = Temp::new();
+        for file in 0..1024 {
+            fs::write(temp.0.join(format!("file-{file}")), []).unwrap();
+        }
+        let cancel = AtomicBool::new(false);
+        let progress = Mutex::new(ScanProgress::default());
+        let report = scan_directory_batches(&temp.0, &cancel, &progress, || {
+            cancel.store(true, Ordering::Relaxed);
+        });
+        assert_eq!(report.files.len(), 512);
+        assert_eq!(progress.lock().unwrap().files, 512);
+        assert!(cancel.load(Ordering::Relaxed));
     }
 }

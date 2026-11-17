@@ -1,3 +1,6 @@
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
     pub x: f32,
@@ -10,7 +13,35 @@ pub struct Rect {
 /// input file; small files are never combined into an aggregate rectangle.
 /// Empty files receive one unit of layout weight while their byte size remains
 /// zero. Subpixel rectangles remain in the result for zoom and hit testing.
+#[cfg(test)]
 pub fn layout(items: &[(usize, u64)], bounds: Rect) -> Vec<(usize, Rect)> {
+    layout_inner(items, bounds, None).unwrap_or_default()
+}
+
+/// Stale generations return no partial geometry. All work shares the global
+/// Rayon pool; cancellation never creates another worker pool or polling thread.
+pub fn layout_with_cancel(
+    items: &[(usize, u64)],
+    bounds: Rect,
+    token: &AtomicU64,
+    generation: u64,
+) -> Option<Vec<(usize, Rect)>> {
+    layout_inner(items, bounds, Some((token, generation)))
+}
+
+type Generation<'a> = Option<(&'a AtomicU64, u64)>;
+fn cancelled(token: Generation<'_>) -> bool {
+    token.is_some_and(|(token, generation)| token.load(Ordering::Relaxed) != generation)
+}
+
+fn layout_inner(
+    items: &[(usize, u64)],
+    bounds: Rect,
+    token: Generation<'_>,
+) -> Option<Vec<(usize, Rect)>> {
+    if cancelled(token) {
+        return None;
+    }
     if items.is_empty()
         || !bounds.x.is_finite()
         || !bounds.y.is_finite()
@@ -19,66 +50,129 @@ pub fn layout(items: &[(usize, u64)], bounds: Rect) -> Vec<(usize, Rect)> {
         || bounds.w <= 0.0
         || bounds.h <= 0.0
     {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let mut ordered = items.to_vec();
-    ordered.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let mut result = Vec::with_capacity(items.len());
-    // Iteration avoids stack overflow on pathological file-size distributions.
-    let mut pending = vec![(ordered.as_slice(), bounds)];
-    while let Some((slice, rect)) = pending.pop() {
+    ordered.par_sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    if cancelled(token) {
+        return None;
+    }
+    let mut result = vec![(0, Rect::default()); items.len()];
+    if fill(&ordered, bounds, &mut result, 0, token) {
+        Some(result)
+    } else {
+        None
+    }
+}
+
+fn fill(
+    items: &[(usize, u64)],
+    rect: Rect,
+    output: &mut [(usize, Rect)],
+    depth: u8,
+    token: Generation<'_>,
+) -> bool {
+    if cancelled(token) {
+        return false;
+    }
+    if items.len() < 4096 || depth >= 32 {
+        return fill_serial(items, rect, output, token);
+    }
+    let Some((split, a, b)) = partition(items, rect, token) else {
+        return false;
+    };
+    let (left, right) = output.split_at_mut(split);
+    let (a, b) = rayon::join(
+        || fill(&items[..split], a, left, depth + 1, token),
+        || fill(&items[split..], b, right, depth + 1, token),
+    );
+    a && b
+}
+
+fn fill_serial(
+    items: &[(usize, u64)],
+    bounds: Rect,
+    output: &mut [(usize, Rect)],
+    token: Generation<'_>,
+) -> bool {
+    // Iteration avoids stack overflow even for pathological size distributions.
+    let mut pending = vec![(items, bounds, 0)];
+    let mut processed = 0usize;
+    while let Some((slice, rect, offset)) = pending.pop() {
+        if processed % 128 == 0 && cancelled(token) {
+            return false;
+        }
+        processed += 1;
         if slice.len() == 1 {
-            result.push((slice[0].0, rect));
+            output[offset] = (slice[0].0, rect);
             continue;
         }
-        let total = slice
+        let Some((split, a, b)) = partition(slice, rect, token) else {
+            return false;
+        };
+        pending.push((&slice[split..], b, offset + split));
+        pending.push((&slice[..split], a, offset));
+    }
+    !cancelled(token)
+}
+
+fn partition(
+    slice: &[(usize, u64)],
+    rect: Rect,
+    token: Generation<'_>,
+) -> Option<(usize, Rect, Rect)> {
+    let mut total = 0.0;
+    for chunk in slice.chunks(4096) {
+        if slice.len() >= 4096 && cancelled(token) {
+            return None;
+        }
+        total += chunk
             .iter()
             .map(|(_, size)| (*size).max(1) as f64)
             .sum::<f64>();
-        let target = total / 2.0;
-        let mut left = 0.0;
-        let mut split = 1;
-        for (index, (_, size)) in slice.iter().enumerate().take(slice.len() - 1) {
-            let next = left + (*size).max(1) as f64;
-            if index > 0 && (left - target).abs() <= (next - target).abs() {
-                split = index;
-                break;
-            }
-            left = next;
-            split = index + 1;
-            if left >= target {
-                break;
-            }
-        }
-        // At extreme size ratios f32 rounds the fraction to 1, which would
-        // erase every file in the remaining branch. Keep both branches
-        // representable; this only distorts areas below floating-point precision.
-        let fraction = ((left / total) as f32).clamp(f32::EPSILON, 1.0 - f32::EPSILON);
-        let (a, b) = if rect.w >= rect.h {
-            let width = rect.w * fraction;
-            (
-                Rect { w: width, ..rect },
-                Rect {
-                    x: rect.x + width,
-                    w: rect.w - width,
-                    ..rect
-                },
-            )
-        } else {
-            let height = rect.h * fraction;
-            (
-                Rect { h: height, ..rect },
-                Rect {
-                    y: rect.y + height,
-                    h: rect.h - height,
-                    ..rect
-                },
-            )
-        };
-        pending.push((&slice[split..], b));
-        pending.push((&slice[..split], a));
     }
-    result
+    let target = total / 2.0;
+    let mut left = 0.0;
+    let mut split = 1;
+    for (index, (_, size)) in slice.iter().enumerate().take(slice.len() - 1) {
+        if index % 4096 == 0 && slice.len() >= 4096 && cancelled(token) {
+            return None;
+        }
+        let next = left + (*size).max(1) as f64;
+        if index > 0 && (left - target).abs() <= (next - target).abs() {
+            split = index;
+            break;
+        }
+        left = next;
+        split = index + 1;
+        if left >= target {
+            break;
+        }
+    }
+    // Keep both branches representable below f32 area precision.
+    let fraction = ((left / total) as f32).clamp(f32::EPSILON, 1.0 - f32::EPSILON);
+    let (a, b) = if rect.w >= rect.h {
+        let width = rect.w * fraction;
+        (
+            Rect { w: width, ..rect },
+            Rect {
+                x: rect.x + width,
+                w: rect.w - width,
+                ..rect
+            },
+        )
+    } else {
+        let height = rect.h * fraction;
+        (
+            Rect { h: height, ..rect },
+            Rect {
+                y: rect.y + height,
+                h: rect.h - height,
+                ..rect
+            },
+        )
+    };
+    Some((split, a, b))
 }
 
 #[cfg(test)]
@@ -158,6 +252,37 @@ mod tests {
                 }
             )
             .is_empty()
+        );
+    }
+    #[test]
+    fn parallel_layout_matches_serial_geometry_for_every_file() {
+        let mut items: Vec<_> = (0..32768).map(|i| (i, (i as u64 * 7919) % 65537)).collect();
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1600.0,
+            h: 1000.0,
+        };
+        let parallel = layout(&items, bounds);
+        items.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut serial = vec![(0, Rect::default()); items.len()];
+        assert!(fill_serial(&items, bounds, &mut serial, None));
+        assert_eq!(parallel, serial);
+    }
+    #[test]
+    fn stale_generation_never_publishes_partial_layout() {
+        let token = AtomicU64::new(2);
+        let items: Vec<_> = (0..8192).map(|id| (id, 1)).collect();
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1000.0,
+            h: 1000.0,
+        };
+        assert!(layout_with_cancel(&items, bounds, &token, 1).is_none());
+        assert_eq!(
+            layout_with_cancel(&items, bounds, &token, 2).unwrap().len(),
+            items.len()
         );
     }
 }
