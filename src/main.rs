@@ -1,6 +1,9 @@
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 mod file_actions;
 mod file_list;
 mod permission;
+mod platform;
 mod render;
 mod scan;
 mod treemap;
@@ -10,7 +13,6 @@ use rayon::prelude::*;
 use std::{
     collections::BTreeMap,
     hash::{Hash, Hasher},
-    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -62,10 +64,7 @@ fn color(path: &std::path::Path) -> Color32 {
 }
 fn configure(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    for path in [
-        "/System/Library/Fonts/STHeiti Medium.ttc",
-        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-    ] {
+    for path in platform::font_paths() {
         if let Ok(data) = std::fs::read(path) {
             fonts
                 .font_data
@@ -104,8 +103,7 @@ fn configure(ctx: &egui::Context) {
 }
 
 fn is_trash_path(path: &std::path::Path) -> bool {
-    path.components()
-        .any(|part| matches!(part.as_os_str().to_str(), Some(".Trash" | ".Trashes")))
+    file_actions::already_in_trash(path)
 }
 
 fn wrapped_text(ui: &mut egui::Ui, text: String, size: f32, color: Color32) -> egui::Response {
@@ -518,7 +516,7 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let (c, stats) = (cancel.clone(), progress.clone());
         std::thread::spawn(move || {
-            let _ = tx.send(scan::scan(PathBuf::from("/"), c, stats));
+            let _ = tx.send(platform::scan_root().and_then(|root| scan::scan(root, c, stats)));
         });
         self.job = Some(Job {
             cancel,
@@ -569,7 +567,7 @@ impl App {
         self.trash_rx = Some(rx);
         self.action_notice = None;
         self.set_notice(Notice {
-            text: "正在移到废纸篓…".into(),
+            text: format!("正在移到{}…", platform::TRASH_NAME),
             kind: NoticeKind::Info,
             expires: None,
         });
@@ -804,7 +802,7 @@ impl App {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.reveal_rx = None;
-                    self.message = Some("Finder 操作未完成，请重试。".into());
+                    self.message = Some("文件管理器操作未完成，请重试。".into());
                 }
                 _ => {}
             }
@@ -851,21 +849,26 @@ impl App {
                             if refresh {
                                 self.start();
                             }
-                            self.action_notice = Some("已移到废纸篓。".into());
+                            self.action_notice = Some(format!("已移到{}。", platform::TRASH_NAME));
                         }
                         Ok(data) => {
                             defer_drop(data);
-                            self.action_notice = Some("已移到废纸篓。".into());
+                            self.action_notice = Some(format!("已移到{}。", platform::TRASH_NAME));
                             self.start();
                         }
                         Err(error) => self.message = Some(error),
                     }
                     defer_drop(output.source);
-                    self.load_recoveries();
+                    if !file_actions::SYSTEM_RECOVERY {
+                        self.load_recoveries();
+                    }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.trash_rx = None;
-                    self.message = Some("废纸篓操作未完成，请重新扫描后重试。".into());
+                    self.message = Some(format!(
+                        "{}操作未完成，请重新扫描后重试。",
+                        platform::TRASH_NAME
+                    ));
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
@@ -1054,19 +1057,19 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.reveal_rx = Some(rx);
         std::thread::spawn(move || {
-            let result = match path.try_exists() {
-                Ok(false) => Err("文件已移动或删除，请重新扫描。".into()),
-                Err(_) => Err("无法读取文件，请检查文件访问权限。".into()),
-                Ok(true) => match std::process::Command::new("/usr/bin/open")
-                    .arg("-R")
-                    .arg(path)
-                    .output()
-                {
-                    Ok(output) if output.status.success() => Ok(()),
-                    _ => Err("无法在 Finder 中显示文件，请确认 Finder 可用后重试。".into()),
-                },
-            };
+            let result = platform::reveal(&path);
             let _ = tx.send(result);
+        });
+    }
+    #[cfg(windows)]
+    fn open_recycle_bin(&mut self) {
+        if self.reveal_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.reveal_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(file_actions::open_recycle_bin());
         });
     }
     fn open_permissions(&mut self) {
@@ -1140,25 +1143,43 @@ impl App {
                 .show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space((ui.available_height() * 0.28).max(24.0));
-                        ui.label(RichText::new("需要完全磁盘访问权限").size(28.0).strong());
+                        ui.label(
+                            RichText::new(if cfg!(windows) {
+                                "正在准备磁盘扫描"
+                            } else {
+                                "需要完全磁盘访问权限"
+                            })
+                            .size(28.0)
+                            .strong(),
+                        );
                         ui.add_space(12.0);
                         if self.permission_rx.is_some() {
                             ui.spinner();
                             ui.label("正在检查权限…");
                         } else {
-                            let reason = if self.access == permission::Access::Denied {
+                            let reason = if cfg!(windows) {
+                                "Windows 启动检查未完成。"
+                            } else if self.access == permission::Access::Denied {
                                 "macOS 尚未授权。"
                             } else {
                                 "无法确认权限。"
                             };
                             ui.label(RichText::new(reason).color(MUTED));
                             ui.add_space(12.0);
-                            ui.label("在系统设置中添加并开启 /Applications/Visualize SSD.app。");
-                            ui.label("授权后点击重新检查；若系统要求，请退出并重新打开应用。");
+                            if cfg!(windows) {
+                                ui.label("无法完成启动检查，请重新检查后重试。");
+                            } else {
+                                ui.label(
+                                    "在系统设置中添加并开启 /Applications/Visualize SSD.app。",
+                                );
+                                ui.label("授权后点击重新检查；若系统要求，请退出并重新打开应用。");
+                            }
                             ui.add_space(20.0);
                             ui.horizontal(|ui| {
                                 ui.add_space((ui.available_width() * 0.5 - 150.0).max(0.0));
-                                if ui.button("打开完全磁盘访问权限设置").clicked() {
+                                if cfg!(target_os = "macos")
+                                    && ui.button("打开完全磁盘访问权限设置").clicked()
+                                {
                                     self.open_permissions();
                                 }
                                 if ui.button("重新检查").clicked() {
@@ -1171,7 +1192,7 @@ impl App {
             self.overlays(ctx);
             return;
         }
-        if !self.recoveries_loaded && self.recovery_rx.is_none() {
+        if !file_actions::SYSTEM_RECOVERY && !self.recoveries_loaded && self.recovery_rx.is_none() {
             self.load_recoveries();
         }
         egui::TopBottomPanel::top("toolbar")
@@ -1193,9 +1214,21 @@ impl App {
                             job.cancel.store(true, Ordering::Relaxed);
                         }
                     }
-                    if ui.button("恢复文件").clicked() {
-                        self.show_recoveries = true;
-                        self.load_recoveries();
+                    if ui
+                        .button(if file_actions::SYSTEM_RECOVERY {
+                            "打开回收站"
+                        } else {
+                            "恢复文件"
+                        })
+                        .clicked()
+                    {
+                        #[cfg(windows)]
+                        self.open_recycle_bin();
+                        #[cfg(not(windows))]
+                        {
+                            self.show_recoveries = true;
+                            self.load_recoveries();
+                        }
                     }
                 });
             });
@@ -1275,7 +1308,7 @@ impl App {
                     let f = &self.data.as_ref().unwrap().files[i];
                     ui.label(RichText::new(bytes(f.size)).size(24.0).color(ACCENT));
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("在 Finder 中显示").clicked() {
+                        if ui.button(platform::REVEAL_LABEL).clicked() {
                             reveal = Some(i);
                         }
                         if ui
@@ -1283,7 +1316,7 @@ impl App {
                                 self.trash_rx.is_none()
                                     && self.restore_rx.is_none()
                                     && !is_trash_path(&f.path),
-                                egui::Button::new("移到废纸篓"),
+                                egui::Button::new(format!("移到{}", platform::TRASH_NAME)),
                             )
                             .clicked()
                         {
@@ -1310,7 +1343,7 @@ impl App {
                             self.action_notice = Some("路径已复制。".into());
                         } else {
                             self.message =
-                                Some("路径包含无法复制为文本的字符，请在 Finder 中查看。".into());
+                                Some("路径包含无法复制为文本的字符，请在文件管理器中查看。".into());
                         }
                     }
                     ui.separator();
@@ -1471,6 +1504,43 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    #[cfg(windows)]
+    #[test]
+    fn confirmed_recycle_keeps_disk_usage_and_reuses_reported_destination() {
+        let source = snapshot();
+        let file = source.files[1].clone();
+        let mut destination = file.clone();
+        destination.path = r"C:\$Recycle.Bin\test\$Rfile".into();
+        destination.parent = destination.path.parent().unwrap().into();
+        let updated = relocate_snapshot(
+            &source,
+            &file.path,
+            file.identity,
+            Some(destination.clone()),
+        )
+        .unwrap();
+        assert_eq!(updated.files.len(), source.files.len());
+        assert_eq!(
+            updated.files.iter().map(|entry| entry.size).sum::<u64>(),
+            source.files.iter().map(|entry| entry.size).sum::<u64>()
+        );
+        assert!(
+            updated
+                .files
+                .iter()
+                .any(|entry| entry.path == destination.path)
+        );
+        assert!(!updated.files.iter().any(|entry| entry.path == file.path));
+        assert!(relocate_snapshot(&source, &file.path, file.identity, None).is_none());
+        let replacement = scan::FileIdentity {
+            device: 123,
+            inode: 456,
+        };
+        assert!(relocate_snapshot(&source, &file.path, replacement, Some(destination)).is_none());
+    }
+
     #[test]
     fn startup_uses_selected_transparent_artwork_as_runtime_icon() {
         let options = native_options().unwrap();
@@ -1980,7 +2050,7 @@ mod tests {
         check(&mut app);
         assert_eq!(app.notice.as_ref().unwrap().kind, NoticeKind::Error);
         app.notice = Some(Notice {
-            text: "正在移到废纸篓…".into(),
+            text: format!("正在移到{}…", platform::TRASH_NAME),
             kind: NoticeKind::Info,
             expires: None,
         });

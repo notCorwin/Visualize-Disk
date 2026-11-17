@@ -14,6 +14,11 @@ const SENTINEL: &str = "/Library/Application Support/com.apple.TCC/TCC.db";
 /// A missing database, ordinary UNIX denial or unexpected error fails closed.
 /// Never derive this path from HOME or other caller-controlled environment.
 pub fn check() -> Access {
+    // Windows checks ACL access per directory during enumeration. No global
+    // permission gate or administrator elevation is needed to start scanning.
+    if cfg!(windows) {
+        return Access::Granted;
+    }
     if !cfg!(target_os = "macos") {
         return Access::Unverified;
     }

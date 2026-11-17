@@ -1,25 +1,70 @@
-use crate::scan::{FileEntry, FileIdentity};
+use crate::scan::{FileEntry, FileIdentity, is_link_or_reparse};
 use std::{fs, io::ErrorKind, path::Path};
 
 const REPLACED: &str = "文件已被替换，请重新扫描后重试。";
 
+#[cfg(target_os = "macos")]
 mod recovery;
+#[cfg(windows)]
+mod windows;
+#[cfg(target_os = "macos")]
 #[cfg_attr(test, allow(unused_imports))]
-pub use recovery::{RecoveryRecord, recoveries, restore};
+pub use recovery::{recoveries, restore};
 
-/// Finder performs the trash operation and maintains its own Put Back metadata.
-/// A durable original-location record is saved before dispatch for app recovery.
+#[derive(Clone, Debug)]
+pub struct RecoveryRecord {
+    pub id: String,
+    pub original_path: std::path::PathBuf,
+    pub trash_path: Option<std::path::PathBuf>,
+    pub identity: FileIdentity,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub original_links: u64,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const SYSTEM_RECOVERY: bool = cfg!(windows);
+
+#[cfg(not(target_os = "macos"))]
+#[cfg_attr(test, allow(dead_code))]
+pub fn recoveries() -> Result<Vec<RecoveryRecord>, String> {
+    Ok(Vec::new())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn restore(_id: &str) -> Result<Option<FileEntry>, String> {
+    Err("请在系统回收站中选择文件并还原。".into())
+}
+
+#[cfg(windows)]
+pub use windows::open_recycle_bin;
+
+/// Use the native recoverable trash operation; never fall back to permanent deletion.
 pub fn move_to_trash(path: &Path, expected: FileIdentity) -> Result<Option<FileEntry>, String> {
     if already_in_trash(path) {
-        return Err("文件已在废纸篓中，请使用“放回原处”；不会再次删除。".into());
+        return Err(if cfg!(windows) {
+            "文件已在回收站中，请在系统回收站中还原；不会再次删除。"
+        } else {
+            "文件已在废纸篓中，请使用“放回原处”；不会再次删除。"
+        }
+        .into());
     }
     verify_file(path, expected)?;
     native_trash(path, expected)
 }
 
 pub fn already_in_trash(path: &Path) -> bool {
-    path.components()
-        .any(|part| part.as_os_str() == ".Trash" || part.as_os_str() == ".Trashes")
+    path.components().any(|part| {
+        #[cfg(windows)]
+        {
+            part.as_os_str()
+                .to_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case("$Recycle.Bin"))
+        }
+        #[cfg(not(windows))]
+        {
+            part.as_os_str() == ".Trash" || part.as_os_str() == ".Trashes"
+        }
+    })
 }
 
 #[cfg(test)]
@@ -40,20 +85,28 @@ fn verify_file(path: &Path, expected: FileIdentity) -> Result<(), String> {
         match error.kind() {
             ErrorKind::NotFound => "文件已移动或删除，请重新扫描。".into(),
             ErrorKind::PermissionDenied => {
-                "macOS 拒绝读取文件信息，请检查文件权限和完全磁盘访问权限。".into()
+                if cfg!(target_os = "macos") {
+                    "macOS 拒绝读取文件信息，请检查文件权限和完全磁盘访问权限。".into()
+                } else {
+                    "Windows 拒绝读取文件信息，请检查当前账户的文件访问权限。".into()
+                }
             }
             _ => "无法读取文件信息，请确认磁盘仍已连接后重试。".into(),
         }
     })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if is_link_or_reparse(&metadata) || !metadata.is_file() {
         return Err("扫描位置已不再是普通文件，请重新扫描后重试。".into());
     }
-    if FileIdentity::from_metadata(&metadata) != expected {
+    if FileIdentity::from_path(path, &metadata)
+        .map_err(|_| "无法确认文件身份，请重新扫描后重试。")?
+        != expected
+    {
         return Err(REPLACED.into());
     }
     Ok(())
 }
 
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn protected_recovery_location(path: &Path, support: &Path) -> bool {
     path.starts_with(support)
         || fs::canonicalize(path)
@@ -125,9 +178,14 @@ fn native_trash(path: &Path, expected: FileIdentity) -> Result<Option<FileEntry>
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+fn native_trash(path: &Path, expected: FileIdentity) -> Result<Option<FileEntry>, String> {
+    windows::move_to_trash(path, expected)
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn native_trash(_path: &Path, _expected: FileIdentity) -> Result<Option<FileEntry>, String> {
-    Err("当前系统不支持 macOS 废纸篓操作。".into())
+    Err("当前系统不支持安全的回收站操作。".into())
 }
 
 #[cfg(target_os = "macos")]
@@ -315,15 +373,16 @@ mod finder {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn destination_entry(path: std::path::PathBuf) -> Option<FileEntry> {
     let metadata = fs::symlink_metadata(&path).ok()?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
+    if !metadata.is_file() || is_link_or_reparse(&metadata) {
         return None;
     }
     Some(FileEntry {
         parent: path.parent()?.to_path_buf(),
         size: metadata.len(),
-        identity: FileIdentity::from_metadata(&metadata),
+        identity: FileIdentity::from_path(&path, &metadata).ok()?,
         path,
     })
 }
@@ -357,7 +416,8 @@ mod tests {
         fn file(&self, name: &str) -> (PathBuf, FileIdentity) {
             let path = self.0.join(name);
             fs::write(&path, b"temporary fixture").unwrap();
-            let identity = FileIdentity::from_metadata(&fs::symlink_metadata(&path).unwrap());
+            let identity =
+                FileIdentity::from_path(&path, &fs::symlink_metadata(&path).unwrap()).unwrap();
             (path, identity)
         }
     }
@@ -407,7 +467,8 @@ mod tests {
             )
             .is_err()
         );
-        let identity = FileIdentity::from_metadata(&fs::symlink_metadata(&temp.0).unwrap());
+        let identity =
+            FileIdentity::from_path(&temp.0, &fs::symlink_metadata(&temp.0).unwrap()).unwrap();
         assert!(move_with(&temp.0, identity, |_, _| panic!()).is_err());
         assert!(move_with(Path::new("relative"), identity, |_, _| panic!()).is_err());
         #[cfg(unix)]
@@ -436,6 +497,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn trash_ancestors_are_rejected_before_any_operation() {
         assert!(already_in_trash(Path::new("/Users/me/.Trash/file")));
         assert!(already_in_trash(Path::new(
@@ -455,12 +517,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn finder_production_codec_preserves_quoted_unicode_paths_without_dispatch() {
         let temp = Temp::new();
         let (path, _) = temp.file("quote\"-line\n中文");
         assert_eq!(finder::file_codec_without_send(&path).as_ref(), Some(&path));
     }
     #[test]
+    #[cfg(target_os = "macos")]
     fn finder_single_item_list_reply_is_unwrapped_without_sending_events() {
         use objc2_foundation::{NSAppleEventDescriptor, NSString};
         let list = NSAppleEventDescriptor::listDescriptor();
@@ -477,6 +541,7 @@ mod tests {
         assert!(finder::single_object(NSAppleEventDescriptor::listDescriptor()).is_none());
     }
     #[test]
+    #[cfg(unix)]
     fn application_recovery_files_are_protected_including_alias_paths() {
         let temp = Temp::new();
         let support = temp.0.join("Support");
@@ -496,6 +561,7 @@ mod tests {
         ));
     }
     #[test]
+    #[cfg(target_os = "macos")]
     fn finder_application_error_is_not_mistaken_for_successful_transport() {
         use objc2_foundation::NSAppleEventDescriptor;
         let reply = NSAppleEventDescriptor::recordDescriptor();

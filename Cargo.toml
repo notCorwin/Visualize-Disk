@@ -17,3 +17,10 @@ strip = true
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSFileManager", "NSURL", "NSError", "NSString", "NSAppleEventDescriptor", "NSProcessInfo", "NSPathUtilities", "NSData", "NSDate", "objc2-core-services"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_SystemInformation", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
+
+[build-dependencies]
+embed-resource = "3.0.12"

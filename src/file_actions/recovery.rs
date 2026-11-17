@@ -1,4 +1,4 @@
-use super::{destination_entry, verify_file};
+use super::{RecoveryRecord, destination_entry, verify_file};
 use crate::scan::{FileEntry, FileIdentity};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -7,15 +7,6 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
-
-#[derive(Clone, Debug)]
-pub struct RecoveryRecord {
-    pub id: String,
-    pub original_path: PathBuf,
-    pub trash_path: Option<PathBuf>,
-    pub identity: FileIdentity,
-    pub original_links: u64,
-}
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

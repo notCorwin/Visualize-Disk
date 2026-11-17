@@ -1,0 +1,47 @@
+name: Windows
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: '-C target-feature=+crt-static'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+          targets: x86_64-pc-windows-msvc
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check Windows code
+        run: cargo check --locked --all-targets --target x86_64-pc-windows-msvc
+      - name: Run headless tests
+        run: cargo test --release --locked --target x86_64-pc-windows-msvc
+      - name: Verify native Windows recycling
+        run: cargo test --release --locked --target x86_64-pc-windows-msvc windows_recycle_smoke -- --ignored
+      - name: Build portable Windows package
+        shell: pwsh
+        run: ./scripts/package-windows.ps1
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Visualize-SSD-Windows-x64
+          path: target/release/bundle/Visualize-SSD-*.zip
+          if-no-files-found: error
+          retention-days: 14
