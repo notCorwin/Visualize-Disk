@@ -585,6 +585,49 @@ mod tests {
     }
 
     #[test]
+    fn file_covered_terminal_top_replaces_the_rim_but_keeps_its_side() {
+        let token = AtomicU64::new(1);
+        let platform = Platform::new(
+            rect(0.0, 0.0, 100.0, 100.0),
+            Color32::from_rgb(70, 145, 150),
+        )
+        .unwrap();
+        let entry = RenderEntry {
+            id: 0,
+            rect: platform.top,
+            color: platform.color,
+        };
+        let map = RenderMap::build_with_platforms(
+            vec![entry],
+            vec![platform],
+            platform.bounds,
+            [200, 200],
+            &token,
+            1,
+        )
+        .unwrap();
+        let files_only =
+            RenderMap::build_with_size(vec![entry], platform.bounds, [200, 200], &token, 1)
+                .unwrap();
+        let top = platform.top;
+        for y in 0..200 {
+            for x in 0..200 {
+                let (px, py) = ((x as f32 + 0.5) * 0.5, (y as f32 + 0.5) * 0.5);
+                if px >= top.x && px < top.x + top.w && py >= top.y && py < top.y + top.h {
+                    assert_eq!(map.hit_test(px, py), Some(0));
+                    assert_eq!(
+                        map.image.as_ref().unwrap().pixels[y * 200 + x],
+                        files_only.image.as_ref().unwrap().pixels[y * 200 + x]
+                    );
+                }
+            }
+        }
+        assert_eq!(map.hit_test(50.0, top.y + top.h + 1.0), None);
+        let side_pixel = ((top.y + top.h + 1.0) * 2.0) as usize * 200 + 100;
+        assert_ne!(map.image.as_ref().unwrap().pixels[side_pixel], BACKGROUND);
+    }
+
+    #[test]
     fn erase_masks_only_owned_pixels_at_hidpi_and_subpixel_boundaries() {
         let token = AtomicU64::new(1);
         for size in [[100, 100], [231, 177], [4096, 3000]] {

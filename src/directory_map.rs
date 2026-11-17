@@ -120,7 +120,16 @@ pub fn layout(
                 let platform = (below_root && !unary)
                     .then(|| Platform::new(bounds, color))
                     .flatten();
-                let content = platform.map_or(bounds, |platform| platform.content);
+                // A terminal directory is a file-covered tabletop, not another
+                // empty container. Only parents of subdirectories expose a
+                // shoulder around their children.
+                let content = platform.map_or(bounds, |platform| {
+                    if directory.children.is_empty() {
+                        platform.top
+                    } else {
+                        platform.content
+                    }
+                });
                 let family = if below_root {
                     Some((
                         base_color,
@@ -231,7 +240,10 @@ mod tests {
             .unwrap();
         assert!(contains(parent.content, nested.bounds));
         assert!(contains(parent.content, file(0).rect));
-        assert!(contains(nested.content, file(1).rect) && contains(nested.content, file(2).rect));
+        assert!(contains(nested.top, file(1).rect) && contains(nested.top, file(2).rect));
+        assert!((area(file(1).rect) + area(file(2).rect) - area(nested.top)).abs() < 0.1);
+        let terminal_top = nested.top;
+        let parent_shoulder = (parent.top.x + 0.5, parent.top.y + 0.5);
         assert!((area(nested.bounds) / area(file(0).rect) - 3.0).abs() < 0.001);
         assert!((area(file(2).rect) / area(file(1).rect) - 2.0).abs() < 0.001);
         let map = crate::render::RenderMap::build_with_platforms(
@@ -243,6 +255,26 @@ mod tests {
             1,
         )
         .unwrap();
+        assert_eq!(map.hit_test(parent_shoulder.0, parent_shoulder.1), None);
+        for y in 0..760 {
+            for x in 0..1200 {
+                let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                if px >= terminal_top.x
+                    && px < terminal_top.x + terminal_top.w
+                    && py >= terminal_top.y
+                    && py < terminal_top.y + terminal_top.h
+                {
+                    assert!(matches!(map.hit_test(px, py), Some(1 | 2)));
+                }
+            }
+        }
+        assert_eq!(
+            map.hit_test(
+                terminal_top.x + terminal_top.w * 0.5,
+                terminal_top.y + terminal_top.h + 1.0
+            ),
+            None
+        );
         for id in 0..4 {
             let r = map.rect(id).unwrap();
             assert_eq!(map.hit_test(r.x + r.w * 0.5, r.y + r.h * 0.5), Some(id));
