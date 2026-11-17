@@ -29,6 +29,7 @@ pub fn layout(
     groups: BTreeMap<&Path, Vec<(usize, u64)>>,
     root: &Path,
     bounds: Rect,
+    pixel_size: f32,
     token: &AtomicU64,
     generation: u64,
 ) -> Option<DirectoryLayout> {
@@ -91,7 +92,7 @@ pub fn layout(
     let mut platforms = Vec::new();
     // Iterative breadth-first publication paints a whole parent before its
     // children. Unary paths do not consume shoulder space or extra elevation.
-    let mut pending = vec![(0, bounds, None::<(Color32, u8)>)];
+    let mut pending = vec![(0, bounds, None::<(Color32, u8, u32)>)];
     while !pending.is_empty() {
         if cancelled() {
             return None;
@@ -106,8 +107,8 @@ pub fn layout(
                 let below_root = directory
                     .path
                     .is_some_and(|path| path != root && path.starts_with(root));
-                let (base_color, depth) =
-                    inherited.unwrap_or_else(|| (crate::color(directory.path.unwrap_or(root)), 0));
+                let (base_color, depth, inherited_platform) = inherited
+                    .unwrap_or_else(|| (crate::color(directory.path.unwrap_or(root)), 0, u32::MAX));
                 let factor = 1.0 + (depth as f32 * 0.035).min(0.14);
                 let channel = |v: u8| (v as f32 * factor).min(255.0) as u8;
                 let color = Color32::from_rgb(
@@ -118,26 +119,21 @@ pub fn layout(
 
                 let unary = directory.children.len() == 1 && directory.files.is_empty();
                 let platform = (below_root && !unary)
-                    .then(|| Platform::new(bounds, color))
+                    .then(|| Platform::new(bounds, color, depth, pixel_size))
                     .flatten()
                     .map(|mut platform| {
-                        platform.file_covered = directory.children.is_empty();
+                        platform.id = id as u32;
                         platform
                     });
-                // A terminal directory is a file-covered tabletop, not another
-                // empty container. Only parents of subdirectories expose a
-                // shoulder around their children.
-                let content = platform.map_or(bounds, |platform| {
-                    if directory.children.is_empty() {
-                        platform.top
-                    } else {
-                        platform.content
-                    }
-                });
+                // Files and child allocations share this same top surface.
+                // The only exposed shoulder is below an inset child platform.
+                let content = platform.map_or(bounds, |platform| platform.top);
+                let active_platform = platform.map_or(inherited_platform, |platform| platform.id);
                 let family = if below_root {
                     Some((
                         base_color,
                         depth.saturating_add(u8::from(platform.is_some())),
+                        active_platform,
                     ))
                 } else {
                     None
@@ -170,6 +166,7 @@ pub fn layout(
                             id: directory.files[slot - child_count].0,
                             rect,
                             color,
+                            platform: active_platform,
                         });
                     }
                 }
@@ -220,6 +217,7 @@ mod tests {
             ]),
             Path::new("/"),
             bounds(),
+            1.0,
             &token,
             1,
         )
@@ -240,14 +238,15 @@ mod tests {
         let nested = scene
             .platforms
             .iter()
-            .find(|p| area(p.bounds) < area(parent.bounds) && contains(parent.content, p.bounds))
+            .find(|p| area(p.bounds) < area(parent.bounds) && contains(parent.top, p.bounds))
             .unwrap();
-        assert!(contains(parent.content, nested.bounds));
-        assert!(contains(parent.content, file(0).rect));
+        assert!(contains(parent.top, nested.bounds));
+        assert!(contains(parent.top, file(0).rect));
         assert!(contains(nested.top, file(1).rect) && contains(nested.top, file(2).rect));
         assert!((area(file(1).rect) + area(file(2).rect) - area(nested.top)).abs() < 0.1);
         let terminal_top = nested.top;
-        let parent_shoulder = (parent.top.x + 0.5, parent.top.y + 0.5);
+        let terminal_bounds = nested.bounds;
+
         assert!((area(nested.bounds) / area(file(0).rect) - 3.0).abs() < 0.001);
         assert!((area(file(2).rect) / area(file(1).rect) - 2.0).abs() < 0.001);
         let map = crate::render::RenderMap::build_with_platforms(
@@ -259,7 +258,7 @@ mod tests {
             1,
         )
         .unwrap();
-        assert_eq!(map.hit_test(parent_shoulder.0, parent_shoulder.1), None);
+
         for y in 0..760 {
             for x in 0..1200 {
                 let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
@@ -272,19 +271,21 @@ mod tests {
                 }
             }
         }
-        assert_eq!(
-            map.hit_test(
-                terminal_top.x + terminal_top.w * 0.5,
-                terminal_top.y + terminal_top.h + 1.0
-            ),
-            None
-        );
+        // Query ownership at a sampled pixel centre, not a subpixel point
+        // whose displayed pixel may still belong to the adjoining file.
+        let side_y = (terminal_top.y + terminal_top.h - 0.5).ceil() + 0.5;
+        if side_y < terminal_bounds.y + terminal_bounds.h {
+            assert_eq!(
+                map.hit_test(terminal_top.x + terminal_top.w * 0.5, side_y),
+                None
+            );
+        }
         for id in 0..4 {
             let r = map.rect(id).unwrap();
             assert_eq!(map.hit_test(r.x + r.w * 0.5, r.y + r.h * 0.5), Some(id));
         }
         token.store(2, Ordering::Relaxed);
-        assert!(layout(BTreeMap::new(), Path::new("/"), bounds(), &token, 1).is_none());
+        assert!(layout(BTreeMap::new(), Path::new("/"), bounds(), 1.0, &token, 1).is_none());
     }
 
     #[test]
@@ -295,6 +296,7 @@ mod tests {
                 BTreeMap::from([(leaf, vec![(0, 1), (1, 2)])]),
                 root,
                 bounds(),
+                1.0,
                 &token,
                 1,
             )
@@ -315,7 +317,7 @@ mod tests {
             .enumerate()
             .map(|(id, path)| (path.as_path(), vec![(id, 1)]))
             .collect();
-        let scene = layout(groups, Path::new("/root"), bounds(), &token, 1).unwrap();
+        let scene = layout(groups, Path::new("/root"), bounds(), 1.0, &token, 1).unwrap();
         assert_eq!(scene.entries.len(), 2000);
         assert!(scene.platforms.is_empty());
         assert!(
@@ -354,7 +356,7 @@ mod tests {
                 .collect();
             groups.insert(Path::new(path), files);
         }
-        let scene = layout(groups, Path::new("/"), bounds(), &token, 1).unwrap();
+        let scene = layout(groups, Path::new("/"), bounds(), 1.0, &token, 1).unwrap();
         assert!(scene.platforms.len() >= 9);
         let map = crate::render::RenderMap::build_with_platforms(
             scene.entries,
@@ -392,6 +394,152 @@ mod tests {
             write!(file, "P6\n1200 760\n255\n").unwrap();
             for pixel in &image.pixels {
                 file.write_all(&pixel.to_array()[..3]).unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod compact_depth_tests {
+    use super::*;
+    use std::{io::Write, path::PathBuf};
+
+    fn scene(mode: &str) -> DirectoryLayout {
+        let mut owned = BTreeMap::<PathBuf, Vec<(usize, u64)>>::new();
+        let mut next_id = 0;
+        let mut files = |count: usize, weight: u64| -> Vec<_> {
+            (0..count)
+                .map(|i| {
+                    let id = next_id;
+                    next_id += 1;
+                    (id, weight + (i % 17) as u64)
+                })
+                .collect()
+        };
+        if mode == "deep" {
+            let mut path = PathBuf::from("/root/ridge");
+            for level in 0..20 {
+                owned.insert(path.clone(), files(2, 5));
+                path.push(format!("level{level:02}"));
+            }
+            owned.insert(path, files(700, 1000));
+            owned.insert(PathBuf::from("/root/other"), files(160, 1000));
+        } else {
+            owned.insert(PathBuf::from("/root/mixed"), files(320, 1000));
+            owned.insert(PathBuf::from("/root/mixed/tiny"), files(3, 1));
+            owned.insert(PathBuf::from("/root/other"), files(100, 1000));
+        }
+        let groups = owned
+            .iter()
+            .map(|(path, files)| (path.as_path(), files.clone()))
+            .collect();
+        let token = AtomicU64::new(1);
+        layout(
+            groups,
+            Path::new("/root"),
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 1200.0,
+                h: 760.0,
+            },
+            1.0,
+            &token,
+            1,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn near_unary_geometry_budget_is_bounded_and_mixed_files_have_no_inner_rim() {
+        for mode in ["deep", "mixed"] {
+            let layout = scene(mode);
+            assert!(
+                layout
+                    .entries
+                    .iter()
+                    .all(|entry| entry.rect.w > 0.0 && entry.rect.h > 0.0)
+            );
+            let mut ids: Vec<_> = layout.entries.iter().map(|entry| entry.id).collect();
+            ids.sort_unstable();
+            assert!(ids.iter().enumerate().all(|(id, &actual)| id == actual));
+            let main = layout
+                .platforms
+                .iter()
+                .max_by(|a, b| (a.bounds.w * a.bounds.h).total_cmp(&(b.bounds.w * b.bounds.h)))
+                .unwrap();
+            if mode == "deep" {
+                // Sum only the geometric margins of the main ancestor chain.
+                // This excludes legitimate area reduction from file weights.
+                let mut losses = [0.0f32; 4];
+                for p in layout.platforms.iter().filter(|p| {
+                    p.bounds.x >= main.bounds.x
+                        && p.bounds.y >= main.bounds.y
+                        && p.bounds.x + p.bounds.w <= main.bounds.x + main.bounds.w + 0.01
+                        && p.bounds.y + p.bounds.h <= main.bounds.y + main.bounds.h + 0.01
+                }) {
+                    losses[0] += p.top.x - p.bounds.x;
+                    losses[1] += p.top.y - p.bounds.y;
+                    losses[2] += p.bounds.x + p.bounds.w - p.top.x - p.top.w;
+                    losses[3] += p.bounds.y + p.bounds.h - p.top.y - p.top.h;
+                }
+                assert!(
+                    losses.iter().all(|&loss| loss <= 11.51),
+                    "per-edge losses={losses:?}"
+                );
+                assert!(
+                    layout.platforms.len() < 20,
+                    "subpixel layers must merge visually"
+                );
+                eprintln!(
+                    "near-unary per-edge decoration={losses:?}, visible_platforms={}",
+                    layout.platforms.len()
+                );
+            } else {
+                assert!(
+                    layout
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.id < 320)
+                        .any(|entry| (entry.rect.y - main.top.y).abs() < 0.001)
+                );
+                assert!(
+                    layout
+                        .entries
+                        .iter()
+                        .filter(|entry| entry.id < 320)
+                        .any(|entry| (entry.rect.x - main.top.x).abs() < 0.001)
+                );
+                assert!(
+                    layout
+                        .entries
+                        .iter()
+                        .all(|entry| entry.platform != u32::MAX)
+                );
+            }
+            let token = AtomicU64::new(1);
+            let bounds = Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 1200.0,
+                h: 760.0,
+            };
+            let map = crate::render::RenderMap::build_with_platforms(
+                layout.entries,
+                layout.platforms,
+                bounds,
+                [1200, 760],
+                &token,
+                1,
+            )
+            .unwrap();
+            if let Ok(prefix) = std::env::var("COMPACT_PREVIEW_PREFIX") {
+                let image = map.image.as_ref().unwrap();
+                let mut file = std::fs::File::create(format!("{prefix}-{mode}.ppm")).unwrap();
+                write!(file, "P6\n1200 760\n255\n").unwrap();
+                for pixel in &image.pixels {
+                    file.write_all(&pixel.to_array()[..3]).unwrap();
+                }
             }
         }
     }

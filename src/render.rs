@@ -12,52 +12,56 @@ const BACKGROUND: Color32 = Color32::from_rgb(19, 23, 29);
 // Logical-point design tokens for the shared platform material.
 const MIN_PLATFORM_SIDE: f32 = 28.0;
 const MIN_PLATFORM_AREA: f32 = 1800.0;
-const MAX_SHOULDER: f32 = 18.0;
-const MAX_RISE: f32 = 8.0;
+// Per-edge decoration is a convergent series along every directory path.
+// The largest (bottom) inset is (gap + shoulder + rise)/(1-decay) = 11.5pt.
+const PLATFORM_GAP: f32 = 0.1;
+const PLATFORM_SHOULDER: f32 = 0.35;
+const PLATFORM_RISE: f32 = 0.7;
+// Material bands preserve readable light/shadow without reserving empty area.
+const HIGHLIGHT_WIDTH: f32 = 1.25;
+const SHADOW_WIDTH: f32 = 1.5;
+const DECORATION_DECAY: f32 = 0.9;
 const FILE_SHADE_LIGHT: f64 = 1.12;
-const FILE_SHADE_X: f64 = 0.065;
-const FILE_SHADE_Y: f64 = 0.045;
+const FILE_SHADE_X: f64 = 0.09;
+const FILE_SHADE_Y: f64 = 0.06;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Platform {
     pub bounds: Rect,
     pub top: Rect,
-    pub content: Rect,
     pub color: Color32,
-    pub file_covered: bool,
+    pub id: u32,
     rise: f32,
     bevel: f32,
 }
 
 impl Platform {
-    pub fn new(bounds: Rect, color: Color32) -> Option<Self> {
+    pub fn new(bounds: Rect, color: Color32, depth: u8, pixel_size: f32) -> Option<Self> {
         let side = bounds.w.min(bounds.h);
         if !valid(bounds) || side < MIN_PLATFORM_SIDE || bounds.w * bounds.h < MIN_PLATFORM_AREA {
             return None;
         }
-        let gap = (side * 0.012).clamp(0.8, 2.0);
-        let rise = (side * 0.045).clamp(2.5, MAX_RISE);
+        let scale = DECORATION_DECAY.powi(depth as i32);
+        let rise = PLATFORM_RISE * scale;
+        // Subpixel layers merge visually; geometry and original file IDs still
+        // descend through the full tree without consuming more decoration.
+        if (PLATFORM_GAP + PLATFORM_SHOULDER + PLATFORM_RISE) * scale < pixel_size * 0.5 {
+            return None;
+        }
+        let gap = (PLATFORM_GAP + PLATFORM_SHOULDER) * scale;
         let top = Rect {
             x: bounds.x + gap,
             y: bounds.y + gap,
             w: bounds.w - gap * 2.0 - rise * 0.25,
             h: bounds.h - gap * 2.0 - rise,
         };
-        let shoulder = (side * 0.065).clamp(3.0, MAX_SHOULDER);
-        let content = Rect {
-            x: top.x + shoulder,
-            y: top.y + shoulder,
-            w: top.w - shoulder * 2.0,
-            h: top.h - shoulder * 2.0,
-        };
         Some(Self {
             bounds,
             top,
-            content,
             color,
-            file_covered: false,
+            id: NONE,
             rise,
-            bevel: (rise * 0.42).max(1.0),
+            bevel: HIGHLIGHT_WIDTH.min(top.w.min(top.h) * 0.1),
         })
     }
 
@@ -77,7 +81,7 @@ impl Platform {
                 let t = (1.0 - distance / self.bevel).clamp(0.0, 1.0);
                 t * t * (3.0 - 2.0 * t)
             };
-            let shade = material + 0.18 * smooth(upper) + 0.11 * smooth(left)
+            let shade = material + 0.25 * smooth(upper) + 0.15 * smooth(left)
                 - 0.20 * smooth(bottom)
                 - 0.13 * smooth(right);
             return Some(shaded(self.color, shade));
@@ -97,12 +101,13 @@ impl Platform {
         }
         // Premultiplied contact shadow blends with the already-painted parent
         // material instead of cutting a black outline into its shoulder.
+        let shadow_width = self.rise * 0.3;
         let distance = (x - r.x - r.w - dx)
             .max(0.0)
             .max((y - r.y - r.h - self.rise).max(0.0));
-        if x >= r.x && y >= r.y && distance < 2.0 {
+        if x >= r.x && y >= r.y && distance < shadow_width {
             return Some(Color32::from_black_alpha(
-                (70.0 * (1.0 - distance / 2.0)) as u8,
+                (45.0 * (1.0 - distance / shadow_width)) as u8,
             ));
         }
         None
@@ -125,6 +130,8 @@ pub struct RenderEntry {
     pub id: usize,
     pub rect: Rect,
     pub color: Color32,
+    // Reuses the existing alignment padding: no per-file size increase.
+    pub platform: u32,
 }
 
 pub struct RenderRaster {
@@ -217,7 +224,9 @@ impl RenderMap {
             }
             by_id[entry.id] = index as u32;
         }
-        let mut base = rasterize(&entries, &platforms, bounds, size, token, generation)?;
+        let mut base = rasterize(
+            &entries, &platforms, &by_id, bounds, size, token, generation,
+        )?;
         let image = base.image.take();
         Some(Self {
             image,
@@ -323,6 +332,7 @@ impl RenderMap {
         rasterize(
             &self.entries,
             &self.platforms,
+            &self.by_id,
             view,
             size,
             token,
@@ -362,9 +372,15 @@ fn dimensions(requested: [usize; 2]) -> [usize; 2] {
     requested.map(|side| ((side as f64 * scale).round() as usize).clamp(1, MAX_SIDE))
 }
 
+pub fn logical_pixel_size(bounds: Rect, requested: [usize; 2]) -> f32 {
+    let [width, height] = dimensions(requested);
+    (bounds.w / width as f32).max(bounds.h / height as f32)
+}
+
 fn rasterize(
     entries: &[RenderEntry],
     platforms: &[Platform],
+    by_id: &[u32],
     view: Rect,
     requested: [usize; 2],
     token: &AtomicU64,
@@ -499,11 +515,11 @@ fn rasterize(
                     owners[start..end].fill(draw.id);
                 }
             }
-            // The terminal tabletop has no empty rim. Its chamfer light acts
-            // on the file material itself, after ownership has been painted.
-            // Restrict work to two non-overlapping edge strips, O(perimeter).
+            // Readable chamfer bands modulate this plane's file material;
+            // their width never creates an empty rim or changes ownership.
+            // Four non-overlapping edge strips keep the work O(perimeter).
             for (platform, _) in platforms {
-                if !platform.file_covered {
+                if platform.id == NONE {
                     continue;
                 }
                 if cancelled(token, generation) {
@@ -511,43 +527,78 @@ fn rasterize(
                 }
                 let top = platform.top;
                 let bevel = platform.bevel;
+                let shadow = SHADOW_WIDTH.min(top.w.min(top.h) * 0.1);
                 let strips = [
                     Rect { h: bevel, ..top },
                     Rect {
+                        y: top.y + top.h - shadow,
+                        h: shadow,
+                        ..top
+                    },
+                    Rect {
                         y: top.y + bevel,
                         w: bevel,
-                        h: top.h - bevel,
+                        h: top.h - bevel - shadow,
                         ..top
+                    },
+                    Rect {
+                        x: top.x + top.w - shadow,
+                        y: top.y + bevel,
+                        w: shadow,
+                        h: top.h - bevel - shadow,
                     },
                 ];
                 for strip in strips {
-                    let x0 = (((strip.x - view.x) * sx - 0.5).ceil().max(0.0) as usize).min(width);
-                    let x1 = ((((strip.x + strip.w) - view.x) * sx - 0.5).ceil().max(0.0) as usize)
-                        .min(width);
-                    let y0 = (((strip.y - view.y) * sy - 0.5).ceil().max(0.0) as usize)
+                    let x0 = (((strip.x - view.x) * sx).floor().max(0.0) as usize).min(width);
+                    let x1 =
+                        ((((strip.x + strip.w) - view.x) * sx).ceil().max(0.0) as usize).min(width);
+                    let y0 = (((strip.y - view.y) * sy).floor().max(0.0) as usize)
                         .max(band * BAND_ROWS)
                         .min(height);
-                    let y1 = ((((strip.y + strip.h) - view.y) * sy - 0.5).ceil().max(0.0) as usize)
+                    let y1 = ((((strip.y + strip.h) - view.y) * sy).ceil().max(0.0) as usize)
                         .min((band + 1) * BAND_ROWS)
                         .min(height);
                     for y in y0..y1 {
-                        let world_y = view.y + (y as f32 + 0.5) / sy;
+                        let py0 = view.y + y as f32 / sy;
+                        let py1 = py0 + 1.0 / sy;
+                        let lo_y = py0.max(strip.y);
+                        let hi_y = py1.min(strip.y + strip.h);
+                        let world_y = (lo_y + hi_y) * 0.5;
+                        let coverage_y = ((hi_y - lo_y) * sy).clamp(0.0, 1.0);
                         for x in x0..x1 {
                             let index = (y - band * BAND_ROWS) * width + x;
-                            if owners[index] == NONE {
+                            let owner = owners[index];
+                            if owner == NONE {
                                 continue;
                             }
-                            let world_x = view.x + (x as f32 + 0.5) / sx;
-                            let smooth = |distance: f32| {
-                                let t = (1.0 - distance / bevel).clamp(0.0, 1.0);
+                            let entry = by_id[owner as usize];
+                            if entry == NONE || entries[entry as usize].platform != platform.id {
+                                continue;
+                            }
+                            let px0 = view.x + x as f32 / sx;
+                            let px1 = px0 + 1.0 / sx;
+                            let lo_x = px0.max(strip.x);
+                            let hi_x = px1.min(strip.x + strip.w);
+                            let world_x = (lo_x + hi_x) * 0.5;
+                            let coverage = coverage_y * ((hi_x - lo_x) * sx).clamp(0.0, 1.0);
+                            let smooth = |distance: f32, width: f32| {
+                                let t = (1.0 - distance / width).clamp(0.0, 1.0);
                                 t * t * (3.0 - 2.0 * t)
                             };
-                            let light =
-                                0.18 * smooth(world_y - top.y) + 0.07 * smooth(world_x - top.x);
+                            let light = (0.25 * smooth(world_y - top.y, bevel)
+                                + 0.10 * smooth(world_x - top.x, bevel)
+                                - 0.18 * smooth(top.y + top.h - world_y, shadow)
+                                - 0.12 * smooth(top.x + top.w - world_x, shadow))
+                                * coverage;
                             let pixel = &mut pixels[index];
                             let alpha = pixel.a();
                             let channel = |value: u8| {
-                                (value as f32 + (alpha - value) as f32 * light).round() as u8
+                                let value = value as f32;
+                                if light >= 0.0 {
+                                    (value + (alpha as f32 - value) * light).round() as u8
+                                } else {
+                                    (value * (1.0 + light)).round() as u8
+                                }
                             };
                             *pixel = Color32::from_rgba_premultiplied(
                                 channel(pixel.r()),
@@ -583,16 +634,19 @@ mod tests {
                 id: 0,
                 rect: rect(0.0, 0.0, 50.0, 100.0),
                 color: Color32::RED,
+                platform: NONE,
             },
             RenderEntry {
                 id: 1,
                 rect: rect(50.0, 0.0, 49.999, 100.0),
                 color: Color32::BLUE,
+                platform: NONE,
             },
             RenderEntry {
                 id: 2,
                 rect: rect(99.999, 0.0, 0.001, 100.0),
                 color: Color32::GREEN,
+                platform: NONE,
             },
         ]
     }
@@ -602,12 +656,20 @@ mod tests {
         let platform = Platform::new(
             rect(0.0, 0.0, 100.0, 100.0),
             Color32::from_rgb(70, 145, 150),
+            0,
+            0.5,
         )
         .unwrap();
         let entry = RenderEntry {
             id: 0,
-            rect: platform.content,
+            rect: rect(
+                platform.top.x + 2.0,
+                platform.top.y + 2.0,
+                platform.top.w - 4.0,
+                platform.top.h - 4.0,
+            ),
             color: platform.color,
+            platform: NONE,
         };
         let mut map = RenderMap::build_with_platforms(
             vec![entry],
@@ -623,7 +685,7 @@ mod tests {
             None
         );
         assert_eq!(
-            map.hit_test(50.0, platform.top.y + platform.top.h + 1.0),
+            map.hit_test(50.0, platform.top.y + platform.top.h + platform.rise * 0.5),
             None
         );
         assert_eq!(map.hit_test(50.0, 50.0), Some(0));
@@ -631,9 +693,9 @@ mod tests {
             .sample(platform.top.x + 5.0, platform.top.y + 0.1)
             .unwrap();
         let side = platform
-            .sample(50.0, platform.top.y + platform.top.h + 1.0)
+            .sample(50.0, platform.top.y + platform.top.h + platform.rise * 0.5)
             .unwrap();
-        assert!(highlight.g() > side.g() + 60);
+        assert!(highlight.g() > side.g() + 40);
         let before = map.image.as_ref().unwrap().pixels.clone();
         let holes = map.erase(0);
         assert_eq!(map.hit_test(50.0, 50.0), None);
@@ -652,13 +714,16 @@ mod tests {
         let mut platform = Platform::new(
             rect(0.0, 0.0, 100.0, 100.0),
             Color32::from_rgb(70, 145, 150),
+            0,
+            0.5,
         )
         .unwrap();
-        platform.file_covered = true;
+        platform.id = 0;
         let entry = RenderEntry {
             id: 0,
             rect: platform.top,
             color: platform.color,
+            platform: 0,
         };
         let map = RenderMap::build_with_platforms(
             vec![entry],
@@ -674,6 +739,7 @@ mod tests {
                 .unwrap();
         let top = platform.top;
         let mut lit_pixels = 0;
+        let mut shadow_pixels = 0;
         for y in 0..200 {
             for x in 0..200 {
                 let (px, py) = ((x as f32 + 0.5) * 0.5, (y as f32 + 0.5) * 0.5);
@@ -681,22 +747,25 @@ mod tests {
                     assert_eq!(map.hit_test(px, py), Some(0));
                     let actual = map.image.as_ref().unwrap().pixels[y * 200 + x];
                     let plain = files_only.image.as_ref().unwrap().pixels[y * 200 + x];
-                    if px >= top.x + platform.bevel && py >= top.y + platform.bevel {
+                    if px - 0.25 >= top.x + platform.bevel
+                        && py - 0.25 >= top.y + platform.bevel
+                        && px + 0.25 <= top.x + top.w - SHADOW_WIDTH
+                        && py + 0.25 <= top.y + top.h - SHADOW_WIDTH
+                    {
                         assert_eq!(actual, plain);
                     } else {
-                        lit_pixels += usize::from(actual != plain);
-                        assert!(
-                            actual.r() >= plain.r()
-                                && actual.g() >= plain.g()
-                                && actual.b() >= plain.b()
-                        );
+                        lit_pixels += usize::from(actual.g() > plain.g());
+                        shadow_pixels += usize::from(actual.g() < plain.g());
                     }
                 }
             }
         }
-        assert!(lit_pixels > 100);
-        assert_eq!(map.hit_test(50.0, top.y + top.h + 1.0), None);
-        let side_pixel = ((top.y + top.h + 1.0) * 2.0) as usize * 200 + 100;
+        assert!(lit_pixels > 100 && shadow_pixels > 100);
+        assert_eq!(
+            map.hit_test(50.0, top.y + top.h + platform.rise * 0.5),
+            None
+        );
+        let side_pixel = ((top.y + top.h + platform.rise * 0.5) * 2.0) as usize * 200 + 100;
         assert_ne!(map.image.as_ref().unwrap().pixels[side_pixel], BACKGROUND);
     }
 
@@ -745,6 +814,7 @@ mod tests {
                 id: 0,
                 rect: rect(0.0, 0.0, 2048.0, 2048.0),
                 color: Color32::RED,
+                platform: NONE,
             }],
             rect(0.0, 0.0, 2048.0, 2048.0),
             [2048, 2048],
@@ -786,11 +856,13 @@ mod tests {
                 id: 0,
                 rect: rect(0.0, 0.0, 50.0, 100.0),
                 color: base,
+                platform: NONE,
             },
             RenderEntry {
                 id: 1,
                 rect: rect(50.0, 0.0, 50.0, 100.0),
                 color: base,
+                platform: NONE,
             },
         ];
         let map = RenderMap::build(entries, rect(0.0, 0.0, 100.0, 100.0), &token, 1).unwrap();
@@ -850,6 +922,7 @@ mod tests {
                     id,
                     rect,
                     color: Color32::from_rgb(65, 143, 151),
+                    platform: NONE,
                 })
                 .collect();
             let map = RenderMap::build_with_size(entries, bounds, size, &token, 1).unwrap();
@@ -867,6 +940,7 @@ mod tests {
                 id: 0,
                 rect: rect(0.0, 0.0, 64.0, 300.0),
                 color: Color32::from_rgb(65, 143, 151),
+                platform: NONE,
             }],
             rect(0.0, 0.0, 64.0, 300.0),
             &token,
@@ -935,6 +1009,7 @@ mod tests {
                 } else {
                     Color32::GREEN
                 },
+                platform: NONE,
             })
             .collect();
         let token = AtomicU64::new(1);

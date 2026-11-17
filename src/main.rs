@@ -383,7 +383,14 @@ fn layout_snapshot(
         w: key.logical_size.x,
         h: key.logical_size.y,
     };
-    let layout = directory_map::layout(grouped.ok()?, &data.root, bounds, token, generation)?;
+    let layout = directory_map::layout(
+        grouped.ok()?,
+        &data.root,
+        bounds,
+        render::logical_pixel_size(bounds, key.physical_size),
+        token,
+        generation,
+    )?;
     render::RenderMap::build_with_platforms(
         layout.entries,
         layout.platforms,
