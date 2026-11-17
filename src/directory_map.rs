@@ -92,7 +92,7 @@ pub fn layout(
     let mut platforms = Vec::new();
     // Iterative breadth-first publication paints a whole parent before its
     // children. Unary paths do not consume shoulder space or extra elevation.
-    let mut pending = vec![(0, bounds, None::<(u8, u32)>)];
+    let mut pending = vec![(0, bounds, None::<u8>)];
     while !pending.is_empty() {
         if cancelled() {
             return None;
@@ -107,7 +107,7 @@ pub fn layout(
                 let below_root = directory
                     .path
                     .is_some_and(|path| path != root && path.starts_with(root));
-                let (depth, inherited_platform) = inherited.unwrap_or((0, u32::MAX));
+                let depth = inherited.unwrap_or(0);
                 let file_color = crate::color(directory.path.unwrap_or(root));
                 let factor = 1.0 + (depth as f32 * 0.035).min(0.14);
                 let channel = |v: u8| (v as f32 * factor).min(255.0) as u8;
@@ -120,20 +120,12 @@ pub fn layout(
                 let unary = directory.children.len() == 1 && directory.files.is_empty();
                 let platform = (below_root && !unary)
                     .then(|| Platform::new(bounds, platform_color, depth, pixel_size))
-                    .flatten()
-                    .map(|mut platform| {
-                        platform.id = id as u32;
-                        platform
-                    });
+                    .flatten();
                 // Files and child allocations share this same top surface.
                 // The only exposed shoulder is below an inset child platform.
                 let content = platform.map_or(bounds, |platform| platform.top);
-                let active_platform = platform.map_or(inherited_platform, |platform| platform.id);
                 let family = if below_root {
-                    Some((
-                        depth.saturating_add(u8::from(platform.is_some())),
-                        active_platform,
-                    ))
+                    Some(depth.saturating_add(u8::from(platform.is_some())))
                 } else {
                     None
                 };
@@ -165,7 +157,6 @@ pub fn layout(
                             id: directory.files[slot - child_count].0,
                             rect,
                             color: file_color,
-                            platform: active_platform,
                         });
                     }
                 }
@@ -439,6 +430,18 @@ mod compact_depth_tests {
             }
             owned.insert(path, files(700, 1000));
             owned.insert(PathBuf::from("/root/other"), files(160, 1000));
+        } else if mode == "hierarchy" {
+            // assembly and its intermediate branch have no direct files;
+            // mixed has direct files adjacent to a raised child surface.
+            owned.insert(
+                PathBuf::from("/root/assembly/branch/alpha"),
+                files(48, 1000),
+            );
+            owned.insert(PathBuf::from("/root/assembly/branch/beta"), files(30, 900));
+            owned.insert(PathBuf::from("/root/assembly/side"), files(40, 950));
+            owned.insert(PathBuf::from("/root/mixed"), files(50, 1000));
+            owned.insert(PathBuf::from("/root/mixed/child"), files(60, 1000));
+            owned.insert(PathBuf::from("/root/mixed/child/nested"), files(24, 1000));
         } else {
             owned.insert(PathBuf::from("/root/mixed"), files(320, 1000));
             owned.insert(PathBuf::from("/root/mixed/tiny"), files(3, 1));
@@ -467,7 +470,7 @@ mod compact_depth_tests {
 
     #[test]
     fn near_unary_geometry_budget_is_bounded_and_mixed_files_have_no_inner_rim() {
-        for mode in ["deep", "mixed"] {
+        for mode in ["deep", "mixed", "hierarchy"] {
             let layout = scene(mode);
             assert!(
                 layout
@@ -510,7 +513,7 @@ mod compact_depth_tests {
                     "near-unary per-edge decoration={losses:?}, visible_platforms={}",
                     layout.platforms.len()
                 );
-            } else {
+            } else if mode == "mixed" {
                 assert!(
                     layout
                         .entries
@@ -524,12 +527,6 @@ mod compact_depth_tests {
                         .iter()
                         .filter(|entry| entry.id < 320)
                         .any(|entry| (entry.rect.x - main.top.x).abs() < 0.001)
-                );
-                assert!(
-                    layout
-                        .entries
-                        .iter()
-                        .all(|entry| entry.platform != u32::MAX)
                 );
             }
             let token = AtomicU64::new(1);

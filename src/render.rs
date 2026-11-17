@@ -18,8 +18,9 @@ const PLATFORM_GAP: f32 = 0.1;
 const PLATFORM_SHOULDER: f32 = 0.35;
 const PLATFORM_RISE: f32 = 0.7;
 // Material bands preserve readable light/shadow without reserving empty area.
-const HIGHLIGHT_WIDTH: f32 = 1.25;
-const SHADOW_WIDTH: f32 = 1.5;
+const BEVEL_WIDTH: f32 = 3.0;
+const LAYER_HEIGHT: f32 = 4.0;
+const LIGHT_REACH: f32 = 6.0;
 const DECORATION_DECAY: f32 = 0.9;
 const FILE_SHADE_LIGHT: f64 = 1.12;
 const FILE_SHADE_X: f64 = 0.09;
@@ -30,9 +31,7 @@ pub struct Platform {
     pub bounds: Rect,
     pub top: Rect,
     pub color: Color32,
-    pub id: u32,
     rise: f32,
-    bevel: f32,
 }
 
 impl Platform {
@@ -59,59 +58,188 @@ impl Platform {
             bounds,
             top,
             color,
-            id: NONE,
             rise,
-            bevel: HIGHLIGHT_WIDTH.min(top.w.min(top.h) * 0.1),
         })
     }
 
-    // Returns material only inside this allocation. Shadows never obscure a
-    // neighbouring file; every exposed shoulder/side keeps a NONE owner.
+    // Paint only this allocation's material. Shared lighting follows file
+    // painting; every exposed shoulder/side keeps a NONE owner.
     fn sample(self, x: f32, y: f32) -> Option<Color32> {
         let r = self.top;
         if x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h {
             let left = x - r.x;
             let upper = y - r.y;
-            let right = r.x + r.w - x;
-            let bottom = r.y + r.h - y;
             let material = 1.055 - 0.07 * upper / r.h - 0.025 * left / r.w;
-            // Continuous chamfer lighting reads as a physical surface rather
-            // than a one-pixel frame around a flat rectangle.
-            let smooth = |distance: f32| {
-                let t = (1.0 - distance / self.bevel).clamp(0.0, 1.0);
-                t * t * (3.0 - 2.0 * t)
-            };
-            let shade = material + 0.25 * smooth(upper) + 0.15 * smooth(left)
-                - 0.20 * smooth(bottom)
-                - 0.13 * smooth(right);
-            return Some(shaded(self.color, shade));
+            return Some(shaded(self.color, material));
         }
         let dx = self.rise * 0.25;
         if y >= r.y + r.h && y < r.y + r.h + self.rise {
             let f = (y - r.y - r.h) / self.rise;
             if x >= r.x + dx * f && x < r.x + r.w + dx * f {
-                return Some(shaded(self.color, 0.75 - 0.12 * f));
+                return Some(self.color);
             }
         }
         if x >= r.x + r.w && x < r.x + r.w + dx {
             let f = (x - r.x - r.w) / dx;
             if y >= r.y + self.rise * f && y < r.y + r.h + self.rise * f {
-                return Some(shaded(self.color, 0.66 - 0.07 * f));
+                return Some(self.color);
             }
-        }
-        // Premultiplied contact shadow blends with the already-painted parent
-        // material instead of cutting a black outline into its shoulder.
-        let shadow_width = self.rise * 0.3;
-        let distance = (x - r.x - r.w - dx)
-            .max(0.0)
-            .max((y - r.y - r.h - self.rise).max(0.0));
-        if x >= r.x && y >= r.y && distance < shadow_width {
-            return Some(Color32::from_black_alpha(
-                (45.0 * (1.0 - distance / shadow_width)) as u8,
-            ));
         }
         None
     }
+}
+
+// One temporary shared elevation field: every actual terrace contributes its
+// own narrow bevel, including beneath descendant materials. The world-space
+// halo keeps directional light continuous across crops and worker bands.
+struct HeightField {
+    values: Vec<f32>,
+    size: [usize; 2],
+    origin: [f32; 2],
+    step: [f32; 2],
+}
+
+impl HeightField {
+    fn build(
+        platforms: &[Platform],
+        view: Rect,
+        size: [usize; 2],
+        token: &AtomicU64,
+        generation: u64,
+    ) -> Option<Self> {
+        // A quarter-point floor resolves the narrowest bevel while bounding
+        // the halo even when the viewport is zoomed to a fraction of a point.
+        let step = [view.w / size[0] as f32, view.h / size[1] as f32].map(|step| step.max(0.25));
+        let low = [view.x, view.y];
+        let high = [view.x + view.w, view.y + view.h];
+        let origin = std::array::from_fn::<_, 2, _>(|axis| {
+            ((low[axis] - LIGHT_REACH) / step[axis]).floor() * step[axis] - step[axis]
+        });
+        let field_size = std::array::from_fn::<_, 2, _>(|axis| {
+            ((high[axis] + LIGHT_REACH - origin[axis]) / step[axis]).ceil() as usize + 1
+        });
+        let mut values = vec![0.0; field_size[0] * field_size[1]];
+        let mut bands: Vec<Vec<(Platform, [usize; 4])>> = (0..field_size[1].div_ceil(BAND_ROWS))
+            .map(|_| Vec::new())
+            .collect();
+        for (index, &platform) in platforms.iter().enumerate() {
+            if index % 1024 == 0 && cancelled(token, generation) {
+                return None;
+            }
+            let r = platform.bounds;
+            let low = [r.x, r.y];
+            let high = [r.x + r.w, r.y + r.h];
+            let start = std::array::from_fn::<_, 2, _>(|axis| {
+                (((low[axis] - origin[axis]) / step[axis] - 0.5)
+                    .ceil()
+                    .max(0.0) as usize)
+                    .min(field_size[axis])
+            });
+            let end = std::array::from_fn::<_, 2, _>(|axis| {
+                (((high[axis] - origin[axis]) / step[axis] - 0.5)
+                    .ceil()
+                    .max(0.0) as usize)
+                    .min(field_size[axis])
+            });
+            if start[0] >= end[0] || start[1] >= end[1] {
+                continue;
+            }
+            for band in start[1] / BAND_ROWS..=(end[1] - 1) / BAND_ROWS {
+                bands[band].push((
+                    platform,
+                    [
+                        start[0],
+                        end[0],
+                        start[1].max(band * BAND_ROWS),
+                        end[1].min((band + 1) * BAND_ROWS),
+                    ],
+                ));
+            }
+        }
+        let width = field_size[0];
+        values
+            .par_chunks_mut(width * BAND_ROWS)
+            .zip(bands.into_par_iter())
+            .enumerate()
+            .for_each(|(band, (values, platforms))| {
+                for (platform, [x0, x1, y0, y1]) in platforms {
+                    if cancelled(token, generation) {
+                        return;
+                    }
+                    let r = platform.bounds;
+                    for y in y0..y1 {
+                        let wy = origin[1] + (y as f32 + 0.5) * step[1];
+                        let dy = (wy - r.y).min(r.y + r.h - wy);
+                        for x in x0..x1 {
+                            let wx = origin[0] + (x as f32 + 0.5) * step[0];
+                            let distance = dy.min(wx - r.x).min(r.x + r.w - wx);
+                            let t = (distance / BEVEL_WIDTH).clamp(0.0, 1.0);
+                            values[(y - band * BAND_ROWS) * width + x] +=
+                                LAYER_HEIGHT * t * t * (3.0 - 2.0 * t);
+                        }
+                    }
+                }
+            });
+        (!cancelled(token, generation)).then_some(Self {
+            values,
+            size: field_size,
+            origin,
+            step,
+        })
+    }
+
+    fn sample(&self, x: f32, y: f32) -> f32 {
+        let p = [x, y];
+        let uv = std::array::from_fn::<_, 2, _>(|axis| {
+            ((p[axis] - self.origin[axis]) / self.step[axis] - 0.5)
+                .clamp(0.0, (self.size[axis] - 1) as f32)
+        });
+        let [x0, y0] = uv.map(|v| v.floor() as usize);
+        let x1 = (x0 + 1).min(self.size[0] - 1);
+        let y1 = (y0 + 1).min(self.size[1] - 1);
+        let [u, v] = [uv[0] - x0 as f32, uv[1] - y0 as f32];
+        let at = |x, y| self.values[y * self.size[0] + x];
+        let a = at(x0, y0) * (1.0 - u) + at(x1, y0) * u;
+        let b = at(x0, y1) * (1.0 - u) + at(x1, y1) * u;
+        a * (1.0 - v) + b * v
+    }
+}
+
+fn illuminate(color: Color32, field: &HeightField, x: f32, y: f32) -> Color32 {
+    const NORMAL_STEP: f32 = 0.6;
+    let gx =
+        (field.sample(x + NORMAL_STEP, y) - field.sample(x - NORMAL_STEP, y)) / (2.0 * NORMAL_STEP);
+    let gy =
+        (field.sample(x, y + NORMAL_STEP) - field.sample(x, y - NORMAL_STEP)) / (2.0 * NORMAL_STEP);
+    let normal = (0.38 * (gx + gy) / (1.0 + (gx * gx + gy * gy).sqrt())).clamp(-0.32, 0.30);
+    let occlusion = contact_occlusion(field, x, y);
+    let light = normal - 0.38 * occlusion;
+    let alpha = color.a();
+    let channel = |value: u8| {
+        let value = value as f32;
+        if light >= 0.0 {
+            (value + (alpha as f32 - value) * light).round() as u8
+        } else {
+            (value * (1.0 + light)).round() as u8
+        }
+    };
+    Color32::from_rgba_premultiplied(
+        channel(color.r()),
+        channel(color.g()),
+        channel(color.b()),
+        alpha,
+    )
+}
+
+fn contact_occlusion(field: &HeightField, x: f32, y: f32) -> f32 {
+    let height = field.sample(x, y);
+    let mut occlusion = 0.0f32;
+    for distance in [1.5, 3.0, 5.0] {
+        let blocker = field.sample(x - distance * 0.70710677, y - distance * 0.70710677);
+        let obstruction = ((blocker - height - distance * 0.45) / LAYER_HEIGHT).clamp(0.0, 1.0);
+        occlusion = occlusion.max(obstruction * (1.0 - distance / 8.0));
+    }
+    occlusion
 }
 
 fn shaded(color: Color32, shade: f32) -> Color32 {
@@ -130,8 +258,6 @@ pub struct RenderEntry {
     pub id: usize,
     pub rect: Rect,
     pub color: Color32,
-    // Reuses the existing alignment padding: no per-file size increase.
-    pub platform: u32,
 }
 
 pub struct RenderRaster {
@@ -224,9 +350,7 @@ impl RenderMap {
             }
             by_id[entry.id] = index as u32;
         }
-        let mut base = rasterize(
-            &entries, &platforms, &by_id, bounds, size, token, generation,
-        )?;
+        let mut base = rasterize(&entries, &platforms, bounds, size, token, generation)?;
         let image = base.image.take();
         Some(Self {
             image,
@@ -332,7 +456,6 @@ impl RenderMap {
         rasterize(
             &self.entries,
             &self.platforms,
-            &self.by_id,
             view,
             size,
             token,
@@ -380,7 +503,6 @@ pub fn logical_pixel_size(bounds: Rect, requested: [usize; 2]) -> f32 {
 fn rasterize(
     entries: &[RenderEntry],
     platforms: &[Platform],
-    by_id: &[u32],
     view: Rect,
     requested: [usize; 2],
     token: &AtomicU64,
@@ -487,16 +609,7 @@ fn rasterize(
                         let world_x = view.x + (x as f32 + 0.5) / sx;
                         if let Some(color) = platform.sample(world_x, world_y) {
                             let pixel = &mut pixels[(y - band * BAND_ROWS) * width + x];
-                            let inverse = 255 - color.a() as u16;
-                            let blend = |front: u8, back: u8| {
-                                (front as u16 + (back as u16 * inverse + 127) / 255).min(255) as u8
-                            };
-                            *pixel = Color32::from_rgba_premultiplied(
-                                blend(color.r(), pixel.r()),
-                                blend(color.g(), pixel.g()),
-                                blend(color.b(), pixel.b()),
-                                255,
-                            );
+                            *pixel = color;
                         }
                     }
                 }
@@ -515,102 +628,29 @@ fn rasterize(
                     owners[start..end].fill(draw.id);
                 }
             }
-            // Readable chamfer bands modulate this plane's file material;
-            // their width never creates an empty rim or changes ownership.
-            // Four non-overlapping edge strips keep the work O(perimeter).
-            for (platform, _) in platforms {
-                if platform.id == NONE {
-                    continue;
-                }
+        });
+    if cancelled(token, generation) {
+        return None;
+    }
+    if !platforms.is_empty() {
+        let field = HeightField::build(platforms, view, size, token, generation)?;
+        pixels
+            .par_chunks_mut(width)
+            .enumerate()
+            .for_each(|(y, row)| {
                 if cancelled(token, generation) {
                     return;
                 }
-                let top = platform.top;
-                let bevel = platform.bevel;
-                let shadow = SHADOW_WIDTH.min(top.w.min(top.h) * 0.1);
-                let strips = [
-                    Rect { h: bevel, ..top },
-                    Rect {
-                        y: top.y + top.h - shadow,
-                        h: shadow,
-                        ..top
-                    },
-                    Rect {
-                        y: top.y + bevel,
-                        w: bevel,
-                        h: top.h - bevel - shadow,
-                        ..top
-                    },
-                    Rect {
-                        x: top.x + top.w - shadow,
-                        y: top.y + bevel,
-                        w: shadow,
-                        h: top.h - bevel - shadow,
-                    },
-                ];
-                for strip in strips {
-                    let x0 = (((strip.x - view.x) * sx).floor().max(0.0) as usize).min(width);
-                    let x1 =
-                        ((((strip.x + strip.w) - view.x) * sx).ceil().max(0.0) as usize).min(width);
-                    let y0 = (((strip.y - view.y) * sy).floor().max(0.0) as usize)
-                        .max(band * BAND_ROWS)
-                        .min(height);
-                    let y1 = ((((strip.y + strip.h) - view.y) * sy).ceil().max(0.0) as usize)
-                        .min((band + 1) * BAND_ROWS)
-                        .min(height);
-                    for y in y0..y1 {
-                        let py0 = view.y + y as f32 / sy;
-                        let py1 = py0 + 1.0 / sy;
-                        let lo_y = py0.max(strip.y);
-                        let hi_y = py1.min(strip.y + strip.h);
-                        let world_y = (lo_y + hi_y) * 0.5;
-                        let coverage_y = ((hi_y - lo_y) * sy).clamp(0.0, 1.0);
-                        for x in x0..x1 {
-                            let index = (y - band * BAND_ROWS) * width + x;
-                            let owner = owners[index];
-                            if owner == NONE {
-                                continue;
-                            }
-                            let entry = by_id[owner as usize];
-                            if entry == NONE || entries[entry as usize].platform != platform.id {
-                                continue;
-                            }
-                            let px0 = view.x + x as f32 / sx;
-                            let px1 = px0 + 1.0 / sx;
-                            let lo_x = px0.max(strip.x);
-                            let hi_x = px1.min(strip.x + strip.w);
-                            let world_x = (lo_x + hi_x) * 0.5;
-                            let coverage = coverage_y * ((hi_x - lo_x) * sx).clamp(0.0, 1.0);
-                            let smooth = |distance: f32, width: f32| {
-                                let t = (1.0 - distance / width).clamp(0.0, 1.0);
-                                t * t * (3.0 - 2.0 * t)
-                            };
-                            let light = (0.25 * smooth(world_y - top.y, bevel)
-                                + 0.10 * smooth(world_x - top.x, bevel)
-                                - 0.18 * smooth(top.y + top.h - world_y, shadow)
-                                - 0.12 * smooth(top.x + top.w - world_x, shadow))
-                                * coverage;
-                            let pixel = &mut pixels[index];
-                            let alpha = pixel.a();
-                            let channel = |value: u8| {
-                                let value = value as f32;
-                                if light >= 0.0 {
-                                    (value + (alpha as f32 - value) * light).round() as u8
-                                } else {
-                                    (value * (1.0 + light)).round() as u8
-                                }
-                            };
-                            *pixel = Color32::from_rgba_premultiplied(
-                                channel(pixel.r()),
-                                channel(pixel.g()),
-                                channel(pixel.b()),
-                                alpha,
-                            );
-                        }
+                let world_y = view.y + (y as f32 + 0.5) / sy;
+                for (x, pixel) in row.iter_mut().enumerate() {
+                    if *pixel == BACKGROUND && owners[y * width + x] == NONE {
+                        continue;
                     }
+                    let world_x = view.x + (x as f32 + 0.5) / sx;
+                    *pixel = illuminate(*pixel, &field, world_x, world_y);
                 }
-            }
-        });
+            });
+    }
     if cancelled(token, generation) {
         return None;
     }
@@ -634,139 +674,128 @@ mod tests {
                 id: 0,
                 rect: rect(0.0, 0.0, 50.0, 100.0),
                 color: Color32::RED,
-                platform: NONE,
             },
             RenderEntry {
                 id: 1,
                 rect: rect(50.0, 0.0, 49.999, 100.0),
                 color: Color32::BLUE,
-                platform: NONE,
             },
             RenderEntry {
                 id: 2,
                 rect: rect(99.999, 0.0, 0.001, 100.0),
                 color: Color32::GREEN,
-                platform: NONE,
             },
         ]
     }
     #[test]
-    fn platform_shoulders_and_sides_are_material_without_file_owners() {
+    fn shared_height_preserves_parent_edges_and_file_ownership() {
         let token = AtomicU64::new(1);
-        let platform = Platform::new(
-            rect(0.0, 0.0, 100.0, 100.0),
-            Color32::from_rgb(70, 145, 150),
-            0,
-            0.5,
-        )
-        .unwrap();
+        let parent = Platform::new(rect(0.0, 0.0, 100.0, 100.0), Color32::GRAY, 0, 0.5).unwrap();
+        let child = Platform::new(parent.top, Color32::GRAY, 1, 0.5).unwrap();
         let entry = RenderEntry {
             id: 0,
-            rect: rect(
-                platform.top.x + 2.0,
-                platform.top.y + 2.0,
-                platform.top.w - 4.0,
-                platform.top.h - 4.0,
-            ),
-            color: platform.color,
-            platform: NONE,
-        };
-        let mut map = RenderMap::build_with_platforms(
-            vec![entry],
-            vec![platform],
-            platform.bounds,
-            [200, 200],
-            &token,
-            1,
-        )
-        .unwrap();
-        assert_eq!(
-            map.hit_test(platform.top.x + 0.5, platform.top.y + 0.5),
-            None
-        );
-        assert_eq!(
-            map.hit_test(50.0, platform.top.y + platform.top.h + platform.rise * 0.5),
-            None
-        );
-        assert_eq!(map.hit_test(50.0, 50.0), Some(0));
-        let highlight = platform
-            .sample(platform.top.x + 5.0, platform.top.y + 0.1)
-            .unwrap();
-        let side = platform
-            .sample(50.0, platform.top.y + platform.top.h + platform.rise * 0.5)
-            .unwrap();
-        assert!(highlight.g() > side.g() + 40);
-        let before = map.image.as_ref().unwrap().pixels.clone();
-        let holes = map.erase(0);
-        assert_eq!(map.hit_test(50.0, 50.0), None);
-        assert!(!holes.is_empty());
-        assert!(
-            holes
-                .iter()
-                .all(|hole| hole.x >= entry.rect.x - 0.5 && hole.y >= entry.rect.y - 0.5)
-        );
-        assert_eq!(map.image.as_ref().unwrap().pixels, before);
-    }
-
-    #[test]
-    fn file_covered_terminal_top_keeps_chamfer_light_without_an_empty_rim() {
-        let token = AtomicU64::new(1);
-        let mut platform = Platform::new(
-            rect(0.0, 0.0, 100.0, 100.0),
-            Color32::from_rgb(70, 145, 150),
-            0,
-            0.5,
-        )
-        .unwrap();
-        platform.id = 0;
-        let entry = RenderEntry {
-            id: 0,
-            rect: platform.top,
-            color: platform.color,
-            platform: 0,
+            rect: child.top,
+            color: Color32::from_rgb(70, 145, 150),
         };
         let map = RenderMap::build_with_platforms(
             vec![entry],
-            vec![platform],
-            platform.bounds,
+            vec![parent, child],
+            parent.bounds,
             [200, 200],
             &token,
             1,
         )
         .unwrap();
-        let files_only =
-            RenderMap::build_with_size(vec![entry], platform.bounds, [200, 200], &token, 1)
-                .unwrap();
-        let top = platform.top;
-        let mut lit_pixels = 0;
-        let mut shadow_pixels = 0;
+        let plain =
+            RenderMap::build_with_size(vec![entry], parent.bounds, [200, 200], &token, 1).unwrap();
+        let field =
+            HeightField::build(&[parent, child], parent.bounds, [200, 200], &token, 1).unwrap();
+        let only_child =
+            HeightField::build(&[child], parent.bounds, [200, 200], &token, 1).unwrap();
+        assert!(field.sample(1.0, 50.0) > only_child.sample(1.0, 50.0));
         for y in 0..200 {
             for x in 0..200 {
-                let (px, py) = ((x as f32 + 0.5) * 0.5, (y as f32 + 0.5) * 0.5);
-                if px >= top.x && px < top.x + top.w && py >= top.y && py < top.y + top.h {
-                    assert_eq!(map.hit_test(px, py), Some(0));
-                    let actual = map.image.as_ref().unwrap().pixels[y * 200 + x];
-                    let plain = files_only.image.as_ref().unwrap().pixels[y * 200 + x];
-                    if px - 0.25 >= top.x + platform.bevel
-                        && py - 0.25 >= top.y + platform.bevel
-                        && px + 0.25 <= top.x + top.w - SHADOW_WIDTH
-                        && py + 0.25 <= top.y + top.h - SHADOW_WIDTH
-                    {
-                        assert_eq!(actual, plain);
-                    } else {
-                        lit_pixels += usize::from(actual.g() > plain.g());
-                        shadow_pixels += usize::from(actual.g() < plain.g());
-                    }
+                assert_eq!(map.base.owners[y * 200 + x], plain.base.owners[y * 200 + x]);
+            }
+        }
+        let pixels = &map.image.as_ref().unwrap().pixels;
+        let base = &plain.image.as_ref().unwrap().pixels;
+        assert!(pixels[100 * 200 + 3].g() > base[100 * 200 + 3].g());
+        assert!(pixels[100 * 200 + 195].g() < base[100 * 200 + 195].g());
+        assert!(pixels[194 * 200 + 100].g() < base[194 * 200 + 100].g());
+        assert_eq!(pixels[100 * 200 + 100], base[100 * 200 + 100]);
+        assert!(field.values.len() <= (MAX_SIDE + 52) * (MAX_SIDE + 52));
+    }
+
+    #[test]
+    fn contact_shadow_falls_on_lower_material_and_never_on_the_higher_plane() {
+        let token = AtomicU64::new(1);
+        let child = Platform::new(rect(20.0, 20.0, 50.0, 50.0), Color32::GRAY, 0, 0.5).unwrap();
+        let field = HeightField::build(
+            &[child],
+            rect(0.0, 0.0, 100.0, 100.0),
+            [200, 200],
+            &token,
+            1,
+        )
+        .unwrap();
+        let color = Color32::from_rgb(100, 140, 150);
+        assert!(illuminate(color, &field, 70.25, 55.0).g() < color.g());
+        assert!(illuminate(color, &field, 55.0, 70.25).g() < color.g());
+        // Test occlusion independently from the bevel's dark-facing normal.
+        assert!(contact_occlusion(&field, 70.25, 55.0) > 0.0);
+        assert!(contact_occlusion(&field, 55.0, 70.25) > 0.0);
+        assert_eq!(contact_occlusion(&field, 20.25, 55.0), 0.0);
+        assert_eq!(contact_occlusion(&field, 55.0, 20.25), 0.0);
+        assert_eq!(illuminate(color, &field, 55.0, 55.0), color);
+        assert_eq!(illuminate(color, &field, 80.0, 80.0), color);
+    }
+
+    #[test]
+    fn elevation_halo_keeps_crop_band_and_hidpi_world_lighting_consistent() {
+        let token = AtomicU64::new(1);
+        let platform =
+            Platform::new(rect(20.0, 120.0, 100.0, 100.0), Color32::GRAY, 0, 0.5).unwrap();
+        let bounds = rect(0.0, 0.0, 180.0, 300.0);
+        let full = HeightField::build(&[platform], bounds, [180, 300], &token, 1).unwrap();
+        let crop = HeightField::build(
+            &[platform],
+            rect(19.0, 122.0, 20.0, 30.0),
+            [20, 30],
+            &token,
+            1,
+        )
+        .unwrap();
+        let hidpi = HeightField::build(&[platform], bounds, [360, 600], &token, 1).unwrap();
+        let color = Color32::from_rgb(70, 145, 150);
+        for y in 0..30 {
+            for x in 0..20 {
+                let wx = 19.5 + x as f32;
+                let wy = 122.5 + y as f32;
+                let a = illuminate(color, &full, wx, wy);
+                assert_eq!(a, illuminate(color, &crop, wx, wy));
+                let b = illuminate(color, &hidpi, wx, wy);
+                for (a, b) in a.to_array().into_iter().zip(b.to_array()) {
+                    assert!(
+                        (a as i16 - b as i16).abs() <= 16,
+                        "HiDPI light mismatch at {wx},{wy}: {a} {b}"
+                    );
                 }
             }
         }
-        assert!(lit_pixels > 100 && shadow_pixels > 100);
-        assert_eq!(
-            map.hit_test(50.0, top.y + top.h + platform.rise * 0.5),
-            None
-        );
-        let side_pixel = ((top.y + top.h + platform.rise * 0.5) * 2.0) as usize * 200 + 100;
-        assert_ne!(map.image.as_ref().unwrap().pixels[side_pixel], BACKGROUND);
+        for (view, size) in [
+            (rect(0.0, 0.0, 2048.0, 2048.0), [2048, 2048]),
+            (rect(0.0, 0.0, 512.0, 512.0), [2048, 2048]),
+            (rect(20.0, 120.0, 0.01, 0.01), [2048, 2048]),
+        ] {
+            let field = HeightField::build(&[platform], view, size, &token, 1).unwrap();
+            assert!(field.values.len() <= (MAX_SIDE + 52) * (MAX_SIDE + 52));
+            eprintln!(
+                "height buffer: world={view:?} pixels={size:?} height={:?} bytes={}",
+                field.size,
+                field.values.len() * std::mem::size_of::<f32>()
+            );
+        }
     }
 
     #[test]
@@ -814,7 +843,6 @@ mod tests {
                 id: 0,
                 rect: rect(0.0, 0.0, 2048.0, 2048.0),
                 color: Color32::RED,
-                platform: NONE,
             }],
             rect(0.0, 0.0, 2048.0, 2048.0),
             [2048, 2048],
@@ -856,13 +884,11 @@ mod tests {
                 id: 0,
                 rect: rect(0.0, 0.0, 50.0, 100.0),
                 color: base,
-                platform: NONE,
             },
             RenderEntry {
                 id: 1,
                 rect: rect(50.0, 0.0, 50.0, 100.0),
                 color: base,
-                platform: NONE,
             },
         ];
         let map = RenderMap::build(entries, rect(0.0, 0.0, 100.0, 100.0), &token, 1).unwrap();
@@ -922,7 +948,6 @@ mod tests {
                     id,
                     rect,
                     color: Color32::from_rgb(65, 143, 151),
-                    platform: NONE,
                 })
                 .collect();
             let map = RenderMap::build_with_size(entries, bounds, size, &token, 1).unwrap();
@@ -940,7 +965,6 @@ mod tests {
                 id: 0,
                 rect: rect(0.0, 0.0, 64.0, 300.0),
                 color: Color32::from_rgb(65, 143, 151),
-                platform: NONE,
             }],
             rect(0.0, 0.0, 64.0, 300.0),
             &token,
@@ -1009,7 +1033,6 @@ mod tests {
                 } else {
                     Color32::GREEN
                 },
-                platform: NONE,
             })
             .collect();
         let token = AtomicU64::new(1);
