@@ -161,7 +161,9 @@ fn show_file_tooltip(
     file: &scan::FileEntry,
 ) -> Option<egui::InnerResponse<()>> {
     let width = (response.ctx.content_rect().width() - 32.0).clamp(1.0, 420.0);
-    egui::Tooltip::for_enabled(response)
+    // The treemap hit test already gates this call on the hovered file.
+    // Skip the standard tooltip delay so moving across files updates immediately.
+    egui::Tooltip::for_widget(response)
         .at_pointer()
         .width(width)
         .show(|ui| file_tooltip(ui, file))
@@ -1125,7 +1127,16 @@ impl App {
                         let count = data.errors.len();
                         if count > 0
                             && ui
-                                .small_button(format!("无法读取的路径（{count}）"))
+                                .add(
+                                    egui::Button::new(
+                                        RichText::new(format!("无法读取的路径（{count}）"))
+                                            .small()
+                                            .color(MUTED),
+                                    )
+                                    .small()
+                                    .frame_when_inactive(false),
+                                )
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
                                 .clicked()
                         {
                             self.show_errors = true;
@@ -1196,9 +1207,12 @@ impl App {
             self.load_recoveries();
         }
         egui::TopBottomPanel::top("toolbar")
-            .exact_height(68.0)
             .frame(egui::Frame::new().fill(PANEL).inner_margin(16.0))
             .show(ctx, |ui| {
+                let padding = ui.spacing().button_padding;
+                let control_height =
+                    ui.text_style_height(&egui::TextStyle::Button) + 2.0 * padding.y;
+                ui.spacing_mut().interact_size.y = control_height;
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(self.job.is_none(), egui::Button::new("重新扫描"))
@@ -1230,6 +1244,51 @@ impl App {
                             self.load_recoveries();
                         }
                     }
+                    if let Some(data) = &self.data {
+                        let count = format!("{} 个文件", data.files.len());
+                        let total = if self.totals_ready {
+                            bytes(self.total_bytes)
+                        } else {
+                            "统计中…".into()
+                        };
+                        let font = egui::TextStyle::Body.resolve(ui.style());
+                        let text_width = |text: &str| {
+                            ui.painter()
+                                .layout_no_wrap(text.into(), font.clone(), TEXT)
+                                .size()
+                                .x
+                        };
+                        let gap = ui.spacing().item_spacing.x;
+                        let summary_width = text_width(&count) + gap + text_width(&total);
+                        let clear_width = text_width("清除") + 2.0 * padding.x;
+                        let search_width =
+                            (ui.available_width() - summary_width - clear_width - 2.0 * gap)
+                                .clamp(80.0, 360.0);
+                        let response = ui.add_sized(
+                            [search_width, control_height],
+                            egui::TextEdit::singleline(&mut self.query)
+                                .hint_text("搜索文件列表")
+                                .margin(padding)
+                                .desired_width(search_width),
+                        );
+                        if response.changed() {
+                            self.dirty = true;
+                        }
+                        if ui
+                            .add_enabled(!self.query.is_empty(), egui::Button::new("清除"))
+                            .clicked()
+                        {
+                            self.query.clear();
+                            self.dirty = true;
+                        }
+                        let spare = ui.available_width() - summary_width;
+                        if spare > gap {
+                            ui.add_space(spare);
+                        }
+                        ui.label(count);
+                        ui.label(RichText::new(total).strong().color(ACCENT))
+                            .on_hover_text("文件逻辑大小");
+                    }
                 });
             });
         self.filter();
@@ -1256,44 +1315,6 @@ impl App {
             self.overlays(ctx);
             return;
         }
-        egui::TopBottomPanel::top("navigation")
-            .exact_height(66.0)
-            .frame(egui::Frame::new().fill(BG).inner_margin(16.0))
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.query)
-                            .hint_text("搜索文件列表")
-                            .desired_width(260.0),
-                    );
-                    if response.changed() {
-                        self.dirty = true;
-                    }
-                    if ui
-                        .add_enabled(!self.query.is_empty(), egui::Button::new("清除"))
-                        .clicked()
-                    {
-                        self.query.clear();
-                        self.dirty = true;
-                    }
-                    ui.separator();
-                    ui.label(format!(
-                        "{} 个文件",
-                        self.data.as_ref().unwrap().files.len()
-                    ));
-                    ui.label(
-                        RichText::new(if self.totals_ready {
-                            bytes(self.total_bytes)
-                        } else {
-                            "统计中…".into()
-                        })
-                        .strong()
-                        .color(ACCENT),
-                    )
-                    .on_hover_text("文件逻辑大小");
-                });
-            });
-        self.filter();
         let mut reveal = None;
         let mut trash = None;
         let mut restore = None;
@@ -2240,10 +2261,70 @@ mod tests {
     }
 
     #[test]
+    fn treemap_tooltip_opens_on_entry_and_updates_while_pointer_moves() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut data = snapshot();
+        for file in &mut data.files {
+            file.size = 100;
+        }
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.data = Some(Arc::new(data));
+        settle(&mut app, &ctx);
+        let canvas = app.canvas_rect.unwrap();
+        let points: Vec<_> = {
+            let map = &app.map_cache.as_ref().unwrap().map;
+            (0..2)
+                .map(|index| {
+                    let rect = map.rect(index).unwrap();
+                    canvas.min
+                        + Vec2::new(
+                            (rect.x + rect.w * 0.5) * canvas.width() / map.bounds.w,
+                            (rect.y + rect.h * 0.5) * canvas.height() / map.bounds.h,
+                        )
+                })
+                .collect()
+        };
+        let start = ctx.input(|input| input.time);
+        for (step, point) in points.into_iter().enumerate() {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1180.0, 780.0),
+                )),
+                time: Some(start + (step + 1) as f64 * 0.01),
+                events: vec![egui::Event::PointerMoved(point)],
+                ..Default::default()
+            };
+            let mut output = ctx.run(input.clone(), |ctx| app.ui(ctx));
+            if step == 0 {
+                // egui measures a newly opened tooltip in an invisible sizing pass,
+                // then requests an immediate repaint; no hover dwell is needed.
+                assert_eq!(
+                    output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+                    Duration::ZERO
+                );
+                output = ctx.run(
+                    egui::RawInput {
+                        time: Some(start + 0.011),
+                        events: vec![],
+                        ..input
+                    },
+                    |ctx| app.ui(ctx),
+                );
+            }
+            let path = app.data.as_ref().unwrap().files[step]
+                .path
+                .to_string_lossy();
+            text_shape(&output, &path);
+        }
+    }
+
+    #[test]
     fn hover_near_right_edge_keeps_a_readable_full_text_tooltip_on_screen() {
         let ctx = egui::Context::default();
         configure(&ctx);
-        ctx.style_mut(|style| style.interaction.tooltip_delay = 0.0);
         let mut file = snapshot().files.remove(0);
         file.path = format!("/Users/Corwin/Downloads/{}.pdf", "长文件名".repeat(30)).into();
         let mut last = None;
