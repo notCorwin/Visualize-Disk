@@ -92,7 +92,7 @@ pub fn layout(
     let mut platforms = Vec::new();
     // Iterative breadth-first publication paints a whole parent before its
     // children. Unary paths do not consume shoulder space or extra elevation.
-    let mut pending = vec![(0, bounds, None::<(Color32, u8, u32)>)];
+    let mut pending = vec![(0, bounds, None::<(u8, u32)>)];
     while !pending.is_empty() {
         if cancelled() {
             return None;
@@ -107,19 +107,19 @@ pub fn layout(
                 let below_root = directory
                     .path
                     .is_some_and(|path| path != root && path.starts_with(root));
-                let (base_color, depth, inherited_platform) = inherited
-                    .unwrap_or_else(|| (crate::color(directory.path.unwrap_or(root)), 0, u32::MAX));
+                let (depth, inherited_platform) = inherited.unwrap_or((0, u32::MAX));
+                let file_color = crate::color(directory.path.unwrap_or(root));
                 let factor = 1.0 + (depth as f32 * 0.035).min(0.14);
                 let channel = |v: u8| (v as f32 * factor).min(255.0) as u8;
-                let color = Color32::from_rgb(
-                    channel(base_color.r()),
-                    channel(base_color.g()),
-                    channel(base_color.b()),
+                let platform_color = Color32::from_rgb(
+                    channel(crate::PANEL.r()),
+                    channel(crate::PANEL.g()),
+                    channel(crate::PANEL.b()),
                 );
 
                 let unary = directory.children.len() == 1 && directory.files.is_empty();
                 let platform = (below_root && !unary)
-                    .then(|| Platform::new(bounds, color, depth, pixel_size))
+                    .then(|| Platform::new(bounds, platform_color, depth, pixel_size))
                     .flatten()
                     .map(|mut platform| {
                         platform.id = id as u32;
@@ -131,7 +131,6 @@ pub fn layout(
                 let active_platform = platform.map_or(inherited_platform, |platform| platform.id);
                 let family = if below_root {
                     Some((
-                        base_color,
                         depth.saturating_add(u8::from(platform.is_some())),
                         active_platform,
                     ))
@@ -165,7 +164,7 @@ pub fn layout(
                         files.push(RenderEntry {
                             id: directory.files[slot - child_count].0,
                             rect,
-                            color,
+                            color: file_color,
                             platform: active_platform,
                         });
                     }
@@ -207,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn children_share_parent_material_and_fit_inside_weighted_platforms() {
+    fn files_use_their_direct_parent_palette_and_fit_inside_weighted_platforms() {
         let token = AtomicU64::new(1);
         let scene = layout(
             BTreeMap::from([
@@ -225,15 +224,29 @@ mod tests {
         assert_eq!(scene.entries.len(), 4);
         assert_eq!(scene.platforms.len(), 3);
         let file = |id| scene.entries.iter().find(|entry| entry.id == id).unwrap();
-        assert!(file(1).color.r() >= file(0).color.r());
+        assert_eq!(file(0).color, crate::color(Path::new("/a")));
+        assert_eq!(file(1).color, crate::color(Path::new("/a/nested")));
         assert_eq!(file(1).color, file(2).color);
-        assert_ne!(file(0).color, file(3).color);
+        assert_eq!(file(3).color, crate::color(Path::new("/b")));
+        let focused = layout(
+            BTreeMap::from([
+                (Path::new("/a"), vec![(0, 10)]),
+                (Path::new("/a/nested"), vec![(1, 10), (2, 20)]),
+            ]),
+            Path::new("/a"),
+            bounds(),
+            1.0,
+            &token,
+            1,
+        )
+        .unwrap();
+        for entry in &focused.entries {
+            assert_eq!(entry.color, file(entry.id).color);
+        }
         let parent = scene
             .platforms
             .iter()
-            .find(|p| {
-                p.color == file(0).color && (area(p.bounds) - area(bounds()) * 0.5).abs() < 0.1
-            })
+            .find(|p| (area(p.bounds) - area(bounds()) * 0.5).abs() < 0.1)
             .unwrap();
         let nested = scene
             .platforms
@@ -281,6 +294,8 @@ mod tests {
             );
         }
         for id in 0..4 {
+            let parent = ["/a", "/a/nested", "/a/nested", "/b"][id];
+            assert_eq!(map.color(id), Some(crate::color(Path::new(parent))));
             let r = map.rect(id).unwrap();
             assert_eq!(map.hit_test(r.x + r.w * 0.5, r.y + r.h * 0.5), Some(id));
         }
