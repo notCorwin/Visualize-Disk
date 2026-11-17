@@ -1476,16 +1476,24 @@ impl Drop for App {
         }
     }
 }
+fn native_options() -> eframe::Result<eframe::NativeOptions> {
+    // eframe otherwise replaces the bundle's Dock icon with its own default.
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/AppIcon.png"))
+        .map_err(|error| eframe::Error::AppCreation(Box::new(error)))?;
+    Ok(eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_icon(icon)
+            .with_inner_size([1180.0, 780.0])
+            .with_min_inner_size([860.0, 560.0]),
+        renderer: eframe::Renderer::Glow,
+        ..Default::default()
+    })
+}
+
 fn main() -> eframe::Result {
     eframe::run_native(
         "Visualize SSD",
-        eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_inner_size([1180.0, 780.0])
-                .with_min_inner_size([860.0, 560.0]),
-            renderer: eframe::Renderer::Glow,
-            ..Default::default()
-        },
+        native_options()?,
         Box::new(move |cc| {
             configure(&cc.egui_ctx);
             let mut app = App::default();
@@ -1498,6 +1506,22 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_uses_selected_transparent_artwork_as_runtime_icon() {
+        let options = native_options().unwrap();
+        let icon = options
+            .viewport
+            .icon
+            .expect("custom runtime icon must be set");
+        let selected =
+            eframe::icon_data::from_png_bytes(include_bytes!("../assets/AppIcon.png")).unwrap();
+        assert_eq!(*icon, selected);
+        assert_ne!(*icon, egui::IconData::default());
+        assert_eq!(icon.width, icon.height);
+        assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 0));
+        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] == 255));
+    }
     fn snapshot() -> scan::ScanResult {
         scan::ScanResult {
             root: "/".into(),

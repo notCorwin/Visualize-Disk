@@ -27,6 +27,9 @@ cp "$BINARY" "$BUNDLE/Contents/MacOS/visualize-ssd"
 cp "$ROOT/assets/Info.plist" "$BUNDLE/Contents/Info.plist"
 cp "$ROOT/assets/AppIcon.icns" "$BUNDLE/Contents/Resources/AppIcon.icns"
 printf 'APPL????' > "$BUNDLE/Contents/PkgInfo"
+# LaunchServices uses the bundle modification date to invalidate icon metadata.
+# The reusable build directory otherwise retains its first-build timestamp.
+touch "$BUNDLE"
 /usr/bin/plutil -lint "$BUNDLE/Contents/Info.plist"
 # A certificate-backed designated requirement preserves Full Disk Access across
 # rebuilds. Ad-hoc signatures are tied to a changing executable hash.
@@ -79,10 +82,10 @@ if [[ "$INSTALL" == 1 ]]; then
     # Remove only our former visible upgrade backups after the new app passes
     # verification. The current rollback bundle remains hidden until cleanup.
     shopt -s nullglob
-    LEGACY_APPS=(/Applications/Visualize\ SSD.previous.*.app)
     LSREGISTER='/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
     REMOVED=0
-    for legacy in "${LEGACY_APPS[@]}"; do
+    # Iterate the glob directly: Bash 3.2 treats an empty array as unset under -u.
+    for legacy in /Applications/Visualize\ SSD.previous.*.app; do
         if [[ -d "$legacy" && ! -L "$legacy" ]] &&
             [[ "$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$legacy/Contents/Info.plist" 2>/dev/null || true)" == 'com.visualizessd.app' ]]; then
             if [[ -x "$LSREGISTER" ]]; then
