@@ -27,20 +27,20 @@ const PANEL: Color32 = Color32::from_rgb(26, 31, 39);
 const TEXT: Color32 = Color32::from_rgb(226, 232, 239);
 const MUTED: Color32 = Color32::from_rgb(143, 158, 176);
 const ACCENT: Color32 = Color32::from_rgb(104, 196, 190);
-const PALETTE: [Color32; 12] = [
-    Color32::from_rgb(65, 143, 151),
-    Color32::from_rgb(90, 126, 178),
-    Color32::from_rgb(157, 117, 169),
-    Color32::from_rgb(177, 133, 80),
-    Color32::from_rgb(112, 151, 105),
-    Color32::from_rgb(173, 107, 111),
-    Color32::from_rgb(89, 153, 177),
-    Color32::from_rgb(131, 127, 183),
-    Color32::from_rgb(166, 151, 94),
-    Color32::from_rgb(85, 159, 135),
-    Color32::from_rgb(174, 121, 146),
-    Color32::from_rgb(124, 147, 178),
-];
+const PALETTE: [Color32; 12] = {
+    const PINE: Color32 = Color32::from_rgb(0x53, 0x7c, 0x6e);
+    const BLUE_GRAY: Color32 = Color32::from_rgb(0x66, 0x81, 0x8d);
+    const BRASS: Color32 = Color32::from_rgb(0xa4, 0x8b, 0x62);
+    const TERRACOTTA: Color32 = Color32::from_rgb(0xb4, 0x7c, 0x66);
+    const MOSS: Color32 = Color32::from_rgb(0x7c, 0x8b, 0x70);
+    const SLATE: Color32 = Color32::from_rgb(0x6c, 0x74, 0x80);
+
+    // Repeat the cooler shades so the warm accents occupy fewer hash slots.
+    [
+        PINE, BLUE_GRAY, SLATE, BRASS, MOSS, TERRACOTTA, BLUE_GRAY, SLATE, PINE, PINE, MOSS,
+        BLUE_GRAY,
+    ]
+};
 
 fn bytes(n: u64) -> String {
     let mut value = n as f64;
