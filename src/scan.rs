@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(windows)]
+mod windows_ntfs;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FileIdentity {
@@ -310,15 +312,16 @@ fn scan_directory(
     if let Some(report) = macos::scan_directory(directory, cancel, progress) {
         return report;
     }
-    scan_directory_batches(&directory.path, cancel, progress, || {})
+    scan_directory_batches(directory, cancel, progress, || {})
 }
 
 fn scan_directory_batches(
-    directory: &std::path::Path,
+    pending: &PendingDirectory,
     cancel: &AtomicBool,
     progress: &Mutex<ScanProgress>,
     after_batch: impl Fn(),
 ) -> DirectoryReport {
+    let directory = pending.path.as_path();
     let mut report = DirectoryReport::default();
     if cancel.load(Ordering::Relaxed) {
         return report;
@@ -355,6 +358,10 @@ fn scan_directory_batches(
             return report;
         }
     };
+    // Preserve Win32's directory access decision before opening the separate
+    // metadata anchor. The original iterator supplies every name.
+    #[cfg(windows)]
+    let query = windows_ntfs::DirectoryQuery::open(pending);
     let parent: Arc<Path> = directory.into();
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -377,6 +384,13 @@ fn scan_directory_batches(
                     Ok(entry) => entry,
                     Err(error) => return EntryReport::Error(directory.to_path_buf(), error),
                 };
+                #[cfg(windows)]
+                if let Some(entry) = query
+                    .as_ref()
+                    .and_then(|query| query.entry(&entry, &parent))
+                {
+                    return entry;
+                }
                 scan_entry(entry.path(), &parent)
             })
             .collect();
@@ -866,7 +880,7 @@ mod tests {
         let portable_progress = Mutex::new(ScanProgress::default());
         let bulk = macos::scan_directory(&pending, &cancel, &native_progress)
             .expect("native enumeration should work on the temporary filesystem");
-        let portable = scan_directory_batches(&temp.0, &cancel, &portable_progress, || {});
+        let portable = scan_directory_batches(&pending, &cancel, &portable_progress, || {});
         let files = |report: DirectoryReport| {
             let mut files: Vec<_> = report
                 .files
@@ -924,8 +938,19 @@ mod tests {
         fs::write(&first, b"old size").unwrap();
         fs::hard_link(&first, &link).unwrap();
         // NTFS can keep the old size in the other name's directory record.
-        fs::write(&first, [0u8; 4096]).unwrap();
+        let writer = fs::OpenOptions::new().write(true).open(&first).unwrap();
+        writer.set_len(4096).unwrap();
 
+        // Verify the native query itself on supported NTFS, so fallback alone
+        // cannot make this test pass if it returns stale identity or size.
+        if let Some(file) = windows_ntfs::query_fixture_file(&link) {
+            let metadata = fs::symlink_metadata(&link).unwrap();
+            assert_eq!(file.size, 4096);
+            assert_eq!(
+                file.identity,
+                FileIdentity::from_path(&link, &metadata).unwrap()
+            );
+        }
         let result = scan(temp.0.clone(), Arc::default(), Arc::default()).unwrap();
         assert_eq!(result.skipped, 0);
         assert_eq!(result.files.len(), 2);
@@ -933,6 +958,54 @@ mod tests {
         assert_eq!(result.files[1].path, first);
         assert_eq!(result.files[0].identity, result.files[1].identity);
         assert!(result.files.iter().all(|file| file.size == 4096));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_scan_preserves_win32_name_resolution() {
+        let mut temp = Temp::new();
+        let ordinary = temp.0.clone();
+        // Keep the cleanup path verbatim even if an assertion fails.
+        temp.0 = fs::canonicalize(&ordinary).unwrap();
+        let verbatim = &temp.0;
+        fs::write(ordinary.join("file"), b"normal").unwrap();
+        fs::write(verbatim.join("file. "), b"verbatim").unwrap();
+
+        for name in [
+            "file. ",
+            "file.",
+            "NUL.txt",
+            "CoM¹.txt",
+            "LPT² .log",
+            "CONIN$",
+        ] {
+            let wide: Vec<_> = name.encode_utf16().collect();
+            assert!(windows_ntfs::requires_win32_normalization(&wide));
+        }
+        for name in ["ordinary.txt", "COM10.txt", "auxiliary.log"] {
+            let wide: Vec<_> = name.encode_utf16().collect();
+            assert!(!windows_ntfs::requires_win32_normalization(&wide));
+        }
+
+        let parent: Arc<Path> = ordinary.as_path().into();
+        let alias = ordinary.join("file. ");
+        let EntryReport::File(expected) = scan_entry(alias.clone(), &parent) else {
+            panic!("existing Windows lookup must resolve one of the two fixture files");
+        };
+        let normal = scan(ordinary, Arc::default(), Arc::default()).unwrap();
+        let actual = normal.files.iter().find(|file| file.path == alias).unwrap();
+        assert_eq!(
+            (actual.size, actual.identity),
+            (expected.size, expected.identity)
+        );
+
+        let exact = scan(verbatim.clone(), Arc::default(), Arc::default()).unwrap();
+        let literal = exact
+            .files
+            .iter()
+            .find(|file| file.path == verbatim.join("file. "))
+            .unwrap();
+        assert_eq!(literal.size, 8);
     }
 
     #[cfg(windows)]
@@ -1154,7 +1227,11 @@ mod tests {
         }
         let cancel = AtomicBool::new(false);
         let progress = Mutex::new(ScanProgress::default());
-        let report = scan_directory_batches(&temp.0, &cancel, &progress, || {
+        let pending = PendingDirectory {
+            identity: directory_identity(&temp.0).unwrap(),
+            path: temp.0.clone(),
+        };
+        let report = scan_directory_batches(&pending, &cancel, &progress, || {
             cancel.store(true, Ordering::Relaxed);
         });
         assert_eq!(report.files.len(), 512);
