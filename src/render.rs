@@ -22,9 +22,9 @@ const BEVEL_WIDTH: f32 = 3.0;
 const LAYER_HEIGHT: f32 = 4.0;
 const LIGHT_REACH: f32 = 6.0;
 const DECORATION_DECAY: f32 = 0.9;
-const FILE_SHADE_LIGHT: f64 = 1.12;
-const FILE_SHADE_X: f64 = 0.09;
-const FILE_SHADE_Y: f64 = 0.06;
+const FILE_SHADE_LIGHT: f64 = 1.20;
+const FILE_SHADE_X: f64 = 0.18;
+const FILE_SHADE_Y: f64 = 0.12;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Platform {
@@ -900,7 +900,7 @@ mod tests {
             }
         }
         assert_eq!(pixels[20 * 100 + 10], pixels[20 * 100 + 60]);
-        assert!(pixels[50 * 100 + 50].g() > pixels[50 * 100 + 49].g() + 5);
+        assert!(pixels[50 * 100 + 50].g() >= pixels[50 * 100 + 49].g() + 20);
         assert!(pixels[10 * 100 + 10].g() > pixels[90 * 100 + 40].g());
     }
     #[test]
