@@ -377,28 +377,7 @@ fn scan_directory_batches(
                     Ok(entry) => entry,
                     Err(error) => return EntryReport::Error(directory.to_path_buf(), error),
                 };
-                let path = entry.path();
-                match fs::symlink_metadata(&path) {
-                    Err(error) => EntryReport::Error(path, error),
-                    Ok(meta) if is_link_or_reparse(&meta) => EntryReport::Skipped,
-                    Ok(meta) if meta.is_dir() || meta.is_file() => {
-                        let identity = match FileIdentity::from_path(&path, &meta) {
-                            Ok(identity) => identity,
-                            Err(error) => return EntryReport::Error(path, error),
-                        };
-                        if meta.is_dir() {
-                            EntryReport::Directory(PendingDirectory { identity, path })
-                        } else {
-                            EntryReport::File(FileEntry {
-                                identity,
-                                size: meta.len(),
-                                path,
-                                parent: Arc::clone(&parent),
-                            })
-                        }
-                    }
-                    Ok(_) => EntryReport::Skipped,
-                }
+                scan_entry(entry.path(), &parent)
             })
             .collect();
         let mut delta = ScanProgress::default();
@@ -421,6 +400,51 @@ fn scan_directory_batches(
         after_batch();
     }
     report
+}
+
+fn scan_entry(path: PathBuf, parent: &Arc<Path>) -> EntryReport {
+    // Windows directory records can carry stale attributes and authorize
+    // listing independently of per-file FILE_READ_ATTRIBUTES. Read identity
+    // and current metadata from the same no-follow handle.
+    #[cfg(windows)]
+    if let Ok(file) = open_windows_metadata(&path)
+        && let Ok(metadata) = file.metadata()
+    {
+        return report_entry(path, parent, &metadata, |_, _| {
+            windows_handle_identity(&file)
+        });
+    }
+    // Preserve reparse skips and diagnostics when the Win32 metadata open
+    // fails, including entries visible by name but denied on an attribute open.
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => report_entry(path, parent, &metadata, FileIdentity::from_path),
+        Err(error) => EntryReport::Error(path, error),
+    }
+}
+
+fn report_entry(
+    path: PathBuf,
+    parent: &Arc<Path>,
+    metadata: &fs::Metadata,
+    identity: impl FnOnce(&Path, &fs::Metadata) -> std::io::Result<FileIdentity>,
+) -> EntryReport {
+    if is_link_or_reparse(metadata) || (!metadata.is_dir() && !metadata.is_file()) {
+        return EntryReport::Skipped;
+    }
+    let identity = match identity(&path, metadata) {
+        Ok(identity) => identity,
+        Err(error) => return EntryReport::Error(path, error),
+    };
+    if metadata.is_dir() {
+        EntryReport::Directory(PendingDirectory { identity, path })
+    } else {
+        EntryReport::File(FileEntry {
+            identity,
+            size: metadata.len(),
+            path,
+            parent: Arc::clone(parent),
+        })
+    }
 }
 
 fn publish(progress: &Mutex<ScanProgress>, delta: ScanProgress) {
@@ -448,31 +472,28 @@ pub fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 }
 
 #[cfg(windows)]
-fn windows_identity(
-    path: &std::path::Path,
-    expected: &fs::Metadata,
-) -> std::io::Result<FileIdentity> {
-    use std::os::windows::{
-        fs::{MetadataExt, OpenOptionsExt},
-        io::AsRawHandle,
+fn open_windows_metadata(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
-    use windows::Win32::{
-        Foundation::HANDLE,
-        Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandle,
-            GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
-        },
-    };
+    // FILE_READ_ATTRIBUTES only: scanning never requires reading file contents.
+    // Share deletion as well as reads/writes so the scan cannot block Explorer.
+    fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES.0)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .custom_flags((FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS).0)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn windows_identity(path: &Path, expected: &fs::Metadata) -> std::io::Result<FileIdentity> {
+    use std::os::windows::fs::MetadataExt;
     if is_link_or_reparse(expected) {
         return Err(std::io::ErrorKind::InvalidInput.into());
     }
-    // FILE_READ_ATTRIBUTES only: scanning never requires reading file contents.
-    // Share deletion as well as reads/writes so the scan cannot block Explorer.
-    let file = fs::OpenOptions::new()
-        .access_mode(0x80)
-        .share_mode(0x1 | 0x2 | 0x4)
-        .custom_flags(0x0020_0000 | 0x0200_0000)
-        .open(path)?;
+    let file = open_windows_metadata(path)?;
     let actual = file.metadata()?;
     if is_link_or_reparse(&actual)
         || expected.file_attributes() != actual.file_attributes()
@@ -483,6 +504,19 @@ fn windows_identity(
     {
         return Err(std::io::ErrorKind::Interrupted.into());
     }
+    windows_handle_identity(&file)
+}
+
+#[cfg(windows)]
+fn windows_handle_identity(file: &fs::File) -> std::io::Result<FileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandle,
+            GetFileInformationByHandleEx, GetVolumeInformationByHandleW,
+        },
+    };
     let mut info = FILE_ID_INFO::default();
     let result = unsafe {
         GetFileInformationByHandleEx(
@@ -877,6 +911,71 @@ mod tests {
         fs::remove_file(&first).unwrap();
         fs::rename(&second, &first).unwrap();
         assert_ne!(identity(&first), original);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_scan_reads_current_size_from_both_hard_links() {
+        let temp = Temp::new();
+        let first = temp.0.join("original");
+        let directory = temp.0.join("child");
+        fs::create_dir(&directory).unwrap();
+        let link = directory.join("hard-link");
+        fs::write(&first, b"old size").unwrap();
+        fs::hard_link(&first, &link).unwrap();
+        // NTFS can keep the old size in the other name's directory record.
+        fs::write(&first, [0u8; 4096]).unwrap();
+
+        let result = scan(temp.0.clone(), Arc::default(), Arc::default()).unwrap();
+        assert_eq!(result.skipped, 0);
+        assert_eq!(result.files.len(), 2);
+        assert_eq!(result.files[0].path, link);
+        assert_eq!(result.files[1].path, first);
+        assert_eq!(result.files[0].identity, result.files[1].identity);
+        assert!(result.files.iter().all(|file| file.size == 4096));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_scan_requires_attribute_access_for_listed_files() {
+        use std::os::windows::process::CommandExt;
+        use std::process::Command;
+
+        fn icacls(path: &Path, args: [&str; 2]) -> std::io::Result<std::process::Output> {
+            Command::new("icacls.exe")
+                .arg(path)
+                .args(args)
+                .creation_flags(0x0800_0000)
+                .output()
+        }
+
+        struct ClearReadDeny<'a>(&'a Path);
+        impl Drop for ClearReadDeny<'_> {
+            fn drop(&mut self) {
+                let _ = icacls(self.0, ["/remove:d", "*S-1-1-0"]);
+            }
+        }
+
+        let temp = Temp::new();
+        let path = temp.0.join("deny-read-attributes");
+        fs::write(&path, b"accessible directory entry").unwrap();
+        let _clear_deny = ClearReadDeny(&path);
+        let deny = icacls(&path, ["/deny", "*S-1-1-0:(RA)"]).unwrap();
+        assert!(deny.status.success(), "could not deny FILE_READ_ATTRIBUTES");
+
+        assert!(
+            fs::read_dir(&temp.0)
+                .unwrap()
+                .any(|entry| entry.unwrap().path() == path)
+        );
+        assert_eq!(
+            open_windows_metadata(&path).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let result = scan(temp.0.clone(), Arc::default(), Arc::default()).unwrap();
+        assert!(result.files.is_empty());
+        assert_eq!(result.skipped, 1);
+        assert_eq!(result.errors, [format!("{}：无访问权限", path.display())]);
     }
 
     #[cfg(windows)]
