@@ -380,7 +380,7 @@ fn destination_entry(path: std::path::PathBuf) -> Option<FileEntry> {
         return None;
     }
     Some(FileEntry {
-        parent: path.parent()?.to_path_buf(),
+        parent: path.parent()?.into(),
         size: metadata.len(),
         identity: FileIdentity::from_path(&path, &metadata).ok()?,
         path,
@@ -489,7 +489,7 @@ mod tests {
         fs::rename(&path, &destination).unwrap();
         let entry = destination_entry(destination.clone()).unwrap();
         assert_eq!(entry.path, destination);
-        assert_eq!(entry.parent, temp.0);
+        assert_eq!(entry.parent.as_ref(), temp.0);
         assert_eq!(entry.size, b"temporary fixture".len() as u64);
         assert_eq!(entry.identity, identity);
         assert!(destination_entry(temp.0.join("missing")).is_none());

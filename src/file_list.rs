@@ -341,7 +341,7 @@ mod tests {
     fn fixture(name: &str) -> FileEntry {
         FileEntry {
             path: Path::new("/data").join(name),
-            parent: "/data".into(),
+            parent: Path::new("/data").into(),
             size: 1024,
             identity: FileIdentity::default(),
         }

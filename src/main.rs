@@ -366,7 +366,7 @@ fn layout_snapshot(
                 return Err(());
             }
             groups
-                .entry(file.parent.as_path())
+                .entry(file.parent.as_ref())
                 .or_insert_with(Vec::new)
                 .push((i, file.size.max(1)));
             Ok(groups)
@@ -1593,7 +1593,7 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     #[cfg(windows)]
     #[test]
@@ -1652,19 +1652,19 @@ mod tests {
             files: vec![
                 scan::FileEntry {
                     path: "/a/empty".into(),
-                    parent: "/a".into(),
+                    parent: Path::new("/a").into(),
                     size: 0,
                     identity: scan::FileIdentity::default(),
                 },
                 scan::FileEntry {
                     path: "/a/large".into(),
-                    parent: "/a".into(),
+                    parent: Path::new("/a").into(),
                     size: 1_000_000,
                     identity: scan::FileIdentity::default(),
                 },
                 scan::FileEntry {
                     path: "/b/other".into(),
-                    parent: "/b".into(),
+                    parent: Path::new("/b").into(),
                     size: 42,
                     identity: scan::FileIdentity::default(),
                 },
@@ -2178,7 +2178,7 @@ mod tests {
         let mut app = App::default();
         let mut trashed = snapshot();
         trashed.files[1].path = "/Users/test/.Trash/large".into();
-        trashed.files[1].parent = "/Users/test/.Trash".into();
+        trashed.files[1].parent = Path::new("/Users/test/.Trash").into();
         app.data = Some(Arc::new(trashed));
         let source = app.data.clone().unwrap();
         let (tx, rx) = mpsc::channel();
@@ -2222,7 +2222,7 @@ mod tests {
         configure(&ctx);
         let mut data = snapshot();
         data.files[0].path = "/用户/文档/报告.txt".into();
-        data.files[0].parent = "/用户/文档".into();
+        data.files[0].parent = Path::new("/用户/文档").into();
         let mut app = App::default();
         app.access = permission::Access::Granted;
         app.recoveries_loaded = true;
@@ -2387,7 +2387,7 @@ mod tests {
                 .join("/"),
             "long-file-name".repeat(30)
         ));
-        data.files[0].parent = data.files[0].path.parent().unwrap().to_path_buf();
+        data.files[0].parent = data.files[0].path.parent().unwrap().into();
         let mut app = App::default();
         app.access = permission::Access::Granted;
         app.recoveries_loaded = true;
@@ -2624,7 +2624,7 @@ mod tests {
                 format!("short_{index}")
             };
             file.path = format!("/tooltip/{name}.mov").into();
-            file.parent = "/tooltip".into();
+            file.parent = Path::new("/tooltip").into();
         }
         let mut app = App::default();
         app.access = permission::Access::Granted;
@@ -2798,12 +2798,12 @@ mod tests {
                     i / 1000
                 )
                 .into(),
-                parent: format!(
+                parent: Path::new(&format!(
                     "/volume{}/folder{}/group{}",
                     i / 350000,
                     i / 100000,
                     i / 1000
-                )
+                ))
                 .into(),
                 size: (i % 10000 + 1) as u64,
                 identity: scan::FileIdentity::default(),

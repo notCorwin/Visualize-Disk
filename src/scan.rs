@@ -53,7 +53,8 @@ pub struct FileEntry {
     pub path: PathBuf,
     /// Logical file length, including sparse regions; not allocated disk blocks.
     pub size: u64,
-    pub parent: PathBuf,
+    /// Shared by entries produced by the same directory scan.
+    pub parent: Arc<Path>,
     pub identity: FileIdentity,
 }
 
@@ -136,7 +137,7 @@ pub fn scan(
     if cancel.load(Ordering::Relaxed) {
         return Err("扫描已取消。".into());
     }
-    files.par_sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+    sort_scanned_files(&mut files);
     if cancel.load(Ordering::Relaxed) {
         return Err("扫描已取消。".into());
     }
@@ -148,6 +149,45 @@ pub fn scan(
         errors,
         elapsed: started.elapsed(),
     })
+}
+
+fn sort_scanned_files(files: &mut [FileEntry]) {
+    files.par_sort_unstable_by(|a, b| {
+        b.size.cmp(&a.size).then_with(|| {
+            #[cfg(unix)]
+            {
+                compare_scanned_paths(&a.path, &b.path)
+            }
+            #[cfg(not(unix))]
+            {
+                a.path.cmp(&b.path)
+            }
+        })
+    });
+}
+
+#[cfg(unix)]
+fn compare_scanned_paths(a: &Path, b: &Path) -> std::cmp::Ordering {
+    let a = a.as_os_str().as_encoded_bytes();
+    let b = b.as_os_str().as_encoded_bytes();
+    // Every path starts with the same root, followed by single separators and
+    // ordinary directory entries. Skip common bytes in fixed-size chunks.
+    let mut offset = 0;
+    for (left, right) in a.as_chunks::<16>().0.iter().zip(b.as_chunks::<16>().0) {
+        if left != right {
+            break;
+        }
+        offset += 16;
+    }
+    for (&left, &right) in a[offset..].iter().zip(&b[offset..]) {
+        if left != right {
+            // Path ordering compares components. An ended component sorts
+            // before any continuation of that component, including a hyphen.
+            let component_byte = |byte| if byte == b'/' { 0 } else { byte };
+            return component_byte(left).cmp(&component_byte(right));
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 #[derive(Default)]
@@ -315,6 +355,7 @@ fn scan_directory_batches(
             return report;
         }
     };
+    let parent: Arc<Path> = directory.into();
     loop {
         if cancel.load(Ordering::Relaxed) {
             break;
@@ -352,7 +393,7 @@ fn scan_directory_batches(
                                 identity,
                                 size: meta.len(),
                                 path,
-                                parent: directory.to_path_buf(),
+                                parent: Arc::clone(&parent),
                             })
                         }
                     }
@@ -383,6 +424,9 @@ fn scan_directory_batches(
 }
 
 fn publish(progress: &Mutex<ScanProgress>, delta: ScanProgress) {
+    if delta.files == 0 && delta.bytes == 0 && delta.skipped == 0 {
+        return;
+    }
     let mut state = progress.lock().unwrap_or_else(|e| e.into_inner());
     state.files = state.files.saturating_add(delta.files);
     state.bytes = state.bytes.saturating_add(delta.bytes);
@@ -718,10 +762,38 @@ mod tests {
                     .unwrap()
             );
         }
-        assert_eq!(result.files[0].parent, temp.0.join("child"));
+        assert_eq!(result.files[0].parent.as_ref(), temp.0.join("child"));
+        assert!(Arc::ptr_eq(
+            &result.files[1].parent,
+            &result.files[2].parent
+        ));
         assert_eq!(result.skipped, 0);
         assert_eq!(progress.lock().unwrap().bytes, 13);
         assert_eq!(progress.lock().unwrap().files, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scanned_path_order_matches_component_order() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = Path::new("./parent//./long-common-directory-prefix");
+        let paths = [
+            b"a/file".as_slice(),
+            b"a-b/file",
+            b"a.b/file",
+            b"a0/file",
+            b"ancestor/child/file-a",
+            b"ancestor/child/file",
+            b"ancestor/file",
+            b"ancestor/\xff",
+        ]
+        .map(|bytes| root.join(std::ffi::OsStr::from_bytes(bytes)));
+        for a in &paths {
+            for b in &paths {
+                assert_eq!(compare_scanned_paths(a, b), a.cmp(b), "{a:?} and {b:?}");
+            }
+        }
     }
 
     #[cfg(unix)]

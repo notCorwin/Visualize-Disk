@@ -15,8 +15,8 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 // Darwin's <sys/attr.h>, <sys/stat.h>, and <sys/vnode.h>, respectively.
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
@@ -138,6 +138,7 @@ fn read_batch(
     if count < 0 {
         return Err(io::Error::last_os_error());
     }
+    let mut parent = report.files.first().map(|file| Arc::clone(&file.parent));
     for _ in 0..count {
         if cancel.load(Ordering::Relaxed) {
             break;
@@ -151,7 +152,7 @@ fn read_batch(
                 delta.bytes = delta.bytes.saturating_add(size);
                 report.files.push(FileEntry {
                     path: child_path(directory, entry.name),
-                    parent: directory.to_path_buf(),
+                    parent: Arc::clone(parent.get_or_insert_with(|| Arc::from(directory))),
                     size,
                     identity,
                 });
