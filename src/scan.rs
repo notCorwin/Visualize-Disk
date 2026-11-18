@@ -937,7 +937,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_scan_requires_attribute_access_for_listed_files() {
+    fn windows_scan_matches_legacy_attribute_access_for_restricted_files() {
         use std::os::windows::process::CommandExt;
         use std::process::Command;
 
@@ -957,11 +957,11 @@ mod tests {
         }
 
         let temp = Temp::new();
-        let path = temp.0.join("deny-read-attributes");
+        let path = temp.0.join("restricted-file");
         fs::write(&path, b"accessible directory entry").unwrap();
         let _clear_deny = ClearReadDeny(&path);
-        let deny = icacls(&path, ["/deny", "*S-1-1-0:(RA)"]).unwrap();
-        assert!(deny.status.success(), "could not deny FILE_READ_ATTRIBUTES");
+        let deny = icacls(&path, ["/deny", "*S-1-1-0:(RD,RA)"]).unwrap();
+        assert!(deny.status.success(), "could not set the file's deny ACE");
 
         assert!(
             fs::read_dir(&temp.0)
@@ -969,13 +969,32 @@ mod tests {
                 .any(|entry| entry.unwrap().path() == path)
         );
         assert_eq!(
-            open_windows_metadata(&path).unwrap_err().kind(),
+            fs::File::open(&path).unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied
         );
+
+        // An attributes-only handle can still succeed under some Windows
+        // tokens. The independent content-read check above verifies the fixture.
+        let legacy = fs::symlink_metadata(&path).and_then(|metadata| {
+            FileIdentity::from_path(&path, &metadata).map(|identity| (metadata.len(), identity))
+        });
         let result = scan(temp.0.clone(), Arc::default(), Arc::default()).unwrap();
-        assert!(result.files.is_empty());
-        assert_eq!(result.skipped, 1);
-        assert_eq!(result.errors, [format!("{}：无访问权限", path.display())]);
+        match legacy {
+            Ok((size, identity)) => {
+                assert_eq!(result.files.len(), 1);
+                assert_eq!(result.files[0].path, path);
+                assert_eq!(result.files[0].size, size);
+                assert_eq!(result.files[0].identity, identity);
+                assert_eq!(result.skipped, 0);
+                assert!(result.errors.is_empty());
+            }
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                assert!(result.files.is_empty());
+                assert_eq!(result.skipped, 1);
+                assert_eq!(result.errors, [format!("{}：无访问权限", path.display())]);
+            }
+        }
     }
 
     #[cfg(windows)]
