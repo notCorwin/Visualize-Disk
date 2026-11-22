@@ -2,7 +2,6 @@
 
 mod directory_map;
 mod file_actions;
-mod file_list;
 mod permission;
 mod platform;
 mod render;
@@ -114,40 +113,10 @@ fn wrapped_text(ui: &mut egui::Ui, text: String, size: f32, color: Color32) -> e
     ui.add(egui::Label::new(job).wrap())
 }
 
-fn path_text(ui: &mut egui::Ui, path: &std::path::Path) -> egui::Response {
-    let text = path.to_string_lossy();
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let file_start = text.len().saturating_sub(name.len());
-    let mut job = egui::text::LayoutJob::default();
-    job.wrap.max_width = ui.available_width();
-    job.wrap.break_anywhere = true;
-    job.append(
-        &text[..file_start],
-        0.0,
-        egui::TextFormat {
-            font_id: FontId::proportional(15.0),
-            color: MUTED,
-            ..Default::default()
-        },
-    );
-    job.append(
-        &text[file_start..],
-        0.0,
-        egui::TextFormat {
-            font_id: FontId::proportional(18.0),
-            color: TEXT,
-            ..Default::default()
-        },
-    );
-    ui.add(egui::Label::new(job).wrap())
-}
-
 fn show_file_tooltip(
     response: &egui::Response,
     file: &scan::FileEntry,
 ) -> Option<egui::InnerResponse<()>> {
-    // List rows share this helper with the treemap, so gate the always-open
-    // tooltip here rather than relying on the caller's treemap hit test.
     if !response.enabled() || !response.hovered() {
         return None;
     }
@@ -209,44 +178,6 @@ struct TrashOutput {
     source: Arc<scan::ScanResult>,
     id: usize,
     result: Result<(), String>,
-}
-
-struct RestoreOutput {
-    source: Arc<scan::ScanResult>,
-    result: Result<Option<scan::ScanResult>, String>,
-}
-
-fn relocate_snapshot(
-    source: &scan::ScanResult,
-    old_path: &std::path::Path,
-    identity: scan::FileIdentity,
-    moved: Option<scan::FileEntry>,
-) -> Option<scan::ScanResult> {
-    let moved = moved?;
-    let matches: Vec<_> = source
-        .files
-        .par_iter()
-        .enumerate()
-        .filter_map(|(i, file)| (file.path == old_path && file.identity == identity).then_some(i))
-        .collect();
-    if matches.len() != 1 {
-        return None;
-    }
-    let id = matches[0];
-    let mut files: Vec<_> = source
-        .files
-        .par_iter()
-        .enumerate()
-        .map(|(i, file)| if i == id { moved.clone() } else { file.clone() })
-        .collect();
-    files.par_sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
-    Some(scan::ScanResult {
-        root: source.root.clone(),
-        files,
-        skipped: source.skipped,
-        errors: source.errors.clone(),
-        elapsed: source.elapsed,
-    })
 }
 
 struct TotalsOutput {
@@ -377,14 +308,6 @@ struct App {
     action_notice: Option<String>,
     notice: Option<Notice>,
     show_errors: bool,
-    show_recoveries: bool,
-    recovery_rx: Option<mpsc::Receiver<Result<Vec<file_actions::RecoveryRecord>, String>>>,
-    recovery_records: Vec<file_actions::RecoveryRecord>,
-    recovery_list: file_list::WrappedFileList,
-    recovery_generation: u64,
-    recoveries_loaded: bool,
-    recoveries_dirty: bool,
-    restore_rx: Option<mpsc::Receiver<RestoreOutput>>,
     canvas_rect: Option<Rect>,
     total_bytes: u64,
     totals_rx: Option<mpsc::Receiver<TotalsOutput>>,
@@ -411,14 +334,6 @@ impl Default for App {
             action_notice: None,
             notice: None,
             show_errors: false,
-            show_recoveries: false,
-            recovery_rx: None,
-            recovery_records: Vec::new(),
-            recovery_list: file_list::WrappedFileList::default(),
-            recovery_generation: 0,
-            recoveries_loaded: false,
-            recoveries_dirty: false,
-            restore_rx: None,
             canvas_rect: None,
             total_bytes: 0,
             totals_rx: None,
@@ -504,7 +419,6 @@ impl App {
     fn trash(&mut self, id: usize) {
         if self.access != permission::Access::Granted
             || self.trash_rx.is_some()
-            || self.restore_rx.is_some()
             || self.hidden.contains(&id)
         {
             return;
@@ -531,74 +445,6 @@ impl App {
         rayon::spawn(move || {
             let result = file_actions::move_to_trash(&path, identity).map(|_| ());
             let _ = tx.send(TrashOutput { source, id, result });
-        });
-    }
-    fn load_recoveries(&mut self) {
-        self.recoveries_dirty = true;
-        self.pump_recoveries();
-    }
-    fn pump_recoveries(&mut self) {
-        #[cfg(test)]
-        {
-            self.recoveries_loaded = true;
-            self.recoveries_dirty = false;
-        }
-        #[cfg(not(test))]
-        {
-            if self.recovery_rx.is_some() || !self.recoveries_dirty {
-                return;
-            }
-            self.recoveries_dirty = false;
-            let (tx, rx) = mpsc::channel();
-            self.recovery_rx = Some(rx);
-            rayon::spawn(move || {
-                let _ = tx.send(file_actions::recoveries());
-            });
-        }
-    }
-    fn restore(&mut self, record_id: &str) {
-        if self.access != permission::Access::Granted
-            || self.restore_rx.is_some()
-            || self.trash_rx.is_some()
-        {
-            return;
-        }
-        let Some(record) = self
-            .recovery_records
-            .iter()
-            .find(|record| record.id == record_id)
-        else {
-            return;
-        };
-        let id = record.id.clone();
-        let old_path = record.trash_path.clone();
-        let identity = record.identity;
-        let source = self.data.clone();
-        let (tx, rx) = mpsc::channel();
-        self.restore_rx = Some(rx);
-        self.set_notice(Notice {
-            text: "正在放回原处…".into(),
-            kind: NoticeKind::Info,
-            expires: None,
-        });
-        rayon::spawn(move || {
-            let result = file_actions::restore(&id).map(|moved| match (&source, &old_path) {
-                (Some(source), Some(old_path)) => {
-                    relocate_snapshot(source, old_path, identity, moved)
-                }
-                _ => None,
-            });
-            // An empty placeholder can never match a current scan snapshot.
-            let source = source.unwrap_or_else(|| {
-                Arc::new(scan::ScanResult {
-                    root: "/".into(),
-                    files: Vec::new(),
-                    skipped: 0,
-                    errors: Vec::new(),
-                    elapsed: Duration::ZERO,
-                })
-            });
-            let _ = tx.send(RestoreOutput { source, result });
         });
     }
     fn set_notice(&mut self, notice: Notice) {
@@ -683,56 +529,6 @@ impl App {
                 });
             self.show_errors = open;
         }
-        if self.show_recoveries && self.access == permission::Access::Granted {
-            let mut open = true;
-            let mut restore = None;
-            egui::Window::new("恢复文件")
-                .open(&mut open)
-                .default_width(580.0)
-                .default_height(300.0)
-                .show(ctx, |ui| {
-                    ui.label(RichText::new("仅显示本应用记录的文件").small().color(MUTED));
-                    if self.recovery_rx.is_some() {
-                        ui.label("正在读取恢复记录…");
-                    }
-                    if self.recovery_records.is_empty() && self.recovery_rx.is_none() {
-                        ui.label("没有可用的恢复记录。");
-                    }
-                    let records = &self.recovery_records;
-                    let busy = self.restore_rx.is_some() || self.trash_rx.is_some();
-                    restore = self.recovery_list.show_rows(
-                        ui,
-                        self.recovery_generation,
-                        records.len(),
-                        |ui, index| {
-                            let record = &records[index];
-                            let mut restore = None;
-                            ui.horizontal_top(|ui| {
-                                let width = (ui.available_width() - 110.0).max(100.0);
-                                ui.allocate_ui_with_layout(
-                                    Vec2::new(width, 0.0),
-                                    egui::Layout::top_down(egui::Align::LEFT),
-                                    |ui| {
-                                        path_text(ui, &record.original_path);
-                                    },
-                                );
-                                if ui
-                                    .add_enabled(!busy, egui::Button::new("放回原处"))
-                                    .clicked()
-                                {
-                                    restore = Some(record.id.clone());
-                                }
-                            });
-                            ui.separator();
-                            restore
-                        },
-                    );
-                });
-            self.show_recoveries = open;
-            if let Some(record) = restore {
-                self.restore(&record);
-            }
-        }
     }
     fn poll(&mut self, ctx: &egui::Context) {
         if let Some(rx) = &self.permission_rx {
@@ -814,9 +610,6 @@ impl App {
                         Err(error) => self.message = Some(error),
                     }
                     defer_drop(output.source);
-                    if !file_actions::SYSTEM_RECOVERY {
-                        self.load_recoveries();
-                    }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.trash_rx = None;
@@ -828,64 +621,6 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        if let Some(rx) = &self.restore_rx {
-            match rx.try_recv() {
-                Ok(output) => {
-                    self.restore_rx = None;
-                    match output.result {
-                        Ok(Some(data))
-                            if self
-                                .data
-                                .as_ref()
-                                .is_some_and(|current| Arc::ptr_eq(current, &output.source)) =>
-                        {
-                            let refresh = self.job.is_some();
-                            self.replace_snapshot(data);
-                            if refresh {
-                                self.start();
-                            }
-                            self.action_notice = Some("已放回原处。".into());
-                        }
-                        Ok(data) => {
-                            defer_drop(data);
-                            self.start();
-                            self.action_notice = Some("已放回原处。".into());
-                        }
-                        Err(error) => self.message = Some(error),
-                    }
-                    defer_drop(output.source);
-                    self.load_recoveries();
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.restore_rx = None;
-                    self.message = Some("恢复操作未完成，请刷新恢复记录后重试。".into());
-                    self.load_recoveries();
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
-        if let Some(rx) = &self.recovery_rx {
-            match rx.try_recv() {
-                Ok(result) => {
-                    self.recovery_rx = None;
-                    self.recoveries_loaded = true;
-                    match result {
-                        Ok(records) => {
-                            defer_drop(std::mem::replace(&mut self.recovery_records, records));
-                            self.recovery_generation = self.recovery_generation.wrapping_add(1);
-                        }
-                        Err(error) => self.message = Some(error),
-                    }
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.recovery_rx = None;
-                    self.recoveries_loaded = true;
-                    self.message = Some("无法读取恢复记录，请重新打开恢复文件窗口。".into());
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
-        self.pump_recoveries();
         if let Some(rx) = &self.totals_rx {
             match rx.try_recv() {
                 Ok(output) => {
@@ -1022,17 +757,6 @@ impl App {
             let _ = tx.send(result);
         });
     }
-    #[cfg(windows)]
-    fn open_recycle_bin(&mut self) {
-        if self.reveal_rx.is_some() {
-            return;
-        }
-        let (tx, rx) = mpsc::channel();
-        self.reveal_rx = Some(rx);
-        std::thread::spawn(move || {
-            let _ = tx.send(file_actions::open_recycle_bin());
-        });
-    }
     fn open_permissions(&mut self) {
         if self.reveal_rx.is_some() {
             return;
@@ -1117,8 +841,6 @@ impl App {
         if self.job.is_some()
             || self.reveal_rx.is_some()
             || self.trash_rx.is_some()
-            || self.restore_rx.is_some()
-            || self.recovery_rx.is_some()
             || self.permission_rx.is_some()
             || self.totals_rx.is_some()
             || self.layout_rx.is_some()
@@ -1184,12 +906,8 @@ impl App {
             self.overlays(ctx);
             return;
         }
-        if !file_actions::SYSTEM_RECOVERY && !self.recoveries_loaded && self.recovery_rx.is_none() {
-            self.load_recoveries();
-        }
         let mut reveal = None;
         let mut trash = None;
-        let mut restore = None;
         egui::TopBottomPanel::top("toolbar")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(16.0))
             .show(ctx, |ui| {
@@ -1212,22 +930,6 @@ impl App {
                             job.cancel.store(true, Ordering::Relaxed);
                         }
                     }
-                    if ui
-                        .button(if file_actions::SYSTEM_RECOVERY {
-                            "打开回收站"
-                        } else {
-                            "恢复文件"
-                        })
-                        .clicked()
-                    {
-                        #[cfg(windows)]
-                        self.open_recycle_bin();
-                        #[cfg(not(windows))]
-                        {
-                            self.show_recoveries = true;
-                            self.load_recoveries();
-                        }
-                    }
                     let selected = self.selected.and_then(|i| {
                         self.data
                             .as_ref()
@@ -1247,30 +949,12 @@ impl App {
                         f.can_trash && file_actions::can_move_to_trash(&f.path)
                     }) && ui
                         .add_enabled(
-                            selected.is_some()
-                                && self.trash_rx.is_none()
-                                && self.restore_rx.is_none(),
+                            selected.is_some() && self.trash_rx.is_none(),
                             egui::Button::new(format!("移到{}", platform::TRASH_NAME)),
                         )
                         .clicked()
                     {
                         trash = selected.map(|(i, _)| i);
-                    }
-                    if let Some((_, f)) = selected {
-                        if let Some(record) = self.recovery_records.iter().find(|record| {
-                            record.trash_path.as_ref() == Some(&f.path)
-                                && record.identity == f.identity
-                        }) {
-                            if ui
-                                .add_enabled(
-                                    self.restore_rx.is_none() && self.trash_rx.is_none(),
-                                    egui::Button::new("放回原处"),
-                                )
-                                .clicked()
-                            {
-                                restore = Some(record.id.clone());
-                            }
-                        }
                     }
                     if let Some(data) = &self.data {
                         let total = if self.totals_ready {
@@ -1399,9 +1083,6 @@ impl App {
         if let Some(i) = trash {
             self.trash(i);
         }
-        if let Some(id) = restore {
-            self.restore(&id);
-        }
         self.overlays(ctx);
     }
 }
@@ -1457,41 +1138,6 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
-
-    #[cfg(windows)]
-    #[test]
-    fn confirmed_recycle_keeps_disk_usage_and_reuses_reported_destination() {
-        let source = snapshot();
-        let file = source.files[1].clone();
-        let mut destination = file.clone();
-        destination.path = r"C:\$Recycle.Bin\test\$Rfile".into();
-        destination.parent = destination.path.parent().unwrap().into();
-        let updated = relocate_snapshot(
-            &source,
-            &file.path,
-            file.identity,
-            Some(destination.clone()),
-        )
-        .unwrap();
-        assert_eq!(updated.files.len(), source.files.len());
-        assert_eq!(
-            updated.files.iter().map(|entry| entry.size).sum::<u64>(),
-            source.files.iter().map(|entry| entry.size).sum::<u64>()
-        );
-        assert!(
-            updated
-                .files
-                .iter()
-                .any(|entry| entry.path == destination.path)
-        );
-        assert!(!updated.files.iter().any(|entry| entry.path == file.path));
-        assert!(relocate_snapshot(&source, &file.path, file.identity, None).is_none());
-        let replacement = scan::FileIdentity {
-            device: 123,
-            inode: 456,
-        };
-        assert!(relocate_snapshot(&source, &file.path, replacement, Some(destination)).is_none());
-    }
 
     #[test]
     fn startup_uses_selected_transparent_artwork_as_runtime_icon() {
@@ -1552,7 +1198,6 @@ mod tests {
         let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
     }
     fn settle(app: &mut App, ctx: &egui::Context) {
-        app.recoveries_loaded = true;
         let start = std::time::Instant::now();
         loop {
             frame(app, ctx);
@@ -1580,7 +1225,6 @@ mod tests {
             configure(&ctx);
             let mut app = App::default();
             app.access = permission::Access::Granted;
-            app.recoveries_loaded = true;
             let mut data = snapshot();
             data.files[0].can_trash = !protected;
             app.data = Some(Arc::new(data));
@@ -1688,7 +1332,6 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = App::default();
         app.access = permission::Access::Granted;
-        app.recoveries_loaded = true;
         for _ in 0..5 {
             frame(&mut app, &ctx);
         }
@@ -2012,7 +1655,7 @@ mod tests {
         assert!(!cache.holes.is_empty());
         app.hide_file(1);
         assert_eq!(app.map_cache.as_ref().unwrap().holes.len(), 1);
-        // A fresh scan (also used after restore) resets holes and slot identities.
+        // A fresh scan resets holes and slot identities.
         app.replace_snapshot(snapshot());
         assert!(app.hidden.is_empty());
         settle(&mut app, &ctx);
@@ -2045,62 +1688,18 @@ mod tests {
         assert!(app.hidden.is_empty());
     }
     #[test]
-    fn restore_result_relocates_same_snapshot_without_changing_disk_usage() {
-        let ctx = egui::Context::default();
-        let mut app = App::default();
-        let mut trashed = snapshot();
-        trashed.files[1].path = "/Users/test/.Trash/large".into();
-        trashed.files[1].parent = Path::new("/Users/test/.Trash").into();
-        app.data = Some(Arc::new(trashed));
-        let source = app.data.clone().unwrap();
-        let (tx, rx) = mpsc::channel();
-        app.restore_rx = Some(rx);
-        tx.send(RestoreOutput {
-            source: source.clone(),
-            result: Err("原位置存在同名文件，未覆盖。".into()),
-        })
-        .unwrap();
-        app.poll(&ctx);
-        assert!(Arc::ptr_eq(app.data.as_ref().unwrap(), &source));
-        let (tx, rx) = mpsc::channel();
-        app.restore_rx = Some(rx);
-        tx.send(RestoreOutput {
-            source,
-            result: Ok(Some(snapshot())),
-        })
-        .unwrap();
-        app.poll(&ctx);
-        assert_eq!(app.data.as_ref().unwrap().files.len(), 3);
-        assert_eq!(
-            app.data
-                .as_ref()
-                .unwrap()
-                .files
-                .iter()
-                .map(|f| f.size)
-                .sum::<u64>(),
-            1_000_042
-        );
-        assert_eq!(
-            app.data.as_ref().unwrap().files[1].path,
-            PathBuf::from("/a/large")
-        );
-        assert!(app.action_notice.as_ref().unwrap().contains("放回原处"));
-        assert!(app.selected.is_none());
-    }
-    #[test]
     fn errors_take_priority_over_success_feedback_until_dismissed() {
         let mut app = App::default();
-        app.message = Some("文件无法恢复，请检查原目录权限。".into());
-        app.action_notice = Some("已放回原处。".into());
+        app.message = Some("文件无法移动，请检查目录权限。".into());
+        app.action_notice = Some("已移到废纸篓。".into());
         app.collect_notices();
         assert_eq!(app.notice.as_ref().unwrap().kind, NoticeKind::Error);
-        assert!(app.notice.as_ref().unwrap().text.contains("恢复"));
-        app.action_notice = Some("已放回原处。".into());
+        assert!(app.notice.as_ref().unwrap().text.contains("移动"));
+        app.action_notice = Some("已移到废纸篓。".into());
         app.collect_notices();
         assert_eq!(app.notice.as_ref().unwrap().kind, NoticeKind::Error);
         app.notice = None;
-        app.action_notice = Some("已放回原处。".into());
+        app.action_notice = Some("已移到废纸篓。".into());
         app.collect_notices();
         assert_eq!(app.notice.as_ref().unwrap().kind, NoticeKind::Success);
     }
@@ -2110,7 +1709,6 @@ mod tests {
         configure(&ctx);
         let mut app = App::default();
         app.access = permission::Access::Granted;
-        app.recoveries_loaded = true;
         for _ in 0..3 {
             frame(&mut app, &ctx);
         }
@@ -2138,7 +1736,6 @@ mod tests {
         configure(&ctx);
         let mut app = App::default();
         app.access = permission::Access::Granted;
-        app.recoveries_loaded = true;
         app.data = Some(Arc::new(snapshot()));
         settle(&mut app, &ctx);
         settle(&mut app, &ctx);
@@ -2154,7 +1751,7 @@ mod tests {
                 assert_eq!(app.layout_generation.load(Ordering::Relaxed), generation);
             }
         };
-        app.action_notice = Some("已放回原处。".into());
+        app.action_notice = Some("已移到废纸篓。".into());
         check(&mut app);
         assert_eq!(app.notice.as_ref().unwrap().kind, NoticeKind::Success);
         app.message = Some("macOS 拒绝移动文件，请检查权限。".repeat(30));
@@ -2196,9 +1793,7 @@ mod tests {
         app.show_errors = true;
         check(&mut app);
         app.show_errors = false;
-        app.show_recoveries = true;
         check(&mut app);
-        app.show_recoveries = false;
     }
     #[test]
     fn long_selected_path_does_not_resize_canvas() {
@@ -2216,7 +1811,6 @@ mod tests {
         data.files[0].parent = data.files[0].path.parent().unwrap().into();
         let mut app = App::default();
         app.access = permission::Access::Granted;
-        app.recoveries_loaded = true;
         app.data = Some(Arc::new(data));
         settle(&mut app, &ctx);
         settle(&mut app, &ctx);
@@ -2229,7 +1823,7 @@ mod tests {
             assert_eq!(app.canvas_rect, rect);
             assert_eq!(app.layout_key, key);
         }
-        app.action_notice = Some("已放回原处。".into());
+        app.action_notice = Some("已移到废纸篓。".into());
         frame(&mut app, &ctx);
         assert_eq!(app.canvas_rect, rect);
     }
@@ -2249,61 +1843,6 @@ mod tests {
             .iter()
             .find_map(|clipped| find(&clipped.shape, text).map(|shape| (shape, clipped.clip_rect)))
             .expect("complete text must be painted")
-    }
-
-    #[test]
-    fn recovery_rows_wrap_complete_paths_without_overlapping_next_record() {
-        let ctx = egui::Context::default();
-        configure(&ctx);
-        let paths = [
-            format!(
-                "/Users/Corwin/Library/Application Support/ChromeCache/{}",
-                "a".repeat(200)
-            ),
-            "/Users/Corwin/Documents/第二个恢复文件.pdf".to_owned(),
-        ];
-        let mut app = App::default();
-        app.access = permission::Access::Granted;
-        app.recoveries_loaded = true;
-        app.data = Some(Arc::new(snapshot()));
-        settle(&mut app, &ctx);
-        app.show_recoveries = true;
-        app.recovery_records = paths
-            .iter()
-            .enumerate()
-            .map(|(index, path)| file_actions::RecoveryRecord {
-                id: format!("fixture-{index}"),
-                original_path: path.into(),
-                trash_path: None,
-                identity: scan::FileIdentity::default(),
-                original_links: 1,
-            })
-            .collect();
-        let mut output = None;
-        for _ in 0..5 {
-            output = Some(ctx.run(
-                egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        Vec2::new(1180.0, 780.0),
-                    )),
-                    ..Default::default()
-                },
-                |ctx| app.ui(ctx),
-            ));
-        }
-        let output = output.as_ref().unwrap();
-        let (first, first_clip) = text_shape(output, &paths[0]);
-        let (second, _) = text_shape(output, &paths[1]);
-        assert!(!first.galley.elided && !second.galley.elided);
-        assert!(first.galley.rows.len() > 1);
-        let first_rect = first.galley.rect.translate(first.pos.to_vec2());
-        let second_rect = second.galley.rect.translate(second.pos.to_vec2());
-        assert!(first_rect.right() <= first_clip.right() + 1.0);
-        assert!(
-            second_rect.top() >= first_rect.bottom(),
-            "wrapped recovery rows overlap"
-        );
     }
 
     #[test]

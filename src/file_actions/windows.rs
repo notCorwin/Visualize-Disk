@@ -310,15 +310,6 @@ pub(super) fn move_to_trash(
     }
 }
 
-pub fn open_recycle_bin() -> Result<(), String> {
-    let system = crate::platform::windows_directory()?;
-    std::process::Command::new(system.join("explorer.exe"))
-        .arg("shell:RecycleBinFolder")
-        .spawn()
-        .map(|_| ())
-        .map_err(|_| "无法打开系统回收站，请确认资源管理器可用后重试。".into())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

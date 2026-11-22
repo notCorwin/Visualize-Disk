@@ -373,6 +373,7 @@ impl RenderMap {
         self.platforms.len()
     }
 
+    #[cfg(test)]
     pub fn color(&self, id: usize) -> Option<Color32> {
         let index = *self.by_id.get(id)?;
         (index != NONE).then(|| self.entries[index as usize].color)
