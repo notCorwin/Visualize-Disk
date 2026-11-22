@@ -1,5 +1,6 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
+mod demo;
 mod directory_map;
 mod file_actions;
 mod hybrid;
@@ -574,6 +575,9 @@ struct Job {
     rx: mpsc::Receiver<Result<scan::ScanResult, String>>,
 }
 struct App {
+    demo: bool,
+    demo_root: Option<demo::DemoRoot>,
+    demo_rx: Option<mpsc::Receiver<Result<demo::DemoRoot, String>>>,
     access: permission::Access,
     permission_rx: Option<mpsc::Receiver<permission::Access>>,
     pending_scan: bool,
@@ -621,6 +625,9 @@ struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
+            demo: false,
+            demo_root: None,
+            demo_rx: None,
             access: permission::Access::Unverified,
             permission_rx: None,
             pending_scan: false,
@@ -669,10 +676,35 @@ impl Default for App {
 }
 impl App {
     fn start(&mut self) {
+        if self.demo {
+            self.access = permission::Access::Granted;
+            if self.demo_root.is_some() {
+                self.launch_scan();
+            } else {
+                self.prepare_demo();
+            }
+            return;
+        }
         let (tx, rx) = mpsc::channel();
         self.queue_permission_check(rx);
         std::thread::spawn(move || {
             let _ = tx.send(permission::check());
+        });
+    }
+    fn prepare_demo(&mut self) {
+        if self.demo_rx.is_some() || self.trash_rx.is_some() {
+            return;
+        }
+        if let Some(job) = self.job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+            defer_drop(job);
+        }
+        self.pending_folder_delete = None;
+        let (tx, rx) = mpsc::channel();
+        self.demo_rx = Some(rx);
+        self.message = None;
+        std::thread::spawn(move || {
+            let _ = tx.send(demo::DemoRoot::create());
         });
     }
     fn queue_permission_check(&mut self, rx: mpsc::Receiver<permission::Access>) {
@@ -706,8 +738,17 @@ impl App {
         }));
         let (tx, rx) = mpsc::channel();
         let (c, stats) = (cancel.clone(), progress.clone());
+        let demo_root = self.demo_root.clone();
+        let is_demo = self.demo;
         std::thread::spawn(move || {
-            let _ = tx.send(platform::scan_root().and_then(|root| scan::scan(root, c, stats)));
+            let result = if is_demo {
+                demo_root
+                    .ok_or_else(|| "演示目录尚未准备好。".to_owned())
+                    .and_then(|demo| demo.scan(c, stats))
+            } else {
+                platform::scan_root().and_then(|root| scan::scan(root, c, stats))
+            };
+            let _ = tx.send(result);
         });
         self.job = Some(Job {
             cancel,
@@ -761,6 +802,9 @@ impl App {
         self.layout_key = None;
     }
     fn trash(&mut self, id: usize) {
+        if self.demo && self.demo_root.is_none() {
+            return;
+        }
         if self.is_folder_tile(id) {
             if self.trash_rx.is_some() || self.pending_folder_delete.is_some() {
                 return;
@@ -831,6 +875,7 @@ impl App {
         }
         let path = file.path.clone();
         let identity = file.identity;
+        let demo_root = self.demo_root.clone();
         let file_change = source_id
             .is_none()
             .then(|| scene_model::Change::RemoveFile {
@@ -846,7 +891,17 @@ impl App {
             expires: None,
         });
         rayon::spawn(move || {
-            let result = file_actions::move_to_trash(&path, identity).map(|_| ());
+            let result = if let Some(root) = demo_root.as_ref() {
+                file_actions::move_target_to_trash_guarded(
+                    &path,
+                    identity,
+                    file_actions::TargetKind::File,
+                    || root.allow_target(&path),
+                )
+            } else {
+                file_actions::move_to_trash(&path, identity)
+            }
+            .map(|_| ());
             let _ = tx.send(TrashOutput {
                 source,
                 id: source_id,
@@ -861,6 +916,7 @@ impl App {
             return;
         };
         if self.trash_rx.is_some()
+            || (self.demo && self.demo_root.is_none())
             || self.access != permission::Access::Granted
             || !self
                 .data
@@ -878,12 +934,22 @@ impl App {
             expires: None,
         });
         let hidden = self.hidden.clone();
+        let demo_root = self.demo_root.clone();
         rayon::spawn(move || {
-            let result = file_actions::move_target_to_trash(
-                &pending.path,
-                pending.identity,
-                file_actions::TargetKind::Directory,
-            )
+            let result = if let Some(root) = demo_root.as_ref() {
+                file_actions::move_target_to_trash_guarded(
+                    &pending.path,
+                    pending.identity,
+                    file_actions::TargetKind::Directory,
+                    || root.allow_target(&pending.path),
+                )
+            } else {
+                file_actions::move_target_to_trash(
+                    &pending.path,
+                    pending.identity,
+                    file_actions::TargetKind::Directory,
+                )
+            }
             .map(|_| ());
             let folder_hidden = result.is_ok().then(|| {
                 let mut updated = (*hidden).clone();
@@ -995,6 +1061,25 @@ impl App {
         }
     }
     fn poll(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.demo_rx {
+            match rx.try_recv() {
+                Ok(Ok(root)) => {
+                    self.demo_rx = None;
+                    self.demo_root = Some(root);
+                    self.access = permission::Access::Granted;
+                    self.launch_scan();
+                }
+                Ok(Err(error)) => {
+                    self.demo_rx = None;
+                    self.message = Some(error);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.demo_rx = None;
+                    self.message = Some("演示数据准备失败，请重置演示后重试。".into());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         self.poll_coordinator();
         if let Some(rx) = &self.projection_rx {
             match rx.try_recv() {
@@ -1935,7 +2020,7 @@ impl App {
         });
     }
     fn reveal(&mut self, i: usize) {
-        if self.reveal_rx.is_some() {
+        if self.reveal_rx.is_some() || (self.demo && self.demo_root.is_none()) {
             return;
         }
         let Some(file) = self.view_file(i) else {
@@ -1967,6 +2052,7 @@ impl App {
         }
         let path = file.path.clone();
         let identity = file.identity;
+        let demo_root = self.demo_root.clone();
         let kind = if self.is_folder_tile(i) {
             file_actions::TargetKind::Directory
         } else {
@@ -1975,7 +2061,10 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.reveal_rx = Some(rx);
         std::thread::spawn(move || {
-            let result = file_actions::verify_target(&path, identity, kind)
+            let result = demo_root
+                .as_ref()
+                .map_or(Ok(()), |root| root.allow_target(&path))
+                .and_then(|_| file_actions::verify_target(&path, identity, kind))
                 .and_then(|_| platform::reveal(&path));
             let _ = tx.send(result);
         });
@@ -2003,7 +2092,13 @@ impl App {
             .frame(egui::Frame::new().fill(PANEL).inner_margin(8.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let status = if let Some(job) = &self.job {
+                    let status = if self.demo_rx.is_some() {
+                        if self.data.is_some() {
+                            "正在准备演示… · 当前为上次结果".into()
+                        } else {
+                            "正在准备演示…".into()
+                        }
+                    } else if let Some(job) = &self.job {
                         let p = *job.progress.lock().unwrap_or_else(|e| e.into_inner());
                         format!(
                             "扫描中 · {} 个文件 · {} · 跳过 {} 项{}",
@@ -2020,12 +2115,24 @@ impl App {
                         "视图尚未更新 · 请重新扫描".into()
                     } else if let Some(data) = &self.data {
                         format!(
-                            "启动磁盘 · {:.1} 秒 · 跳过 {} 项",
+                            "{} · {:.1} 秒 · 跳过 {} 项",
+                            if self.demo {
+                                "演示目录"
+                            } else {
+                                "启动磁盘"
+                            },
                             data.elapsed.as_secs_f64(),
                             data.skipped
                         )
                     } else {
-                        "启动磁盘 · 扫描已停止".into()
+                        format!(
+                            "{} · 扫描已停止",
+                            if self.demo {
+                                "演示目录"
+                            } else {
+                                "启动磁盘"
+                            }
+                        )
                     };
                     ui.add(egui::Label::new(RichText::new(status).small().color(MUTED)).truncate());
                     if self.projection_dirty {
@@ -2084,6 +2191,7 @@ impl App {
             self.trash(id);
         }
         if self.job.is_some()
+            || self.demo_rx.is_some()
             || self.reveal_rx.is_some()
             || self.trash_rx.is_some()
             || self.permission_rx.is_some()
@@ -2164,6 +2272,20 @@ impl App {
                     ui.text_style_height(&egui::TextStyle::Button) + 2.0 * padding.y;
                 ui.spacing_mut().interact_size.y = control_height;
                 ui.horizontal(|ui| {
+                    if self.demo {
+                        ui.label(RichText::new("演示模式").strong().color(ACCENT))
+                            .on_hover_text("演示文件使用稀疏空间，显示的是逻辑大小。");
+                        if ui
+                            .add_enabled(
+                                self.demo_rx.is_none() && self.trash_rx.is_none(),
+                                egui::Button::new("重置演示"),
+                            )
+                            .on_hover_text("创建新的演示数据；原有数据和废纸篓内容不会自动删除。")
+                            .clicked()
+                        {
+                            self.prepare_demo();
+                        }
+                    }
                     if ui
                         .add_enabled(self.job.is_none(), egui::Button::new("重新扫描"))
                         .clicked()
@@ -2252,7 +2374,9 @@ impl App {
                     self.canvas_rect = Some(ui.max_rect());
                     ui.vertical_centered(|ui| {
                         ui.add_space((ui.available_height() * 0.32).max(32.0));
-                        let heading = if self.job.is_some() {
+                        let heading = if self.demo_rx.is_some() {
+                            "正在准备演示…"
+                        } else if self.job.is_some() {
                             "扫描中…"
                         } else {
                             "扫描已停止"
@@ -2439,12 +2563,23 @@ fn native_options() -> eframe::Result<eframe::NativeOptions> {
 }
 
 fn main() -> eframe::Result {
+    let demo = std::env::args_os().any(|arg| arg == "--demo")
+        || (cfg!(target_os = "macos")
+            && std::env::current_exe()
+                .ok()
+                .and_then(|path| path.file_name().map(|s| s == "visualize-ssd-demo"))
+                .unwrap_or(false));
     eframe::run_native(
-        "Visualize SSD",
+        if demo {
+            "Visualize SSD · 演示"
+        } else {
+            "Visualize SSD"
+        },
         native_options()?,
         Box::new(move |cc| {
             configure(&cc.egui_ctx);
             let mut app = App::default();
+            app.demo = demo;
             app.start();
             Ok(Box::new(app))
         }),

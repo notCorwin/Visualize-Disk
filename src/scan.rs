@@ -110,6 +110,30 @@ pub fn scan(
     cancel: Arc<AtomicBool>,
     progress: Arc<Mutex<ScanProgress>>,
 ) -> Result<ScanResult, String> {
+    scan_impl(root, cancel, progress, None)
+}
+
+pub(crate) fn scan_restricted(
+    root: PathBuf,
+    expected_real: &Path,
+    expected_identity: FileIdentity,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<Mutex<ScanProgress>>,
+) -> Result<ScanResult, String> {
+    scan_impl(
+        root,
+        cancel,
+        progress,
+        Some((expected_real, expected_identity)),
+    )
+}
+
+fn scan_impl(
+    root: PathBuf,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<Mutex<ScanProgress>>,
+    restriction: Option<(&Path, FileIdentity)>,
+) -> Result<ScanResult, String> {
     let started = Instant::now();
     let metadata = fs::symlink_metadata(&root).map_err(|e| root_error(&e))?;
     if !metadata.is_dir() || is_link_or_reparse(&metadata) {
@@ -118,6 +142,11 @@ pub fn scan(
     *progress.lock().unwrap_or_else(|e| e.into_inner()) = ScanProgress::default();
     let real_root = fs::canonicalize(&root).map_err(|e| root_error(&e))?;
     let root_identity = FileIdentity::from_path(&root, &metadata).map_err(|e| root_error(&e))?;
+    if restriction.is_some_and(|(expected_real, expected_identity)| {
+        expected_real != real_root || expected_identity != root_identity
+    }) {
+        return Err("演示目录已更改，请重置演示。".into());
+    }
     let excluded_trash = excluded_trash_path();
     if excluded_trash.as_ref().is_some_and(|trash| {
         is_excluded_trash(&root, trash) || is_excluded_trash(&real_root, trash)
