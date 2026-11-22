@@ -1,4 +1,6 @@
-use super::{FileEntry, FileIdentity, already_in_trash, destination_entry, verify_file};
+use super::{
+    FileEntry, FileIdentity, TargetKind, already_in_trash, destination_entry, verify_target,
+};
 use std::{
     ffi::OsString,
     os::windows::ffi::{OsStrExt, OsStringExt},
@@ -47,6 +49,7 @@ struct Outcome {
 struct RecycleGuard {
     path: PathBuf,
     expected_identity: FileIdentity,
+    kind: TargetKind,
     outcome: Arc<Mutex<Outcome>>,
 }
 
@@ -57,7 +60,8 @@ impl IFileOperationProgressSink_Impl for RecycleGuard_Impl {
         if flags & TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32 == 0 {
             return Err(Error::from_hresult(E_ABORT));
         }
-        verify_file(&self.path, self.expected_identity).map_err(|_| Error::from_hresult(E_ABORT))
+        verify_target(&self.path, self.expected_identity, self.kind)
+            .map_err(|_| Error::from_hresult(E_ABORT))
     }
     fn PostDeleteItem(
         &self,
@@ -233,12 +237,13 @@ fn operation_error(error: HRESULT) -> String {
 pub(super) fn move_to_trash(
     path: &Path,
     expected: FileIdentity,
+    kind: TargetKind,
 ) -> Result<Option<FileEntry>, String> {
     let _apartment = Apartment::new()?;
     let parsing_path = shell_parsing_path(path)?;
     // Converting verbatim paths to Shell paths must not select a different file
     // (for example a trailing-dot or trailing-space name).
-    verify_file(&parsing_path, expected)?;
+    verify_target(&parsing_path, expected, kind)?;
     let encoded: Vec<u16> = parsing_path
         .as_os_str()
         .encode_wide()
@@ -272,13 +277,14 @@ pub(super) fn move_to_trash(
         let sink: IFileOperationProgressSink = RecycleGuard {
             path: path.to_path_buf(),
             expected_identity: expected,
+            kind,
             outcome: outcome.clone(),
         }
         .into();
         operation
             .DeleteItem(&item, &sink)
             .map_err(|e| operation_error(e.code()))?;
-        verify_file(path, expected)?;
+        verify_target(path, expected, kind)?;
         let result = operation.PerformOperations();
         let aborted = operation
             .GetAnyOperationsAborted()
@@ -290,7 +296,25 @@ pub(super) fn move_to_trash(
         if let Some(file) = state
             .destination
             .clone()
-            .and_then(destination_entry)
+            .and_then(|path| {
+                if kind == TargetKind::File {
+                    destination_entry(path)
+                } else {
+                    let metadata = std::fs::symlink_metadata(&path).ok()?;
+                    if !metadata.is_dir() {
+                        return None;
+                    }
+                    Some(FileEntry {
+                        identity: FileIdentity::from_path(&path, &metadata).ok()?,
+                        parent_identity: FileIdentity::default(),
+                        parent_is_leaf: false,
+                        parent: path.parent()?.into(),
+                        can_trash: false,
+                        size: 0,
+                        path,
+                    })
+                }
+            })
             .filter(|entry| entry.identity == expected && already_in_trash(&entry.path))
         {
             if source_is_gone(path) {
@@ -318,6 +342,7 @@ mod tests {
         let guard = RecycleGuard {
             path: PathBuf::from(r"C:\missing"),
             expected_identity: FileIdentity::default(),
+            kind: TargetKind::File,
             outcome: Arc::new(Mutex::new(Outcome::default())),
         };
         let sink: IFileOperationProgressSink = guard.into();

@@ -190,6 +190,8 @@ fn read_batch(
                 delta.files += 1;
                 delta.bytes = delta.bytes.saturating_add(size);
                 report.files.push(FileEntry {
+                    parent_identity: FileIdentity::default(),
+                    parent_is_leaf: false,
                     can_trash: true,
                     path: child_path(directory, entry.name),
                     parent: Arc::clone(parent.get_or_insert_with(|| Arc::from(directory))),
@@ -203,7 +205,10 @@ fn read_batch(
                     identity,
                 });
             }
-            Ok(EntryMetadata::Other) => delta.skipped += 1,
+            Ok(EntryMetadata::Other) => {
+                delta.skipped += 1;
+                report.uncertain_entries = true;
+            }
             Err(error) => record_error(
                 delta,
                 &mut report.errors,

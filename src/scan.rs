@@ -58,6 +58,9 @@ pub struct FileEntry {
     /// Shared by entries produced by the same directory scan.
     pub parent: Arc<Path>,
     pub identity: FileIdentity,
+    pub parent_identity: FileIdentity,
+    /// True only when the parent was fully enumerated and had no subdirectories.
+    pub parent_is_leaf: bool,
     pub can_trash: bool,
 }
 
@@ -262,7 +265,13 @@ impl Traversal<'_> {
                 }
             }
             let mut report = scan_directory(&directory, self.cancel, self.progress);
+            let parent_is_leaf = report.directories.is_empty()
+                && report.errors.is_empty()
+                && !report.uncertain_entries
+                && report.unreadable.is_none();
             for file in &mut report.files {
+                file.parent_identity = directory.identity;
+                file.parent_is_leaf = parent_is_leaf;
                 file.can_trash = crate::file_actions::can_move_to_trash(&file.path)
                     && (self.root == self.real_root
                         || crate::file_actions::can_move_to_trash(&self.real_path(&file.path)));
@@ -375,6 +384,8 @@ struct DirectoryReport {
     directories: Vec<PendingDirectory>,
     errors: Vec<String>,
     unreadable: Option<std::io::Error>,
+    // Reparse points, links and special entries may conceal a directory.
+    uncertain_entries: bool,
 }
 
 enum EntryReport {
@@ -485,7 +496,10 @@ fn scan_directory_batches(
                     report.files.push(file);
                 }
                 EntryReport::Directory(directory) => report.directories.push(directory),
-                EntryReport::Skipped => delta.skipped += 1,
+                EntryReport::Skipped => {
+                    delta.skipped += 1;
+                    report.uncertain_entries = true;
+                }
                 EntryReport::Error(path, error) => {
                     record_error(&mut delta, &mut report.errors, &path, &error)
                 }
@@ -535,6 +549,8 @@ fn report_entry(
         EntryReport::Directory(PendingDirectory { identity, path })
     } else {
         EntryReport::File(FileEntry {
+            parent_identity: FileIdentity::default(),
+            parent_is_leaf: false,
             identity,
             can_trash: true,
             size: metadata.len(),
@@ -1034,6 +1050,61 @@ mod tests {
         assert_eq!(result.skipped, 0);
         assert_eq!(progress.lock().unwrap().bytes, 13);
         assert_eq!(progress.lock().unwrap().files, 3);
+    }
+
+    #[test]
+    fn leaf_detection_counts_empty_child_directories() {
+        let temp = Temp::new();
+        fs::create_dir_all(temp.0.join("branch/empty")).unwrap();
+        fs::create_dir_all(temp.0.join("leaf")).unwrap();
+        fs::write(temp.0.join("branch/a"), b"a").unwrap();
+        fs::write(temp.0.join("leaf/b"), b"b").unwrap();
+        let result = scan(
+            temp.0.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(ScanProgress::default())),
+        )
+        .unwrap();
+        assert!(
+            !result
+                .files
+                .iter()
+                .find(|f| f.path.ends_with("branch/a"))
+                .unwrap()
+                .parent_is_leaf
+        );
+        assert!(
+            result
+                .files
+                .iter()
+                .find(|f| f.path.ends_with("leaf/b"))
+                .unwrap()
+                .parent_is_leaf
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leaf_detection_is_conservative_about_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+        let temp = Temp::new();
+        fs::create_dir(temp.0.join("directory")).unwrap();
+        fs::write(temp.0.join("file"), b"a").unwrap();
+        symlink(temp.0.join("directory"), temp.0.join("link")).unwrap();
+        let result = scan(
+            temp.0.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(ScanProgress::default())),
+        )
+        .unwrap();
+        assert!(
+            !result
+                .files
+                .iter()
+                .find(|f| f.path.ends_with("file"))
+                .unwrap()
+                .parent_is_leaf
+        );
     }
 
     #[cfg(unix)]

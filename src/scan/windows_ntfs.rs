@@ -261,6 +261,8 @@ fn build_entry(
         EntryReport::Directory(PendingDirectory { path, identity })
     } else {
         EntryReport::File(FileEntry {
+            parent_identity: FileIdentity::default(),
+            parent_is_leaf: false,
             can_trash: true,
             path,
             size: info.EndOfFile as u64,

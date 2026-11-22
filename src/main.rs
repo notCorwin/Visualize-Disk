@@ -2,6 +2,7 @@
 
 mod directory_map;
 mod file_actions;
+mod hybrid;
 mod permission;
 mod platform;
 mod render;
@@ -281,7 +282,14 @@ impl Notice {
 struct TrashOutput {
     source: Arc<scan::ScanResult>,
     id: usize,
+    folder_hidden: Option<Arc<BTreeSet<usize>>>,
     result: Result<(), String>,
+}
+
+struct PendingFolderDelete {
+    source: Arc<scan::ScanResult>,
+    path: std::path::PathBuf,
+    identity: scan::FileIdentity,
 }
 
 struct TotalsOutput {
@@ -293,6 +301,17 @@ enum ViewMode {
     #[default]
     Files,
     Folders,
+    Hybrid,
+}
+
+impl ViewMode {
+    fn index(self) -> usize {
+        match self {
+            Self::Files => 0,
+            Self::Folders => 1,
+            Self::Hybrid => 2,
+        }
+    }
 }
 
 struct FolderOutput {
@@ -308,26 +327,34 @@ fn folder_snapshot(
     token: &AtomicU64,
     generation: u64,
 ) -> Option<scan::ScanResult> {
-    let mut groups: HashMap<&std::path::Path, u64> = HashMap::new();
+    let mut groups: HashMap<&std::path::Path, (u64, scan::FileIdentity, bool)> = HashMap::new();
     for (id, file) in data.files.iter().enumerate() {
         if id % 1024 == 0 && token.load(Ordering::Relaxed) != generation {
             return None;
         }
         if !hidden.contains(&id) {
-            let size = groups.entry(file.parent.as_ref()).or_default();
-            *size = size.saturating_add(file.size);
+            let group =
+                groups
+                    .entry(file.parent.as_ref())
+                    .or_insert((0, file.parent_identity, true));
+            group.0 = group.0.saturating_add(file.size);
+            group.2 &= group.1 == file.parent_identity && file.can_trash;
         }
     }
     let mut groups: Vec<_> = groups.into_iter().collect();
     groups.sort_unstable_by(|a, b| a.0.cmp(b.0));
     let files = groups
         .into_iter()
-        .map(|(path, size)| scan::FileEntry {
+        .map(|(path, (size, identity, safe))| scan::FileEntry {
+            parent_identity: scan::FileIdentity::default(),
+            parent_is_leaf: false,
             path: path.to_path_buf(),
             parent: Arc::from(path.parent().unwrap_or(path)),
             size,
-            identity: scan::FileIdentity::default(),
-            can_trash: false,
+            identity,
+            can_trash: safe
+                && path != data.root
+                && file_actions::can_move_target(path, file_actions::TargetKind::Directory),
         })
         .collect();
     (token.load(Ordering::Relaxed) == generation).then(|| scan::ScanResult {
@@ -457,10 +484,13 @@ struct App {
     folder_data: Option<Arc<scan::ScanResult>>,
     folder_rx: Option<mpsc::Receiver<FolderOutput>>,
     folder_generation: Arc<AtomicU64>,
+    hybrid_data: Option<hybrid::HybridSnapshot>,
+    hybrid_rx: Option<mpsc::Receiver<(u64, hybrid::HybridSnapshot)>>,
     hidden: Arc<BTreeSet<usize>>,
     job: Option<Job>,
     reveal_rx: Option<mpsc::Receiver<Result<(), String>>>,
     trash_rx: Option<mpsc::Receiver<TrashOutput>>,
+    pending_folder_delete: Option<PendingFolderDelete>,
     selected: Option<usize>,
     message: Option<String>,
     action_notice: Option<String>,
@@ -475,7 +505,7 @@ struct App {
     layout_generation: Arc<AtomicU64>,
     layout_key: Option<LayoutKey>,
     map_cache: Option<MapCache>,
-    inactive_map_cache: Option<MapCache>,
+    mode_caches: [Option<MapCache>; 3],
 }
 impl Default for App {
     fn default() -> Self {
@@ -488,10 +518,13 @@ impl Default for App {
             folder_data: None,
             folder_rx: None,
             folder_generation: Arc::new(AtomicU64::new(0)),
+            hybrid_data: None,
+            hybrid_rx: None,
             hidden: Arc::default(),
             job: None,
             reveal_rx: None,
             trash_rx: None,
+            pending_folder_delete: None,
             selected: None,
             message: None,
             action_notice: None,
@@ -506,7 +539,7 @@ impl Default for App {
             layout_generation: Arc::new(AtomicU64::new(0)),
             layout_key: None,
             map_cache: None,
-            inactive_map_cache: None,
+            mode_caches: [None, None, None],
         }
     }
 }
@@ -576,8 +609,10 @@ impl App {
         if let Some(old) = self.map_cache.take() {
             defer_drop(old);
         }
-        if let Some(old) = self.inactive_map_cache.take() {
-            defer_drop(old);
+        for cache in &mut self.mode_caches {
+            if let Some(old) = cache.take() {
+                defer_drop(old);
+            }
         }
         self.total_bytes = 0;
         self.totals_ready = false;
@@ -585,8 +620,43 @@ impl App {
         self.layout_key = None;
     }
     fn trash(&mut self, id: usize) {
-        if self.mode != ViewMode::Files
-            || self.access != permission::Access::Granted
+        if self.is_folder_tile(id) {
+            if self.trash_rx.is_some() || self.pending_folder_delete.is_some() {
+                return;
+            }
+            if let (Some(source), Some(folder)) = (
+                self.data.as_ref(),
+                self.view_data().and_then(|data| data.files.get(id)),
+            ) {
+                if self.access == permission::Access::Granted
+                    && folder.can_trash
+                    && file_actions::can_move_target(
+                        &folder.path,
+                        file_actions::TargetKind::Directory,
+                    )
+                {
+                    self.pending_folder_delete = Some(PendingFolderDelete {
+                        source: source.clone(),
+                        path: folder.path.clone(),
+                        identity: folder.identity,
+                    });
+                }
+            }
+            return;
+        }
+        let id = if self.mode == ViewMode::Hybrid {
+            let Some(Some(id)) = self
+                .hybrid_data
+                .as_ref()
+                .and_then(|data| data.source_ids.get(id))
+            else {
+                return;
+            };
+            *id
+        } else {
+            id
+        };
+        if self.access != permission::Access::Granted
             || self.trash_rx.is_some()
             || self.hidden.contains(&id)
         {
@@ -613,8 +683,72 @@ impl App {
         });
         rayon::spawn(move || {
             let result = file_actions::move_to_trash(&path, identity).map(|_| ());
-            let _ = tx.send(TrashOutput { source, id, result });
+            let _ = tx.send(TrashOutput {
+                source,
+                id,
+                folder_hidden: None,
+                result,
+            });
         });
+    }
+    fn confirm_folder_delete(&mut self) {
+        let Some(pending) = self.pending_folder_delete.take() else {
+            return;
+        };
+        if self.trash_rx.is_some()
+            || self.access != permission::Access::Granted
+            || !self
+                .data
+                .as_ref()
+                .is_some_and(|data| Arc::ptr_eq(data, &pending.source))
+        {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.trash_rx = Some(rx);
+        self.action_notice = None;
+        self.set_notice(Notice {
+            text: format!("正在移到{}…", platform::TRASH_NAME),
+            kind: NoticeKind::Info,
+            expires: None,
+        });
+        let hidden = self.hidden.clone();
+        rayon::spawn(move || {
+            let result = file_actions::move_target_to_trash(
+                &pending.path,
+                pending.identity,
+                file_actions::TargetKind::Directory,
+            )
+            .map(|_| ());
+            let folder_hidden = result.is_ok().then(|| {
+                let mut updated = (*hidden).clone();
+                updated.extend(
+                    pending
+                        .source
+                        .files
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(id, f)| f.path.starts_with(&pending.path).then_some(id)),
+                );
+                Arc::new(updated)
+            });
+            let _ = tx.send(TrashOutput {
+                source: pending.source,
+                id: 0,
+                folder_hidden,
+                result,
+            });
+        });
+    }
+    fn hide_folder(&mut self, hidden: Arc<BTreeSet<usize>>) {
+        defer_drop(std::mem::replace(&mut self.hidden, hidden));
+        self.invalidate_folders();
+        self.reset_layout();
+        for cache in &mut self.mode_caches {
+            if let Some(cache) = cache.take() {
+                defer_drop(cache);
+            }
+        }
     }
     fn set_notice(&mut self, notice: Notice) {
         if notice.kind != NoticeKind::Error
@@ -712,6 +846,18 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+        if let Some(rx) = &self.hybrid_rx {
+            match rx.try_recv() {
+                Ok((generation, data)) => {
+                    self.hybrid_rx = None;
+                    if generation == self.folder_generation.load(Ordering::Relaxed) {
+                        self.hybrid_data = Some(data);
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.hybrid_rx = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if let Some(rx) = &self.permission_rx {
             match rx.try_recv() {
                 Ok(access) => {
@@ -777,7 +923,11 @@ impl App {
                                 .as_ref()
                                 .is_some_and(|current| Arc::ptr_eq(current, &output.source))
                             {
-                                self.hide_file(output.id);
+                                if let Some(hidden) = output.folder_hidden {
+                                    self.hide_folder(hidden);
+                                } else {
+                                    self.hide_file(output.id);
+                                }
                                 // A running scan may have read the old path already.
                                 if self.job.is_some() {
                                     self.launch_scan();
@@ -872,7 +1022,7 @@ impl App {
             if let Some(cache) = &mut self.map_cache {
                 cache.hide(id);
             }
-        } else if let Some(cache) = &mut self.inactive_map_cache {
+        } else if let Some(cache) = &mut self.mode_caches[ViewMode::Files.index()] {
             cache.hide(id);
         }
     }
@@ -884,10 +1034,19 @@ impl App {
         if let Some(data) = self.folder_data.take() {
             defer_drop(data);
         }
-        if self.mode == ViewMode::Folders {
+        if let Some(rx) = self.hybrid_rx.take() {
+            defer_drop(rx);
+        }
+        if let Some(data) = self.hybrid_data.take() {
+            defer_drop(data);
+        }
+        if self.mode != ViewMode::Files {
             self.reset_layout();
-        } else if let Some(cache) = self.inactive_map_cache.take() {
-            defer_drop(cache);
+        }
+        for mode in [ViewMode::Folders, ViewMode::Hybrid] {
+            if let Some(cache) = self.mode_caches[mode.index()].take() {
+                defer_drop(cache);
+            }
         }
     }
     fn reset_layout(&mut self) {
@@ -903,13 +1062,14 @@ impl App {
     }
     fn set_mode(&mut self, mode: ViewMode) {
         if self.mode != mode {
+            self.mode_caches[self.mode.index()] = self.map_cache.take();
             self.mode = mode;
             self.layout_generation.fetch_add(1, Ordering::Relaxed);
             if let Some(rx) = self.layout_rx.take() {
                 defer_drop(rx);
             }
             self.selected = None;
-            std::mem::swap(&mut self.map_cache, &mut self.inactive_map_cache);
+            self.map_cache = self.mode_caches[mode.index()].take();
             let generation = self.layout_generation.load(Ordering::Relaxed);
             self.layout_key = self.map_cache.as_mut().map(|cache| {
                 cache.generation = generation;
@@ -921,9 +1081,42 @@ impl App {
         match self.mode {
             ViewMode::Files => self.data.as_ref(),
             ViewMode::Folders => self.folder_data.as_ref(),
+            ViewMode::Hybrid => self.hybrid_data.as_ref().map(|data| &data.data),
+        }
+    }
+    fn is_folder_tile(&self, id: usize) -> bool {
+        match self.mode {
+            ViewMode::Files => false,
+            ViewMode::Folders => true,
+            ViewMode::Hybrid => self
+                .hybrid_data
+                .as_ref()
+                .and_then(|data| data.source_ids.get(id))
+                .is_some_and(Option::is_none),
         }
     }
     fn prepare_folders(&mut self, ctx: &egui::Context) {
+        if self.mode == ViewMode::Hybrid {
+            if self.hybrid_data.is_some() || self.hybrid_rx.is_some() {
+                return;
+            }
+            let Some(data) = self.data.clone() else {
+                return;
+            };
+            let hidden = self.hidden.clone();
+            let token = self.folder_generation.clone();
+            let generation = token.load(Ordering::Relaxed);
+            let (tx, rx) = mpsc::channel();
+            self.hybrid_rx = Some(rx);
+            let ctx = ctx.clone();
+            rayon::spawn(move || {
+                if let Some(data) = hybrid::build(&data, &hidden, &token, generation) {
+                    let _ = tx.send((generation, data));
+                }
+                ctx.request_repaint();
+            });
+            return;
+        }
         if self.mode != ViewMode::Folders || self.folder_data.is_some() || self.folder_rx.is_some()
         {
             return;
@@ -1089,7 +1282,24 @@ impl App {
     }
     fn ui(&mut self, ctx: &egui::Context) {
         self.ui_contents(ctx);
-        if !ctx.wants_keyboard_input()
+        if let Some(pending) = &self.pending_folder_delete {
+            let path = pending.path.to_string_lossy().into_owned();
+            let mut confirm = false;
+            let mut cancel = false;
+            egui::Window::new("移到废纸篓").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(ctx, |ui| {
+                ui.label("将整个文件夹及其所有子文件夹和文件移到废纸篓，包括未扫描或后来新增的内容：");
+                ui.add(egui::Label::new(path).wrap());
+                ui.horizontal(|ui| { cancel = ui.button("取消").clicked(); confirm = ui.button(format!("移到{}", platform::TRASH_NAME)).clicked(); });
+            });
+            if cancel {
+                self.pending_folder_delete = None;
+            }
+            if confirm {
+                self.confirm_folder_delete();
+            }
+        }
+        if self.pending_folder_delete.is_none()
+            && !ctx.wants_keyboard_input()
             && ctx.input_mut(|input| {
                 input.consume_key(egui::Modifiers::COMMAND, egui::Key::Backspace)
             })
@@ -1104,6 +1314,7 @@ impl App {
             || self.totals_rx.is_some()
             || self.layout_rx.is_some()
             || self.folder_rx.is_some()
+            || self.hybrid_rx.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -1203,6 +1414,12 @@ impl App {
                     {
                         self.set_mode(ViewMode::Folders);
                     }
+                    if ui
+                        .selectable_label(self.mode == ViewMode::Hybrid, "折中")
+                        .clicked()
+                    {
+                        self.set_mode(ViewMode::Hybrid);
+                    }
                     let selected = self.selected.and_then(|i| {
                         self.view_data()
                             .and_then(|data| data.files.get(i))
@@ -1217,16 +1434,22 @@ impl App {
                     {
                         reveal = selected.map(|(i, _)| i);
                     }
-                    if self.mode == ViewMode::Files
-                        && selected.is_none_or(|(_, f)| {
-                            f.can_trash && file_actions::can_move_to_trash(&f.path)
-                        })
-                        && ui
-                            .add_enabled(
-                                selected.is_some() && self.trash_rx.is_none(),
-                                egui::Button::new(format!("移到{}", platform::TRASH_NAME)),
+                    if selected.is_none_or(|(id, f)| {
+                        f.can_trash
+                            && file_actions::can_move_target(
+                                &f.path,
+                                if self.is_folder_tile(id) {
+                                    file_actions::TargetKind::Directory
+                                } else {
+                                    file_actions::TargetKind::File
+                                },
                             )
-                            .clicked()
+                    }) && ui
+                        .add_enabled(
+                            selected.is_some() && self.trash_rx.is_none(),
+                            egui::Button::new(format!("移到{}", platform::TRASH_NAME)),
+                        )
+                        .clicked()
                     {
                         trash = selected.map(|(i, _)| i);
                     }
@@ -1360,7 +1583,7 @@ impl App {
                     if response.clicked() {
                         self.selected = Some(i);
                     }
-                    if self.mode == ViewMode::Folders {
+                    if self.is_folder_tile(i) {
                         show_entry_tooltip(&response, f, true);
                     } else {
                         show_file_tooltip(&response, f);
@@ -1395,8 +1618,10 @@ impl Drop for App {
         if let Some(map) = self.map_cache.take() {
             defer_drop(map);
         }
-        if let Some(map) = self.inactive_map_cache.take() {
-            defer_drop(map);
+        for cache in &mut self.mode_caches {
+            if let Some(map) = cache.take() {
+                defer_drop(map);
+            }
         }
     }
 }
@@ -1454,6 +1679,8 @@ mod tests {
             root: "/".into(),
             files: vec![
                 scan::FileEntry {
+                    parent_identity: scan::FileIdentity::default(),
+                    parent_is_leaf: false,
                     can_trash: true,
                     path: "/a/empty".into(),
                     parent: Path::new("/a").into(),
@@ -1461,6 +1688,8 @@ mod tests {
                     identity: scan::FileIdentity::default(),
                 },
                 scan::FileEntry {
+                    parent_identity: scan::FileIdentity::default(),
+                    parent_is_leaf: false,
                     can_trash: true,
                     path: "/a/large".into(),
                     parent: Path::new("/a").into(),
@@ -1468,6 +1697,8 @@ mod tests {
                     identity: scan::FileIdentity::default(),
                 },
                 scan::FileEntry {
+                    parent_identity: scan::FileIdentity::default(),
+                    parent_is_leaf: false,
                     can_trash: true,
                     path: "/b/other".into(),
                     parent: Path::new("/b").into(),
@@ -1560,6 +1791,8 @@ mod tests {
     fn folder_mode_groups_direct_files_once_and_excludes_hidden() {
         let mut data = snapshot();
         data.files.push(scan::FileEntry {
+            parent_identity: scan::FileIdentity::default(),
+            parent_is_leaf: false,
             path: "/a/nested/file".into(),
             parent: Path::new("/a/nested").into(),
             size: 7,
@@ -1581,7 +1814,7 @@ mod tests {
                 (Path::new("/b"), 42)
             ]
         );
-        assert!(folders.files.iter().all(|f| !f.can_trash));
+        assert!(folders.files.iter().all(|f| f.can_trash));
         assert!(folder_snapshot(&data, &BTreeSet::new(), &token, 0).is_none());
     }
     #[test]
@@ -1623,7 +1856,7 @@ mod tests {
         assert!(app.hidden.contains(&2));
     }
     #[test]
-    fn folder_mode_delete_shortcut_does_not_delete() {
+    fn folder_mode_delete_shortcut_requests_confirmation() {
         let ctx = egui::Context::default();
         configure(&ctx);
         let mut app = App::default();
@@ -1650,7 +1883,38 @@ mod tests {
         };
         let _ = ctx.run(input, |ctx| app.ui(ctx));
         assert!(app.trash_rx.is_none());
-        assert_eq!(app.selected, Some(0));
+        assert!(app.pending_folder_delete.is_some());
+    }
+    #[test]
+    fn hybrid_mode_preserves_tile_types_and_reuses_cache_until_hidden_changes() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        let mut data = snapshot();
+        data.files[2].parent_is_leaf = true;
+        app.data = Some(Arc::new(data));
+        app.set_mode(ViewMode::Hybrid);
+        settle(&mut app, &ctx);
+        let hybrid = app.hybrid_data.as_ref().unwrap();
+        assert_eq!(hybrid.source_ids, vec![Some(0), Some(1), None]);
+        assert!(!app.is_folder_tile(0));
+        assert!(app.is_folder_tile(2));
+        let texture = app.map_cache.as_ref().unwrap().texture.id();
+        app.set_mode(ViewMode::Folders);
+        settle(&mut app, &ctx);
+        app.set_mode(ViewMode::Hybrid);
+        settle(&mut app, &ctx);
+        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), texture);
+        app.selected = Some(1);
+        app.hide_file(1);
+        assert_eq!(app.selected, None);
+        settle(&mut app, &ctx);
+        assert_eq!(
+            app.hybrid_data.as_ref().unwrap().source_ids,
+            vec![Some(0), None]
+        );
+        assert_ne!(app.map_cache.as_ref().unwrap().texture.id(), texture);
     }
     #[test]
     fn bytes_are_binary_and_zero_is_exact() {
@@ -1951,6 +2215,7 @@ mod tests {
         app.trash_rx = Some(rx);
         tx.send(TrashOutput {
             source: source.clone(),
+            folder_hidden: None,
             id: 1,
             result: Err("无法移到废纸篓。".into()),
         })
@@ -1963,6 +2228,7 @@ mod tests {
         app.trash_rx = Some(rx);
         tx.send(TrashOutput {
             source: source.clone(),
+            folder_hidden: None,
             id: 1,
             result: Ok(()),
         })
@@ -2068,6 +2334,7 @@ mod tests {
         app.trash_rx = Some(rx);
         tx.send(TrashOutput {
             source,
+            folder_hidden: None,
             id: 0,
             result: Ok(()),
         })
@@ -2617,6 +2884,8 @@ mod tests {
         let files: Vec<_> = (0..n)
             .into_par_iter()
             .map(|i| scan::FileEntry {
+                parent_identity: scan::FileIdentity::default(),
+                parent_is_leaf: false,
                 can_trash: true,
                 path: format!(
                     "/volume{}/folder{}/group{}/file{i}",

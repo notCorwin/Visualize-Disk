@@ -1,6 +1,12 @@
 use crate::scan::{FileEntry, FileIdentity, is_link_or_reparse};
 use std::{fs, io::ErrorKind, path::Path};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetKind {
+    File,
+    Directory,
+}
+
 const REPLACED: &str = "文件已被替换，请重新扫描后重试。";
 
 #[cfg(windows)]
@@ -8,9 +14,14 @@ mod windows;
 
 /// Use the native recoverable trash operation; never fall back to permanent deletion.
 pub fn move_to_trash(path: &Path, expected: FileIdentity) -> Result<Option<FileEntry>, String> {
-    if is_system_path(path) || fs::canonicalize(path).is_ok_and(|p| is_system_path(&p)) {
-        return Err("系统文件夹中的内容不能移到废纸篓。".into());
-    }
+    move_target_to_trash(path, expected, TargetKind::File)
+}
+
+pub fn move_target_to_trash(
+    path: &Path,
+    expected: FileIdentity,
+    kind: TargetKind,
+) -> Result<Option<FileEntry>, String> {
     if already_in_trash(path) {
         return Err(if cfg!(windows) {
             "文件已在回收站中，请在系统回收站中还原；不会再次删除。"
@@ -19,13 +30,36 @@ pub fn move_to_trash(path: &Path, expected: FileIdentity) -> Result<Option<FileE
         }
         .into());
     }
-    verify_file(path, expected)?;
-    native_trash(path, expected)
+    if !can_move_target(path, kind) {
+        return Err("系统文件夹中的内容不能移到废纸篓。".into());
+    }
+    match fs::canonicalize(path) {
+        Ok(real) if !can_move_target(&real, kind) => {
+            return Err("系统文件夹中的内容不能移到废纸篓。".into());
+        }
+        Err(_) if kind == TargetKind::Directory => {
+            return Err("无法确认文件夹位置，请重新扫描后重试。".into());
+        }
+        _ => {}
+    }
+    verify_target(path, expected, kind)?;
+    native_trash(path, expected, kind)
 }
 
 /// Whether a scanned file may be offered as a trash action.
 pub fn can_move_to_trash(path: &Path) -> bool {
     !already_in_trash(path) && !is_system_path(path)
+}
+
+pub fn can_move_target(path: &Path, kind: TargetKind) -> bool {
+    can_move_to_trash(path)
+        && (kind != TargetKind::Directory
+            || (path.is_absolute()
+                && path.parent().is_some()
+                && !crate::scan::startup_data_relative(path)
+                    .as_os_str()
+                    .is_empty()
+                && !Path::new("/System").starts_with(path)))
 }
 
 fn is_system_path(path: &Path) -> bool {
@@ -60,7 +94,12 @@ fn move_with(
     operation(path, expected)
 }
 
+#[cfg(test)]
 fn verify_file(path: &Path, expected: FileIdentity) -> Result<(), String> {
+    verify_target(path, expected, TargetKind::File)
+}
+
+fn verify_target(path: &Path, expected: FileIdentity, kind: TargetKind) -> Result<(), String> {
     if !path.is_absolute() {
         return Err("无法确认文件位置，请重新扫描后重试。".into());
     }
@@ -77,7 +116,12 @@ fn verify_file(path: &Path, expected: FileIdentity) -> Result<(), String> {
             _ => "无法读取文件信息，请确认磁盘仍已连接后重试。".into(),
         }
     })?;
-    if is_link_or_reparse(&metadata) || !metadata.is_file() {
+    if is_link_or_reparse(&metadata)
+        || match kind {
+            TargetKind::File => !metadata.is_file(),
+            TargetKind::Directory => !metadata.is_dir(),
+        }
+    {
         return Err("扫描位置已不再是普通文件，请重新扫描后重试。".into());
     }
     if FileIdentity::from_path(path, &metadata)
@@ -90,7 +134,11 @@ fn verify_file(path: &Path, expected: FileIdentity) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn native_trash(path: &Path, expected: FileIdentity) -> Result<Option<FileEntry>, String> {
+fn native_trash(
+    path: &Path,
+    expected: FileIdentity,
+    kind: TargetKind,
+) -> Result<Option<FileEntry>, String> {
     let home = home_directory()?;
     let home_meta =
         fs::metadata(&home).map_err(|_| "无法确认当前用户的废纸篓位置，请在 Finder 中处理。")?;
@@ -100,19 +148,33 @@ fn native_trash(path: &Path, expected: FileIdentity) -> Result<Option<FileEntry>
     // Only request consent for an explicit user action and recheck identity
     // immediately before asking Finder to perform its recoverable delete.
     finder::permission(true)?;
-    verify_file(path, expected)?;
+    verify_target(path, expected, kind)?;
+    if !can_move_target(
+        &fs::canonicalize(path).map_err(|_| "无法确认文件位置，请重新扫描后重试。")?,
+        kind,
+    ) {
+        return Err("系统文件夹中的内容不能移到废纸篓。".into());
+    }
     finder::trash(path)
         .map(|()| None)
         .map_err(|error| error.message)
 }
 
 #[cfg(windows)]
-fn native_trash(path: &Path, expected: FileIdentity) -> Result<Option<FileEntry>, String> {
-    windows::move_to_trash(path, expected)
+fn native_trash(
+    path: &Path,
+    expected: FileIdentity,
+    kind: TargetKind,
+) -> Result<Option<FileEntry>, String> {
+    windows::move_to_trash(path, expected, kind)
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
-fn native_trash(_path: &Path, _expected: FileIdentity) -> Result<Option<FileEntry>, String> {
+fn native_trash(
+    _path: &Path,
+    _expected: FileIdentity,
+    _kind: TargetKind,
+) -> Result<Option<FileEntry>, String> {
     Err("当前系统不支持安全的回收站操作。".into())
 }
 
@@ -268,6 +330,8 @@ fn destination_entry(path: std::path::PathBuf) -> Option<FileEntry> {
         return None;
     }
     Some(FileEntry {
+        parent_identity: FileIdentity::default(),
+        parent_is_leaf: false,
         can_trash: can_move_to_trash(&path)
             && fs::canonicalize(&path).is_ok_and(|p| can_move_to_trash(&p)),
         parent: path.parent()?.into(),
@@ -369,6 +433,44 @@ mod tests {
             assert!(move_with(&link, file_identity, |_, _| panic!()).is_err());
             assert!(file.exists());
         }
+    }
+
+    #[test]
+    fn directories_require_original_identity_and_reject_protected_ancestors() {
+        let temp = Temp::new();
+        let original = temp.0.join("directory");
+        fs::create_dir(&original).unwrap();
+        let metadata = fs::symlink_metadata(&original).unwrap();
+        let identity = FileIdentity::from_path(&original, &metadata).unwrap();
+        assert!(verify_target(&original, identity, TargetKind::Directory).is_ok());
+        assert!(verify_target(&original, identity, TargetKind::File).is_err());
+        fs::rename(&original, temp.0.join("old")).unwrap();
+        fs::create_dir(&original).unwrap();
+        assert_eq!(
+            verify_target(&original, identity, TargetKind::Directory).unwrap_err(),
+            REPLACED
+        );
+        assert!(!can_move_target(Path::new("/"), TargetKind::Directory));
+        assert!(!can_move_target(
+            Path::new("/System"),
+            TargetKind::Directory
+        ));
+        assert!(!can_move_target(
+            Path::new("/System/Volumes/Data"),
+            TargetKind::Directory
+        ));
+        assert!(!can_move_target(
+            Path::new("/System/Volumes/Data/System"),
+            TargetKind::Directory
+        ));
+        assert!(can_move_target(
+            Path::new("/System/Volumes/Data/Users"),
+            TargetKind::Directory
+        ));
+        assert!(can_move_target(
+            Path::new("/Systematic"),
+            TargetKind::Directory
+        ));
     }
 
     #[test]
