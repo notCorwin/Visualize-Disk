@@ -3,7 +3,10 @@
 use crate::treemap::Rect;
 use eframe::egui::{Color32, ColorImage};
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 const MAX_SIDE: usize = 2048;
 const BAND_ROWS: usize = 128;
@@ -97,6 +100,8 @@ struct HeightField {
     size: [usize; 2],
     origin: [f32; 2],
     step: [f32; 2],
+    offset: [usize; 2],
+    full_size: [usize; 2],
 }
 
 impl HeightField {
@@ -104,6 +109,26 @@ impl HeightField {
         platforms: &[Platform],
         view: Rect,
         size: [usize; 2],
+        token: &AtomicU64,
+        generation: u64,
+    ) -> Option<Self> {
+        Self::build_region(
+            platforms,
+            view,
+            size,
+            [0, 0, size[0], size[1]],
+            token,
+            generation,
+        )
+    }
+
+    // Build the same world-space height samples as a full frame, retaining only
+    // samples needed by the patch and its lighting/interpolation halo.
+    fn build_region(
+        platforms: &[Platform],
+        view: Rect,
+        size: [usize; 2],
+        region: [usize; 4],
         token: &AtomicU64,
         generation: u64,
     ) -> Option<Self> {
@@ -115,9 +140,32 @@ impl HeightField {
         let origin = std::array::from_fn::<_, 2, _>(|axis| {
             ((low[axis] - LIGHT_REACH) / step[axis]).floor() * step[axis] - step[axis]
         });
-        let field_size = std::array::from_fn::<_, 2, _>(|axis| {
+        let full_size = std::array::from_fn::<_, 2, _>(|axis| {
             ((high[axis] + LIGHT_REACH - origin[axis]) / step[axis]).ceil() as usize + 1
         });
+        let patch_low = [region[0], region[1]];
+        let patch_high = [region[2], region[3]];
+        let offset = std::array::from_fn::<_, 2, _>(|axis| {
+            let world = low[axis]
+                + (patch_low[axis] as f32 + 0.5) * (high[axis] - low[axis]) / size[axis] as f32;
+            (((world - LIGHT_REACH) - origin[axis]) / step[axis])
+                .floor()
+                .max(0.0) as usize
+        });
+        let end = std::array::from_fn::<_, 2, _>(|axis| {
+            let world = low[axis]
+                + (patch_high[axis].saturating_sub(1) as f32 + 0.5) * (high[axis] - low[axis])
+                    / size[axis] as f32;
+            ((((world + LIGHT_REACH) - origin[axis]) / step[axis]).ceil() as usize + 2)
+                .min(full_size[axis])
+        });
+        // Preserve the original full-frame field, including boundary samples.
+        let (offset, end) = if region == [0, 0, size[0], size[1]] {
+            ([0, 0], full_size)
+        } else {
+            (offset, end)
+        };
+        let field_size = [end[0] - offset[0], end[1] - offset[1]];
         let mut values = vec![0.0; field_size[0] * field_size[1]];
         let mut bands: Vec<Vec<(Platform, [usize; 4])>> = (0..field_size[1].div_ceil(BAND_ROWS))
             .map(|_| Vec::new())
@@ -133,12 +181,14 @@ impl HeightField {
                 (((low[axis] - origin[axis]) / step[axis] - 0.5)
                     .ceil()
                     .max(0.0) as usize)
+                    .saturating_sub(offset[axis])
                     .min(field_size[axis])
             });
             let end = std::array::from_fn::<_, 2, _>(|axis| {
                 (((high[axis] - origin[axis]) / step[axis] - 0.5)
                     .ceil()
                     .max(0.0) as usize)
+                    .saturating_sub(offset[axis])
                     .min(field_size[axis])
             });
             if start[0] >= end[0] || start[1] >= end[1] {
@@ -168,10 +218,10 @@ impl HeightField {
                     }
                     let r = platform.bounds;
                     for y in y0..y1 {
-                        let wy = origin[1] + (y as f32 + 0.5) * step[1];
+                        let wy = origin[1] + ((y + offset[1]) as f32 + 0.5) * step[1];
                         let dy = (wy - r.y).min(r.y + r.h - wy);
                         for x in x0..x1 {
-                            let wx = origin[0] + (x as f32 + 0.5) * step[0];
+                            let wx = origin[0] + ((x + offset[0]) as f32 + 0.5) * step[0];
                             let distance = dy.min(wx - r.x).min(r.x + r.w - wx);
                             let t = (distance / BEVEL_WIDTH).clamp(0.0, 1.0);
                             values[(y - band * BAND_ROWS) * width + x] +=
@@ -185,13 +235,17 @@ impl HeightField {
             size: field_size,
             origin,
             step,
+            offset,
+            full_size,
         })
     }
 
     fn sample(&self, x: f32, y: f32) -> f32 {
         let p = [x, y];
         let uv = std::array::from_fn::<_, 2, _>(|axis| {
-            ((p[axis] - self.origin[axis]) / self.step[axis] - 0.5)
+            (((p[axis] - self.origin[axis]) / self.step[axis] - 0.5)
+                .clamp(0.0, (self.full_size[axis] - 1) as f32)
+                - self.offset[axis] as f32)
                 .clamp(0.0, (self.size[axis] - 1) as f32)
         });
         let [x0, y0] = uv.map(|v| v.floor() as usize);
@@ -264,7 +318,7 @@ pub struct RenderRaster {
     pub image: Option<ColorImage>,
     pub bounds: Rect,
     size: [usize; 2],
-    owners: Vec<u32>,
+    owners: Arc<Vec<u32>>,
 }
 
 impl RenderRaster {
@@ -290,10 +344,9 @@ impl RenderRaster {
 pub struct RenderMap {
     pub image: Option<ColorImage>,
     pub bounds: Rect,
-    entries: Vec<RenderEntry>,
-    #[cfg(test)]
-    platforms: Vec<Platform>,
-    by_id: Vec<u32>,
+    entries: Arc<Vec<RenderEntry>>,
+    platforms: Arc<Vec<Platform>>,
+    by_id: Arc<Vec<u32>>,
     base: RenderRaster,
 }
 
@@ -329,6 +382,7 @@ impl RenderMap {
         Self::build_with_platforms(entries, Vec::new(), bounds, size, token, generation)
     }
 
+    #[cfg(test)]
     pub fn build_with_platforms(
         entries: Vec<RenderEntry>,
         platforms: Vec<Platform>,
@@ -337,15 +391,38 @@ impl RenderMap {
         token: &AtomicU64,
         generation: u64,
     ) -> Option<Self> {
-        if cancelled(token, generation) || !valid(bounds) {
+        let slot_count = entries.len();
+        Self::build_with_slots(
+            entries, platforms, bounds, size, slot_count, token, generation,
+        )
+    }
+
+    /// Build a map with a bounded, caller-owned stable slot space. `slot_count`
+    /// comes from the source snapshot or generational arena, not an arbitrary ID.
+    /// This preserves sparse IDs after tombstones without indexing a new Vec by
+    /// the number of live entries.
+    pub fn build_with_slots(
+        entries: Vec<RenderEntry>,
+        platforms: Vec<Platform>,
+        bounds: Rect,
+        size: [usize; 2],
+        slot_count: usize,
+        token: &AtomicU64,
+        generation: u64,
+    ) -> Option<Self> {
+        if cancelled(token, generation)
+            || !valid(bounds)
+            || slot_count < entries.len()
+            || slot_count >= NONE as usize
+        {
             return None;
         }
-        let mut by_id = vec![NONE; entries.len()];
+        let mut by_id = vec![NONE; slot_count];
         for (index, entry) in entries.iter().enumerate() {
             if index % 4096 == 0 && cancelled(token, generation) {
                 return None;
             }
-            if entry.id >= by_id.len() || index >= NONE as usize {
+            if entry.id >= by_id.len() || index >= NONE as usize || by_id[entry.id] != NONE {
                 return None;
             }
             by_id[entry.id] = index as u32;
@@ -355,12 +432,73 @@ impl RenderMap {
         Some(Self {
             image,
             bounds,
-            entries,
-            #[cfg(test)]
-            platforms,
-            by_id,
+            entries: Arc::new(entries),
+            platforms: Arc::new(platforms),
+            by_id: Arc::new(by_id),
             base,
         })
+    }
+
+    /// O(1) snapshot for off-thread updates. Raster pixels already uploaded to
+    /// the texture are intentionally not copied. Changes use copy-on-write and
+    /// the caller must reject results whose scene generation is no longer live.
+    pub fn snapshot_for_update(&self) -> Self {
+        Self {
+            image: None,
+            bounds: self.bounds,
+            entries: Arc::clone(&self.entries),
+            platforms: Arc::clone(&self.platforms),
+            by_id: Arc::clone(&self.by_id),
+            base: RenderRaster {
+                image: None,
+                bounds: self.base.bounds,
+                size: self.base.size,
+                owners: Arc::clone(&self.base.owners),
+            },
+        }
+    }
+
+    /// Live geometry in painting order; tombstones retain invalid rectangles.
+    pub fn entries(&self) -> &[RenderEntry] {
+        &self.entries
+    }
+
+    /// Platform painting order is shared with the full rasterizer.
+    pub fn platforms(&self) -> &[Platform] {
+        &self.platforms
+    }
+
+    /// Verify in one cancellable pass that no displayed pixel refers to a
+    /// tombstoned slot. Run on an immutable snapshot off the UI thread.
+    pub fn owners_exclude(
+        &self,
+        excluded: &std::collections::HashSet<usize>,
+        token: &AtomicU64,
+        generation: u64,
+    ) -> Option<bool> {
+        if cancelled(token, generation) {
+            return None;
+        }
+        if excluded.is_empty() {
+            return Some(true);
+        }
+        for chunk in self.base.owners.chunks(4096) {
+            if cancelled(token, generation) {
+                return None;
+            }
+            if chunk
+                .iter()
+                .any(|&owner| owner != NONE && excluded.contains(&(owner as usize)))
+            {
+                return Some(false);
+            }
+        }
+        (!cancelled(token, generation)).then_some(true)
+    }
+
+    /// Actual texture dimensions after the renderer's size cap.
+    pub fn physical_size(&self) -> [usize; 2] {
+        self.base.size
     }
 
     pub fn rect(&self, id: usize) -> Option<Rect> {
@@ -386,11 +524,12 @@ impl RenderMap {
     /// Remove just this file's sampled pixels. Geometry and the original GPU
     /// texture stay valid; returned rectangles cover precisely the cleared
     /// owners and can be painted as background over that texture.
+    #[cfg(test)]
     pub fn erase(&mut self, id: usize) -> Vec<Rect> {
         let Some(rect) = self.rect(id) else {
             return Vec::new();
         };
-        self.by_id[id] = NONE;
+        Arc::make_mut(&mut self.by_id)[id] = NONE;
         let [width, height] = self.base.size;
         let sx = width as f32 / self.bounds.w;
         let sy = height as f32 / self.bounds.h;
@@ -409,7 +548,7 @@ impl RenderMap {
             std::collections::BTreeMap::new();
         for y in y0..y1 {
             let mut current = std::collections::BTreeMap::new();
-            let row = &mut self.base.owners[y * width..(y + 1) * width];
+            let row = &mut Arc::make_mut(&mut self.base.owners)[y * width..(y + 1) * width];
             let mut x = x0;
             while x < x1 {
                 if row[x] != id as u32 {
@@ -441,6 +580,82 @@ impl RenderMap {
                 h: h as f32 / sy,
             })
             .collect()
+    }
+
+    /// Hide many IDs in one owner pass. Run on `snapshot_for_update()` off
+    /// the UI thread; discard the snapshot when cancelled. Returned rectangles
+    /// cover exactly the erased pixels, ready to be published with the map.
+    pub fn erase_many(
+        &mut self,
+        ids: &[usize],
+        token: &AtomicU64,
+        generation: u64,
+    ) -> Option<Vec<Rect>> {
+        if cancelled(token, generation) {
+            return None;
+        }
+        let mut erased = std::collections::HashSet::with_capacity(ids.len().min(self.by_id.len()));
+        for (i, &id) in ids.iter().enumerate() {
+            if i % 4096 == 0 && cancelled(token, generation) {
+                return None;
+            }
+            if self.by_id.get(id).is_some_and(|&slot| slot != NONE) {
+                erased.insert(id as u32);
+            }
+        }
+        if erased.is_empty() {
+            return Some(Vec::new());
+        }
+        let by_id = Arc::make_mut(&mut self.by_id);
+        for &id in &erased {
+            by_id[id as usize] = NONE;
+        }
+        let [width, height] = self.base.size;
+        let owners = Arc::make_mut(&mut self.base.owners);
+        let mut runs: Vec<[usize; 4]> = Vec::new();
+        let mut previous: std::collections::BTreeMap<(usize, usize), usize> =
+            std::collections::BTreeMap::new();
+        for y in 0..height {
+            if cancelled(token, generation) {
+                return None;
+            }
+            let row = &mut owners[y * width..(y + 1) * width];
+            let mut current = std::collections::BTreeMap::new();
+            let mut x = 0;
+            while x < width {
+                if !erased.contains(&row[x]) {
+                    x += 1;
+                    continue;
+                }
+                let start = x;
+                while x < width && erased.contains(&row[x]) {
+                    row[x] = NONE;
+                    x += 1;
+                }
+                let key = (start, x);
+                let index = if let Some(&i) = previous.get(&key) {
+                    runs[i][3] += 1;
+                    i
+                } else {
+                    runs.push([start, y, x - start, 1]);
+                    runs.len() - 1
+                };
+                current.insert(key, index);
+            }
+            previous = current;
+        }
+        let sx = width as f32 / self.bounds.w;
+        let sy = height as f32 / self.bounds.h;
+        Some(
+            runs.into_iter()
+                .map(|[x, y, w, h]| Rect {
+                    x: self.bounds.x + x as f32 / sx,
+                    y: self.bounds.y + y as f32 / sy,
+                    w: w as f32 / sx,
+                    h: h as f32 / sy,
+                })
+                .collect(),
+        )
     }
 
     /// Render just the currently visible world rectangle. The overview remains
@@ -499,6 +714,245 @@ fn dimensions(requested: [usize; 2]) -> [usize; 2] {
 pub fn logical_pixel_size(bounds: Rect, requested: [usize; 2]) -> f32 {
     let [width, height] = dimensions(requested);
     (bounds.w / width as f32).max(bounds.h / height as f32)
+}
+
+/// A rectangular update in the physical pixel grid of an existing map.
+/// Colors and owners are computed together and must be published together.
+pub struct RasterPatch {
+    pub origin: [usize; 2],
+    pub image: ColorImage,
+    owners: Vec<u32>,
+    full_size: [usize; 2],
+}
+
+impl RenderMap {
+    /// Commit a patch and its changed geometry as one validated transaction.
+    /// IDs outside the changed region must retain their identity and geometry.
+    /// The caller must publish the matching texture in the same UI frame.
+    pub fn apply_scene_patch(
+        &mut self,
+        patch: &RasterPatch,
+        changes: &[(usize, Option<RenderEntry>)],
+        platforms: Option<Vec<Platform>>,
+    ) -> bool {
+        let [width, height] = patch.image.size;
+        let [x, y] = patch.origin;
+        if self.base.size != patch.full_size
+            || width == 0
+            || height == 0
+            || x.checked_add(width).is_none_or(|v| v > self.base.size[0])
+            || y.checked_add(height).is_none_or(|v| v > self.base.size[1])
+            || patch.owners.len() != width * height
+        {
+            return false;
+        }
+        let mut changed = std::collections::HashMap::with_capacity(changes.len());
+        let max_slots = self.by_id.len().saturating_add(changes.len());
+        let mut added = 0usize;
+        for (id, entry) in changes {
+            if *id >= NONE as usize
+                || *id >= max_slots
+                || changed.insert(*id, entry.is_some()).is_some()
+                || entry
+                    .as_ref()
+                    .is_some_and(|entry| entry.id != *id || !valid(entry.rect))
+            {
+                return false;
+            }
+            if entry.is_some() && self.by_id.get(*id).is_none_or(|slot| *slot == NONE) {
+                added += 1;
+            }
+        }
+        if self
+            .entries
+            .len()
+            .checked_add(added)
+            .is_none_or(|len| len >= NONE as usize)
+        {
+            return false;
+        }
+        // An owner in the new patch must resolve to an existing or added entry.
+        for &owner in &patch.owners {
+            if owner == NONE {
+                continue;
+            }
+            let id = owner as usize;
+            let alive = changed
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| self.by_id.get(id).is_some_and(|index| *index != NONE));
+            if !alive {
+                return false;
+            }
+        }
+        if !changes.is_empty() {
+            let by_id = Arc::make_mut(&mut self.by_id);
+            let entries = Arc::make_mut(&mut self.entries);
+            for (id, entry) in changes {
+                if *id >= by_id.len() {
+                    by_id.resize(*id + 1, NONE);
+                }
+                let index = by_id[*id];
+                match entry {
+                    Some(entry) if index == NONE => {
+                        by_id[*id] = entries.len() as u32;
+                        entries.push(*entry);
+                    }
+                    Some(entry) => entries[index as usize] = *entry,
+                    None if index != NONE => {
+                        by_id[*id] = NONE;
+                        entries[index as usize].rect.w = 0.0;
+                    }
+                    None => {}
+                }
+            }
+        }
+        if let Some(platforms) = platforms {
+            self.platforms = Arc::new(platforms);
+        }
+        self.apply_patch(patch)
+    }
+
+    /// Update hit-test ownership after the matching texture patch is queued.
+    /// The caller must also atomically publish matching geometry and slot IDs.
+    pub fn apply_patch(&mut self, patch: &RasterPatch) -> bool {
+        let [width, height] = patch.image.size;
+        let [x0, y0] = patch.origin;
+        if self.base.size != patch.full_size
+            || width == 0
+            || height == 0
+            || x0.checked_add(width).is_none_or(|x| x > self.base.size[0])
+            || y0.checked_add(height).is_none_or(|y| y > self.base.size[1])
+            || patch.owners.len() != width * height
+        {
+            return false;
+        }
+        for y in 0..height {
+            let dst = (y0 + y) * self.base.size[0] + x0;
+            Arc::make_mut(&mut self.base.owners)[dst..dst + width]
+                .copy_from_slice(&patch.owners[y * width..(y + 1) * width]);
+        }
+        true
+    }
+}
+
+/// Draw one half-open rectangle in the same pixel grid and drawing order as a
+/// full render. Callers supply every intersecting entry and platform in the
+/// same order as the full scene, including platforms in the lighting halo.
+pub fn raster_patch(
+    entries: &[RenderEntry],
+    platforms: &[Platform],
+    view: Rect,
+    requested: [usize; 2],
+    region: [usize; 4],
+    token: &AtomicU64,
+    generation: u64,
+) -> Option<RasterPatch> {
+    if !valid(view) || cancelled(token, generation) {
+        return None;
+    }
+    let size = dimensions(requested);
+    let [x0, y0, x1, y1] = region;
+    if x0 >= x1 || y0 >= y1 || x1 > size[0] || y1 > size[1] {
+        return None;
+    }
+    let width = x1 - x0;
+    let height = y1 - y0;
+    let sx = size[0] as f32 / view.w;
+    let sy = size[1] as f32 / view.h;
+    let mut pixels = vec![BACKGROUND; width * height];
+    let mut owners = vec![NONE; width * height];
+    for (i, platform) in platforms.iter().enumerate() {
+        if i % 1024 == 0 && cancelled(token, generation) {
+            return None;
+        }
+        let r = platform.bounds;
+        let ax = (((r.x - view.x) * sx - 0.5).ceil().max(0.0) as usize)
+            .max(x0)
+            .min(x1);
+        let bx = ((((r.x + r.w) - view.x) * sx - 0.5).ceil().max(0.0) as usize)
+            .max(x0)
+            .min(x1);
+        let ay = (((r.y - view.y) * sy - 0.5).ceil().max(0.0) as usize)
+            .max(y0)
+            .min(y1);
+        let by = ((((r.y + r.h) - view.y) * sy - 0.5).ceil().max(0.0) as usize)
+            .max(y0)
+            .min(y1);
+        for y in ay..by {
+            let wy = view.y + (y as f32 + 0.5) / sy;
+            for x in ax..bx {
+                let wx = view.x + (x as f32 + 0.5) / sx;
+                if let Some(color) = platform.sample(wx, wy) {
+                    pixels[(y - y0) * width + x - x0] = color;
+                }
+            }
+        }
+    }
+    for (i, entry) in entries.iter().enumerate() {
+        if i % 4096 == 0 && cancelled(token, generation) {
+            return None;
+        }
+        let r = entry.rect;
+        if !valid(r) || entry.id >= NONE as usize {
+            continue;
+        }
+        let ax = (((r.x - view.x) * sx - 0.5).ceil().max(0.0) as usize).min(size[0]);
+        let bx = ((((r.x + r.w) - view.x) * sx - 0.5).ceil().max(0.0) as usize).min(size[0]);
+        let ay = (((r.y - view.y) * sy - 0.5).ceil().max(0.0) as usize).min(size[1]);
+        let by = ((((r.y + r.h) - view.y) * sy - 0.5).ceil().max(0.0) as usize).min(size[1]);
+        if ax >= bx || ay >= by {
+            continue;
+        }
+        let cx = ax.max(x0);
+        let dx = bx.min(x1);
+        let cy = ay.max(y0);
+        let dy = by.min(y1);
+        if cx >= dx || cy >= dy {
+            continue;
+        }
+        let u = (view.x as f64 - r.x as f64 + (ax as f64 + 0.5) / sx as f64) / r.w as f64;
+        let shade_step = [
+            (-FILE_SHADE_X / (sx as f64 * r.w as f64)) as f32,
+            (-FILE_SHADE_Y / (sy as f64 * r.h as f64)) as f32,
+        ];
+        for y in cy..dy {
+            let band_y0 = ay.max((y / BAND_ROWS) * BAND_ROWS);
+            let v = (view.y as f64 - r.y as f64 + (band_y0 as f64 + 0.5) / sy as f64) / r.h as f64;
+            let base = (FILE_SHADE_LIGHT - FILE_SHADE_X * u - FILE_SHADE_Y * v) as f32;
+            let row = base + (y - band_y0) as f32 * shade_step[1];
+            for x in cx..dx {
+                let n = (y - y0) * width + x - x0;
+                pixels[n] = shaded(entry.color, row + (x - ax) as f32 * shade_step[0]);
+                owners[n] = entry.id as u32;
+            }
+        }
+    }
+    if !platforms.is_empty() {
+        let field = HeightField::build_region(platforms, view, size, region, token, generation)?;
+        for y in y0..y1 {
+            if cancelled(token, generation) {
+                return None;
+            }
+            let wy = view.y + (y as f32 + 0.5) / sy;
+            for x in x0..x1 {
+                let n = (y - y0) * width + x - x0;
+                if pixels[n] != BACKGROUND || owners[n] != NONE {
+                    let wx = view.x + (x as f32 + 0.5) / sx;
+                    pixels[n] = illuminate(pixels[n], &field, wx, wy);
+                }
+            }
+        }
+    }
+    if cancelled(token, generation) {
+        return None;
+    }
+    Some(RasterPatch {
+        origin: [x0, y0],
+        image: ColorImage::new([width, height], pixels),
+        owners,
+        full_size: size,
+    })
 }
 
 fn rasterize(
@@ -659,7 +1113,7 @@ fn rasterize(
         image: Some(ColorImage::new(size, pixels)),
         bounds: view,
         size,
-        owners,
+        owners: Arc::new(owners),
     })
 }
 
@@ -688,6 +1142,182 @@ mod tests {
             },
         ]
     }
+    #[test]
+    fn patch_matches_full_raster_across_bands_lighting_and_hidpi() {
+        let token = AtomicU64::new(42);
+        let bounds = rect(0.0, 0.0, 180.0, 300.0);
+        let platforms = vec![
+            Platform::new(bounds, Color32::GRAY, 0, 0.5).unwrap(),
+            Platform::new(rect(18.0, 120.0, 95.0, 90.0), Color32::GRAY, 1, 0.5).unwrap(),
+        ];
+        let entries = vec![
+            RenderEntry {
+                id: 0,
+                rect: rect(0.0, 0.0, 88.5, 300.0),
+                color: Color32::RED,
+            },
+            RenderEntry {
+                id: 1,
+                rect: rect(88.5, 10.3, 50.0, 230.0),
+                color: Color32::BLUE,
+            },
+            RenderEntry {
+                id: 2,
+                rect: rect(138.5, 0.0, 0.001, 300.0),
+                color: Color32::GREEN,
+            },
+        ];
+        for requested in [[180, 300], [271, 451], [4096, 3000]] {
+            let full = rasterize(&entries, &platforms, bounds, requested, &token, 42).unwrap();
+            let [w, h] = full.size;
+            for region in [
+                [0, 0, w.min(17), h.min(19)],
+                [w / 4, h / 4, (w / 4 + 53).min(w), (h / 4 + 79).min(h)],
+                [w - 12, h - 14, w, h],
+            ] {
+                let patch =
+                    raster_patch(&entries, &platforms, bounds, requested, region, &token, 42)
+                        .unwrap();
+                let pw = region[2] - region[0];
+                for y in region[1]..region[3] {
+                    for x in region[0]..region[2] {
+                        let a = (y - region[1]) * pw + x - region[0];
+                        let b = y * w + x;
+                        assert_eq!(
+                            patch.image.pixels[a],
+                            full.image.as_ref().unwrap().pixels[b],
+                            "pixel {x},{y} size {requested:?}"
+                        );
+                        assert_eq!(patch.owners[a], full.owners[b]);
+                    }
+                }
+            }
+        }
+        assert!(
+            raster_patch(
+                &entries,
+                &platforms,
+                bounds,
+                [180, 300],
+                [0, 0, 1, 1],
+                &token,
+                41
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn scene_patch_publishes_geometry_and_owners_or_rejects_without_mutation() {
+        let token = AtomicU64::new(1);
+        let bounds = rect(0.0, 0.0, 100.0, 100.0);
+        let mut map = RenderMap::build(entries(), bounds, &token, 1).unwrap();
+        let replacement = RenderEntry {
+            id: 1,
+            rect: rect(50.0, 0.0, 49.999, 100.0),
+            color: Color32::GREEN,
+        };
+        let patch = raster_patch(
+            &[replacement],
+            &[],
+            bounds,
+            [100, 100],
+            [50, 0, 100, 100],
+            &token,
+            1,
+        )
+        .unwrap();
+        assert!(!map.apply_scene_patch(&patch, &[(1, None)], None));
+        assert_eq!(map.hit_test(70.0, 50.0), Some(1));
+        assert_eq!(map.color(1), Some(Color32::BLUE));
+        assert!(map.apply_scene_patch(&patch, &[(1, Some(replacement))], None));
+        assert_eq!(map.hit_test(70.0, 50.0), Some(1));
+        assert_eq!(map.color(1), Some(Color32::GREEN));
+        assert_eq!(map.hit_test(20.0, 50.0), Some(0));
+    }
+
+    #[test]
+    fn background_snapshot_batch_erase_matches_individual_erases_without_touching_live_map() {
+        let token = AtomicU64::new(1);
+        let bounds = rect(0.0, 0.0, 100.0, 100.0);
+        let live = RenderMap::build_with_size(entries(), bounds, [231, 177], &token, 1).unwrap();
+        let mut single = live.snapshot_for_update();
+        let mut batch = live.snapshot_for_update();
+        single.erase(0);
+        single.erase(1);
+        let holes = batch.erase_many(&[0, 1, 1, 999], &token, 1).unwrap();
+        assert_eq!(single.base.owners.as_slice(), batch.base.owners.as_slice());
+        assert!(batch.rect(0).is_none() && batch.rect(1).is_none());
+        assert_eq!(live.hit_test(20.0, 50.0), Some(0));
+        assert_eq!(live.hit_test(70.0, 50.0), Some(1));
+        assert!(!holes.is_empty());
+        for y in 0..177 {
+            for x in 0..231 {
+                let wx = (x as f32 + 0.5) * 100.0 / 231.0;
+                let wy = (y as f32 + 0.5) * 100.0 / 177.0;
+                let covered = holes
+                    .iter()
+                    .any(|r| wx >= r.x && wx < r.x + r.w && wy >= r.y && wy < r.y + r.h);
+                assert_eq!(
+                    covered,
+                    live.base.owners[y * 231 + x] != NONE && batch.base.owners[y * 231 + x] == NONE
+                );
+            }
+        }
+        assert!(batch.erase_many(&[0], &token, 0).is_none());
+    }
+
+    #[test]
+    fn sparse_stable_slots_accept_tombstones_and_reject_duplicate_ids() {
+        let token = AtomicU64::new(1);
+        let mut e = entries();
+        e[1].id = 5;
+        e.truncate(2);
+        let map = RenderMap::build_with_slots(
+            e.clone(),
+            Vec::new(),
+            rect(0.0, 0.0, 100.0, 100.0),
+            [100, 100],
+            6,
+            &token,
+            1,
+        )
+        .unwrap();
+        assert_eq!(map.hit_test(70.0, 50.0), Some(5));
+        let missing = std::collections::HashSet::from([2usize, 3, 4]);
+        assert_eq!(map.owners_exclude(&missing, &token, 1), Some(true));
+        assert_eq!(
+            map.owners_exclude(&std::collections::HashSet::from([5]), &token, 1),
+            Some(false)
+        );
+        assert_eq!(map.owners_exclude(&missing, &token, 0), None);
+        assert!(
+            RenderMap::build_with_slots(
+                e.clone(),
+                Vec::new(),
+                rect(0.0, 0.0, 100.0, 100.0),
+                [100, 100],
+                5,
+                &token,
+                1
+            )
+            .is_none()
+        );
+        e[0].id = 5;
+        assert!(
+            RenderMap::build_with_slots(
+                e,
+                Vec::new(),
+                rect(0.0, 0.0, 100.0, 100.0),
+                [100, 100],
+                6,
+                &token,
+                1
+            )
+            .is_none()
+        );
+    }
+
     #[test]
     fn shared_height_preserves_parent_edges_and_file_ownership() {
         let token = AtomicU64::new(1);

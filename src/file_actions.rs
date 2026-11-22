@@ -99,7 +99,11 @@ fn verify_file(path: &Path, expected: FileIdentity) -> Result<(), String> {
     verify_target(path, expected, TargetKind::File)
 }
 
-fn verify_target(path: &Path, expected: FileIdentity, kind: TargetKind) -> Result<(), String> {
+pub(crate) fn verify_target(
+    path: &Path,
+    expected: FileIdentity,
+    kind: TargetKind,
+) -> Result<(), String> {
     if !path.is_absolute() {
         return Err("无法确认文件位置，请重新扫描后重试。".into());
     }

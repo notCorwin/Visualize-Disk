@@ -11,7 +11,7 @@ use std::{
 pub(crate) struct HybridSnapshot {
     pub data: Arc<scan::ScanResult>,
     /// The source file index, or None when the tile represents a directory.
-    pub source_ids: Vec<Option<usize>>,
+    pub source_ids: Arc<[Option<usize>]>,
 }
 
 pub(crate) fn build(
@@ -59,11 +59,12 @@ pub(crate) fn build(
         data: Arc::new(scan::ScanResult {
             root: data.root.clone(),
             files,
+            directories: Arc::clone(&data.directories),
             skipped: data.skipped,
             errors: Vec::new(),
             elapsed: data.elapsed,
         }),
-        source_ids,
+        source_ids: source_ids.into(),
     })
 }
 
@@ -95,13 +96,14 @@ mod tests {
                 file("/disk/branch/leaf/c", 6, true),
                 file("/disk/branch/leaf/d", 7, true),
             ],
+            directories: Vec::new().into(),
             skipped: 0,
             errors: vec![],
             elapsed: Duration::ZERO,
         };
         let token = AtomicU64::new(1);
         let result = build(&data, &BTreeSet::from([1]), &token, 1).unwrap();
-        assert_eq!(result.source_ids, vec![Some(0), None]);
+        assert_eq!(result.source_ids.as_ref(), &[Some(0), None]);
         assert_eq!(result.data.files[0].path, Path::new("/disk/branch/a"));
         assert_eq!(result.data.files[1].path, Path::new("/disk/branch/leaf"));
         assert_eq!(result.data.files[1].size, 13);

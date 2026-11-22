@@ -7,7 +7,7 @@ use eframe::egui::Color32;
 use rayon::prelude::*;
 use std::{
     collections::HashMap,
-    path::Path,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -23,6 +23,32 @@ struct Directory<'a> {
 pub struct DirectoryLayout {
     pub entries: Vec<RenderEntry>,
     pub platforms: Vec<Platform>,
+    /// Populated only when requested by the incremental scene builder.
+    pub partitions: Vec<DirectoryPartition>,
+}
+
+/// A child allocation inside one directory content surface. File IDs are
+/// indices in the input snapshot; callers must translate them to stable IDs.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PartitionItemId {
+    Directory(PathBuf),
+    File(usize),
+}
+
+#[derive(Clone, Debug)]
+pub struct PartitionItem {
+    pub id: PartitionItemId,
+    pub rect: Rect,
+    pub weight: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct DirectoryPartition {
+    /// None is the synthetic top-level ancestor of the scanned paths.
+    pub path: Option<PathBuf>,
+    pub bounds: Rect,
+    pub platform: Option<Platform>,
+    pub items: Vec<PartitionItem>,
 }
 
 pub fn layout<'a>(
@@ -32,6 +58,31 @@ pub fn layout<'a>(
     pixel_size: f32,
     token: &AtomicU64,
     generation: u64,
+) -> Option<DirectoryLayout> {
+    layout_internal(groups, root, bounds, pixel_size, token, generation, false)
+}
+
+/// Export fixed directory surfaces and allocations for an incremental scene.
+/// The ordinary full-render path does not allocate this additional data.
+pub fn layout_with_partitions<'a>(
+    groups: impl IntoIterator<Item = (&'a Path, Vec<(usize, u64)>)>,
+    root: &Path,
+    bounds: Rect,
+    pixel_size: f32,
+    token: &AtomicU64,
+    generation: u64,
+) -> Option<DirectoryLayout> {
+    layout_internal(groups, root, bounds, pixel_size, token, generation, true)
+}
+
+fn layout_internal<'a>(
+    groups: impl IntoIterator<Item = (&'a Path, Vec<(usize, u64)>)>,
+    root: &Path,
+    bounds: Rect,
+    pixel_size: f32,
+    token: &AtomicU64,
+    generation: u64,
+    export_partitions: bool,
 ) -> Option<DirectoryLayout> {
     let cancelled = || token.load(Ordering::Relaxed) != generation;
     if cancelled() {
@@ -103,6 +154,7 @@ pub fn layout<'a>(
     }
     let mut entries = Vec::with_capacity(file_count);
     let mut platforms = Vec::new();
+    let mut partitions = Vec::new();
     // Iterative breadth-first publication paints a whole parent before its
     // children. Unary paths do not consume shoulder space or extra elevation.
     let mut pending = vec![(0, bounds, None::<u8>)];
@@ -159,13 +211,35 @@ pub fn layout<'a>(
                 let geometry = treemap::layout_with_cancel(&items, content, token, generation)?;
                 let mut files = Vec::with_capacity(directory.files.len());
                 let mut children = Vec::with_capacity(child_count);
+                let mut allocation = export_partitions.then(|| Vec::with_capacity(geometry.len()));
                 for (index, (slot, rect)) in geometry.into_iter().enumerate() {
                     if index % 4096 == 0 && cancelled() {
                         return None;
                     }
                     if slot < child_count {
-                        children.push((directory.children[slot], rect, family));
+                        let child = directory.children[slot];
+                        if let Some(allocation) = allocation.as_mut() {
+                            allocation.push(PartitionItem {
+                                id: PartitionItemId::Directory(
+                                    directories[child]
+                                        .path
+                                        .expect("child directory has a path")
+                                        .to_path_buf(),
+                                ),
+                                rect,
+                                weight: directories[child].weight,
+                            });
+                        }
+                        children.push((child, rect, family));
                     } else {
+                        if let Some(allocation) = allocation.as_mut() {
+                            let (id, weight) = directory.files[slot - child_count];
+                            allocation.push(PartitionItem {
+                                id: PartitionItemId::File(id),
+                                rect,
+                                weight,
+                            });
+                        }
                         files.push(RenderEntry {
                             id: directory.files[slot - child_count].0,
                             rect,
@@ -173,11 +247,17 @@ pub fn layout<'a>(
                         });
                     }
                 }
-                Some((files, children, platform))
+                let partition = allocation.map(|items| DirectoryPartition {
+                    path: directory.path.map(Path::to_path_buf),
+                    bounds: content,
+                    platform,
+                    items,
+                });
+                Some((files, children, platform, partition))
             })
             .collect();
         pending = Vec::new();
-        for (mut files, children, platform) in pieces? {
+        for (mut files, children, platform, partition) in pieces? {
             if cancelled() {
                 return None;
             }
@@ -186,9 +266,16 @@ pub fn layout<'a>(
             if let Some(platform) = platform {
                 platforms.push(platform);
             }
+            if let Some(partition) = partition {
+                partitions.push(partition);
+            }
         }
     }
-    (!cancelled()).then_some(DirectoryLayout { entries, platforms })
+    (!cancelled()).then_some(DirectoryLayout {
+        entries,
+        platforms,
+        partitions,
+    })
 }
 
 #[cfg(test)]
@@ -208,6 +295,56 @@ mod tests {
     }
     fn area(r: Rect) -> f32 {
         r.w * r.h
+    }
+
+    #[test]
+    fn exported_partitions_match_full_layout_and_preserve_direct_child_weights() {
+        let groups = || {
+            BTreeMap::from([
+                (Path::new("/a"), vec![(0, 10)]),
+                (Path::new("/a/nested"), vec![(1, 20), (2, 30)]),
+                (Path::new("/b"), vec![(3, 40)]),
+            ])
+        };
+        let token = AtomicU64::new(1);
+        let full = layout(groups(), Path::new("/"), bounds(), 1.0, &token, 1).unwrap();
+        let exported =
+            layout_with_partitions(groups(), Path::new("/"), bounds(), 1.0, &token, 1).unwrap();
+        assert!(full.partitions.is_empty());
+        for entry in &full.entries {
+            let allocation = exported
+                .partitions
+                .iter()
+                .flat_map(|p| &p.items)
+                .find(|item| item.id == PartitionItemId::File(entry.id))
+                .unwrap();
+            assert_eq!(allocation.rect, entry.rect);
+        }
+        let a = exported
+            .partitions
+            .iter()
+            .find(|p| p.path.as_deref() == Some(Path::new("/a")))
+            .unwrap();
+        let nested = a
+            .items
+            .iter()
+            .find(|i| i.id == PartitionItemId::Directory("/a/nested".into()))
+            .unwrap();
+        assert_eq!(nested.weight, 50);
+        let nested_partition = exported
+            .partitions
+            .iter()
+            .find(|p| p.path.as_deref() == Some(Path::new("/a/nested")))
+            .unwrap();
+        assert!(contains(nested.rect, nested_partition.bounds));
+        assert_eq!(
+            a.items
+                .iter()
+                .find(|i| i.id == PartitionItemId::File(0))
+                .unwrap()
+                .weight,
+            10
+        );
     }
 
     #[test]

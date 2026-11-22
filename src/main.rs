@@ -3,10 +3,17 @@
 mod directory_map;
 mod file_actions;
 mod hybrid;
+mod incremental_geometry;
+mod incremental_layout;
+mod incremental_update;
 mod permission;
 mod platform;
 mod render;
 mod scan;
+mod scene_actor;
+mod scene_coordinator;
+mod scene_model;
+mod sparse_projection;
 mod treemap;
 
 use eframe::egui::{self, Color32, FontId, Rect, RichText, Sense, Vec2};
@@ -27,6 +34,10 @@ const PANEL: Color32 = Color32::from_rgb(26, 31, 39);
 const TEXT: Color32 = Color32::from_rgb(226, 232, 239);
 const MUTED: Color32 = Color32::from_rgb(143, 158, 176);
 const ACCENT: Color32 = Color32::from_rgb(104, 196, 190);
+// Avoid retaining a complete per-item partition tree for very large scans.
+// Those views use the existing cancellable background rebuild until a compact
+// spatial index is available.
+const MAX_INCREMENTAL_SLOTS: usize = 100_000;
 const PALETTE: [Color32; 12] = {
     const PINE: Color32 = Color32::from_rgb(0x53, 0x7c, 0x6e);
     const BLUE_GRAY: Color32 = Color32::from_rgb(0x66, 0x81, 0x8d);
@@ -254,6 +265,13 @@ fn defer_drop<T: Send + 'static>(value: T) {
     rayon::spawn(move || drop(value));
 }
 
+struct WakeOnDrop(egui::Context);
+impl Drop for WakeOnDrop {
+    fn drop(&mut self) {
+        self.0.request_repaint();
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NoticeKind {
     Success,
@@ -281,7 +299,8 @@ impl Notice {
 
 struct TrashOutput {
     source: Arc<scan::ScanResult>,
-    id: usize,
+    id: Option<usize>,
+    file_change: Option<scene_model::Change>,
     folder_hidden: Option<Arc<BTreeSet<usize>>>,
     result: Result<(), String>,
 }
@@ -312,11 +331,65 @@ impl ViewMode {
             Self::Hybrid => 2,
         }
     }
+    fn scene_view(self) -> scene_model::View {
+        match self {
+            Self::Files => scene_model::View::Files,
+            Self::Folders => scene_model::View::Folders,
+            Self::Hybrid => scene_model::View::Hybrid,
+        }
+    }
+    fn from_scene(view: scene_model::View) -> Self {
+        match view {
+            scene_model::View::Files => Self::Files,
+            scene_model::View::Folders => Self::Folders,
+            scene_model::View::Hybrid => Self::Hybrid,
+        }
+    }
 }
 
 struct FolderOutput {
     generation: u64,
     data: scan::ScanResult,
+}
+
+// A view remains bound to its original slot order while a deletion is
+// reconciled. Owners in an already published texture are slot indices, so
+// replacing a projection with a freshly sorted vector would redirect clicks.
+struct ProjectionDelta {
+    generation: u64,
+    folder: Option<(scan::ScanResult, Arc<BTreeSet<usize>>)>,
+    hybrid: Option<(hybrid::HybridSnapshot, Arc<BTreeSet<usize>>)>,
+    maps: [Option<(egui::TextureId, render::RenderMap, Arc<Vec<treemap::Rect>>)>; 3],
+}
+
+fn anchor_projection(
+    old: &scan::ScanResult,
+    fresh: &scan::ScanResult,
+) -> (scan::ScanResult, Vec<usize>) {
+    let current: HashMap<_, _> = fresh.files.iter().map(|file| (&file.path, file)).collect();
+    let mut removed = Vec::new();
+    let mut files = Vec::with_capacity(old.files.len());
+    for (id, file) in old.files.iter().enumerate() {
+        match current.get(&file.path) {
+            Some(new) if new.identity == file.identity => files.push((*new).clone()),
+            _ => {
+                removed.push(id);
+                // Retain a tombstone so all published owner slots stay stable.
+                files.push(file.clone());
+            }
+        }
+    }
+    (
+        scan::ScanResult {
+            root: old.root.clone(),
+            files,
+            directories: fresh.directories.clone(),
+            skipped: fresh.skipped,
+            errors: fresh.errors.clone(),
+            elapsed: fresh.elapsed,
+        },
+        removed,
+    )
 }
 
 // Each directory tile represents only files directly inside that directory.
@@ -360,6 +433,7 @@ fn folder_snapshot(
     (token.load(Ordering::Relaxed) == generation).then(|| scan::ScanResult {
         root: data.root.clone(),
         files,
+        directories: data.directories.clone(),
         skipped: data.skipped,
         errors: Vec::new(),
         elapsed: data.elapsed,
@@ -387,21 +461,24 @@ struct LayoutOutput {
     generation: u64,
     key: LayoutKey,
     map: render::RenderMap,
+    holes: Vec<treemap::Rect>,
+    partitions: Option<Vec<directory_map::DirectoryPartition>>,
 }
 // One generation owns geometry, pixels and hit testing together. A resize may
 // stretch this entire cache while its replacement is prepared off-thread.
 struct MapCache {
     generation: u64,
+    revision: u64,
+    needs_rebuild: bool,
     key: LayoutKey,
     map: render::RenderMap,
     texture: egui::TextureHandle,
     // Pixel-aligned holes reuse the existing texture without a full upload.
-    holes: Vec<treemap::Rect>,
-}
-impl MapCache {
-    fn hide(&mut self, id: usize) {
-        self.holes.extend(self.map.erase(id));
-    }
+    holes: Arc<Vec<treemap::Rect>>,
+    partitions: Option<Arc<Vec<directory_map::DirectoryPartition>>>,
+    projection: Option<Arc<sparse_projection::SparseProjection>>,
+    geometry: Option<Arc<incremental_geometry::IncrementalGeometry>>,
+    recovery_projection: Option<Arc<sparse_projection::SparseProjection>>,
 }
 
 fn totals_snapshot(
@@ -417,16 +494,33 @@ fn totals_snapshot(
     (token.load(Ordering::Relaxed) == generation).then_some(TotalsOutput { generation, bytes })
 }
 
+#[cfg(test)]
 fn layout_snapshot(
     data: &scan::ScanResult,
     key: LayoutKey,
     token: &AtomicU64,
     generation: u64,
 ) -> Option<render::RenderMap> {
+    layout_snapshot_excluding(data, key, token, generation, &BTreeSet::new(), false)
+        .map(|(map, _)| map)
+}
+
+fn layout_snapshot_excluding(
+    data: &scan::ScanResult,
+    key: LayoutKey,
+    token: &AtomicU64,
+    generation: u64,
+    excluded: &BTreeSet<usize>,
+    retain_partitions: bool,
+) -> Option<(
+    render::RenderMap,
+    Option<Vec<directory_map::DirectoryPartition>>,
+)> {
     let grouped: Result<HashMap<&std::path::Path, Vec<(usize, u64)>>, ()> = data
         .files
         .par_iter()
         .enumerate()
+        .filter(|(i, _)| !excluded.contains(i))
         .try_fold(HashMap::new, |mut groups, (i, file)| {
             if i % 1024 == 0 && token.load(Ordering::Relaxed) != generation {
                 return Err(());
@@ -452,22 +546,26 @@ fn layout_snapshot(
         w: key.logical_size.x,
         h: key.logical_size.y,
     };
-    let layout = directory_map::layout(
-        grouped.ok()?,
-        &data.root,
-        bounds,
-        render::logical_pixel_size(bounds, key.physical_size),
-        token,
-        generation,
-    )?;
-    render::RenderMap::build_with_platforms(
+    let groups = grouped.ok()?;
+    let pixel_size = render::logical_pixel_size(bounds, key.physical_size);
+    let layout = if retain_partitions {
+        directory_map::layout_with_partitions(
+            groups, &data.root, bounds, pixel_size, token, generation,
+        )?
+    } else {
+        directory_map::layout(groups, &data.root, bounds, pixel_size, token, generation)?
+    };
+    let partitions = retain_partitions.then_some(layout.partitions);
+    let map = render::RenderMap::build_with_slots(
         layout.entries,
         layout.platforms,
         bounds,
         key.physical_size,
+        data.files.len(),
         token,
         generation,
-    )
+    )?;
+    Some((map, partitions))
 }
 
 struct Job {
@@ -486,6 +584,19 @@ struct App {
     folder_generation: Arc<AtomicU64>,
     hybrid_data: Option<hybrid::HybridSnapshot>,
     hybrid_rx: Option<mpsc::Receiver<(u64, hybrid::HybridSnapshot)>>,
+    projection_rx: Option<mpsc::Receiver<ProjectionDelta>>,
+    projection_dirty: bool,
+    projection_hidden: [Arc<BTreeSet<usize>>; 3],
+    coordinator: Option<scene_coordinator::Coordinator>,
+    coordinator_version: Option<scene_actor::Version>,
+    coordinator_source: Option<Arc<scan::ScanResult>>,
+    coordinator_epoch: u64,
+    coordinator_disabled: bool,
+    coordinator_init_pending: [bool; 3],
+    coordinator_update_pending: bool,
+    coordinator_hidden: Arc<BTreeSet<usize>>,
+    pending_scene_changes: Option<Vec<scene_model::Change>>,
+    scene_source_dirty: bool,
     hidden: Arc<BTreeSet<usize>>,
     job: Option<Job>,
     reveal_rx: Option<mpsc::Receiver<Result<(), String>>>,
@@ -520,6 +631,19 @@ impl Default for App {
             folder_generation: Arc::new(AtomicU64::new(0)),
             hybrid_data: None,
             hybrid_rx: None,
+            projection_rx: None,
+            projection_dirty: false,
+            projection_hidden: Default::default(),
+            coordinator: None,
+            coordinator_version: None,
+            coordinator_source: None,
+            coordinator_epoch: 0,
+            coordinator_disabled: false,
+            coordinator_init_pending: [false; 3],
+            coordinator_update_pending: false,
+            coordinator_hidden: Arc::default(),
+            pending_scene_changes: None,
+            scene_source_dirty: false,
             hidden: Arc::default(),
             job: None,
             reveal_rx: None,
@@ -593,6 +717,23 @@ impl App {
         self.message = None;
     }
     fn replace_snapshot(&mut self, data: scan::ScanResult) {
+        if let Some(old) = self.coordinator.take() {
+            defer_drop(old);
+        }
+        self.coordinator_version = None;
+        self.coordinator_source = None;
+        self.coordinator_epoch = self.coordinator_epoch.wrapping_add(1);
+        self.coordinator_disabled = false;
+        self.coordinator_init_pending = [false; 3];
+        self.coordinator_update_pending = false;
+        self.coordinator_hidden = Arc::default();
+        self.pending_scene_changes = None;
+        self.scene_source_dirty = false;
+        self.projection_dirty = false;
+        if let Some(old) = self.projection_rx.take() {
+            defer_drop(old);
+        }
+        self.projection_hidden = Default::default();
         self.invalidate_folders();
         defer_drop(std::mem::take(&mut self.hidden));
         if let Some(old) = self.data.replace(Arc::new(data)) {
@@ -624,10 +765,7 @@ impl App {
             if self.trash_rx.is_some() || self.pending_folder_delete.is_some() {
                 return;
             }
-            if let (Some(source), Some(folder)) = (
-                self.data.as_ref(),
-                self.view_data().and_then(|data| data.files.get(id)),
-            ) {
+            if let (Some(source), Some(folder)) = (self.data.as_ref(), self.view_file(id)) {
                 if self.access == permission::Access::Granted
                     && folder.can_trash
                     && file_actions::can_move_target(
@@ -644,7 +782,27 @@ impl App {
             }
             return;
         }
-        let id = if self.mode == ViewMode::Hybrid {
+        let source_id = if let Some(projection) = self
+            .map_cache
+            .as_ref()
+            .and_then(|cache| cache.projection.as_ref())
+        {
+            let Some(scene_model::TileId::File(entry)) = projection.id(id) else {
+                return;
+            };
+            let Some(displayed) = projection.get(id) else {
+                return;
+            };
+            self.data
+                .as_ref()
+                .and_then(|source| source.files.get(entry.slot as usize))
+                .filter(|original| {
+                    entry.generation == 0
+                        && original.path == displayed.path
+                        && original.identity == displayed.identity
+                })
+                .map(|_| entry.slot as usize)
+        } else if self.mode == ViewMode::Hybrid {
             let Some(Some(id)) = self
                 .hybrid_data
                 .as_ref()
@@ -652,20 +810,20 @@ impl App {
             else {
                 return;
             };
-            *id
+            Some(*id)
         } else {
-            id
+            Some(id)
         };
         if self.access != permission::Access::Granted
             || self.trash_rx.is_some()
-            || self.hidden.contains(&id)
+            || source_id.is_some_and(|id| self.hidden.contains(&id))
         {
             return;
         }
         let Some(source) = self.data.clone() else {
             return;
         };
-        let Some(file) = source.files.get(id) else {
+        let Some(file) = self.view_file(id) else {
             return;
         };
         if !file.can_trash || !file_actions::can_move_to_trash(&file.path) {
@@ -673,6 +831,12 @@ impl App {
         }
         let path = file.path.clone();
         let identity = file.identity;
+        let file_change = source_id
+            .is_none()
+            .then(|| scene_model::Change::RemoveFile {
+                path: path.clone(),
+                identity,
+            });
         let (tx, rx) = mpsc::channel();
         self.trash_rx = Some(rx);
         self.action_notice = None;
@@ -685,7 +849,8 @@ impl App {
             let result = file_actions::move_to_trash(&path, identity).map(|_| ());
             let _ = tx.send(TrashOutput {
                 source,
-                id,
+                id: source_id,
+                file_change,
                 folder_hidden: None,
                 result,
             });
@@ -734,7 +899,8 @@ impl App {
             });
             let _ = tx.send(TrashOutput {
                 source: pending.source,
-                id: 0,
+                id: None,
+                file_change: None,
                 folder_hidden,
                 result,
             });
@@ -742,13 +908,8 @@ impl App {
     }
     fn hide_folder(&mut self, hidden: Arc<BTreeSet<usize>>) {
         defer_drop(std::mem::replace(&mut self.hidden, hidden));
-        self.invalidate_folders();
-        self.reset_layout();
-        for cache in &mut self.mode_caches {
-            if let Some(cache) = cache.take() {
-                defer_drop(cache);
-            }
-        }
+        self.abandon_coordinator();
+        self.begin_projection_update();
     }
     fn set_notice(&mut self, notice: Notice) {
         if notice.kind != NoticeKind::Error
@@ -788,7 +949,7 @@ impl App {
                         .fill(PANEL)
                         .inner_margin(14.0)
                         .corner_radius(8.0)
-                        .stroke(egui::Stroke::new(1.0, MUTED.gamma_multiply(0.3)))
+                        .stroke(egui::Stroke::new(1.0_f32, MUTED.gamma_multiply(0.3)))
                         .show(ui, |ui| {
                             ui.horizontal_top(|ui| {
                                 let color = match notice.kind {
@@ -834,12 +995,85 @@ impl App {
         }
     }
     fn poll(&mut self, ctx: &egui::Context) {
+        self.poll_coordinator();
+        if let Some(rx) = &self.projection_rx {
+            match rx.try_recv() {
+                Ok(output) => {
+                    self.projection_rx = None;
+                    if output.generation == self.folder_generation.load(Ordering::Relaxed) {
+                        let compatible = output.maps.iter().enumerate().all(|(index, update)| {
+                            let current = if self.mode.index() == index {
+                                self.map_cache.as_ref()
+                            } else {
+                                self.mode_caches[index].as_ref()
+                            };
+                            match (update, current) {
+                                (None, None) => true,
+                                (Some((texture, _, _)), Some(cache)) => {
+                                    cache.texture.id() == *texture
+                                }
+                                _ => false,
+                            }
+                        });
+                        if !compatible {
+                            defer_drop(output);
+                            return;
+                        }
+                        if let Some((data, removed)) = output.folder {
+                            self.folder_data = Some(Arc::new(data));
+                            self.projection_hidden[ViewMode::Folders.index()] = removed;
+                        }
+                        if let Some((data, removed)) = output.hybrid {
+                            self.hybrid_data = Some(data);
+                            self.projection_hidden[ViewMode::Hybrid.index()] = removed;
+                        }
+                        for (index, update) in output.maps.into_iter().enumerate() {
+                            if let Some((_, map, holes)) = update {
+                                let cache = if self.mode.index() == index {
+                                    self.map_cache.as_mut()
+                                } else {
+                                    self.mode_caches[index].as_mut()
+                                };
+                                if let Some(cache) = cache {
+                                    defer_drop(std::mem::replace(&mut cache.map, map));
+                                    defer_drop(std::mem::replace(&mut cache.holes, holes));
+                                    cache.recovery_projection = cache.projection.take();
+                                    cache.needs_rebuild =
+                                        cache.partitions.is_none() && cache.geometry.is_none();
+                                }
+                            }
+                        }
+                        self.projection_dirty = false;
+                        self.coordinator_disabled = false;
+                    } else {
+                        defer_drop(output);
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.projection_rx = None;
+                    self.invalidate_folders();
+                    self.reset_layout();
+                    for cache in &mut self.mode_caches {
+                        if let Some(old) = cache.take() {
+                            defer_drop(old);
+                        }
+                    }
+                    self.projection_dirty = false;
+                    if !self.scene_source_dirty {
+                        self.coordinator_disabled = false;
+                    }
+                    self.message = Some("视图更新未完成，正在重新生成。".into());
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if let Some(rx) = &self.folder_rx {
             match rx.try_recv() {
                 Ok(output) => {
                     self.folder_rx = None;
                     if output.generation == self.folder_generation.load(Ordering::Relaxed) {
                         self.folder_data = Some(Arc::new(output.data));
+                        self.projection_hidden[ViewMode::Folders.index()] = Arc::default();
                     }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => self.folder_rx = None,
@@ -852,6 +1086,7 @@ impl App {
                     self.hybrid_rx = None;
                     if generation == self.folder_generation.load(Ordering::Relaxed) {
                         self.hybrid_data = Some(data);
+                        self.projection_hidden[ViewMode::Hybrid.index()] = Arc::default();
                     }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => self.hybrid_rx = None,
@@ -923,13 +1158,19 @@ impl App {
                                 .as_ref()
                                 .is_some_and(|current| Arc::ptr_eq(current, &output.source))
                             {
+                                let deleted_folder = output.folder_hidden.is_some();
                                 if let Some(hidden) = output.folder_hidden {
                                     self.hide_folder(hidden);
-                                } else {
-                                    self.hide_file(output.id);
+                                    // The deleted directory changes its parent's
+                                    // leaf status. Re-enumerate to establish it.
+                                    self.launch_scan();
+                                } else if let Some(id) = output.id {
+                                    self.hide_file(id);
+                                } else if let Some(change) = output.file_change {
+                                    self.queue_scene_changes(vec![change]);
                                 }
                                 // A running scan may have read the old path already.
-                                if self.job.is_some() {
+                                if self.job.is_some() && !deleted_folder {
                                     self.launch_scan();
                                 }
                             } else {
@@ -975,8 +1216,10 @@ impl App {
                         && self.layout_key == Some(output.key)
                     {
                         if let Some(image) = output.map.image.take() {
-                            let mut cache = MapCache {
+                            let cache = MapCache {
                                 generation: output.generation,
+                                revision: output.generation,
+                                needs_rebuild: false,
                                 key: output.key,
                                 map: output.map,
                                 texture: ctx.load_texture(
@@ -984,15 +1227,12 @@ impl App {
                                     image,
                                     egui::TextureOptions::NEAREST,
                                 ),
-                                holes: Vec::new(),
+                                holes: Arc::new(output.holes),
+                                partitions: output.partitions.map(Arc::new),
+                                projection: None,
+                                geometry: None,
+                                recovery_projection: None,
                             };
-                            // Resize work can finish after a deletion. Apply the
-                            // current holes before displaying its replacement.
-                            if self.mode == ViewMode::Files {
-                                for &id in self.hidden.iter() {
-                                    cache.hide(id);
-                                }
-                            }
                             if let Some(old) = self.map_cache.replace(cache) {
                                 defer_drop(old);
                             }
@@ -1008,6 +1248,128 @@ impl App {
             }
         }
     }
+    fn poll_coordinator(&mut self) {
+        loop {
+            let event = match self.coordinator.as_ref().map(|c| c.try_recv()) {
+                Some(Ok(event)) => event,
+                Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                    self.abandon_coordinator();
+                    return;
+                }
+                _ => return,
+            };
+            match event {
+                scene_coordinator::Event::Ready(version) => {
+                    if version.source_generation != self.coordinator_epoch
+                        || !Arc::ptr_eq(&self.hidden, &self.coordinator_hidden)
+                    {
+                        self.abandon_coordinator();
+                    } else {
+                        self.coordinator_version = Some(version);
+                    }
+                }
+                scene_coordinator::Event::ModeReady(ready) => {
+                    let mode = ViewMode::from_scene(ready.mode);
+                    self.coordinator_init_pending[mode.index()] = false;
+                    if Some(ready.version) != self.coordinator_version {
+                        continue;
+                    }
+                    let cache = if self.mode == mode {
+                        self.map_cache.as_mut()
+                    } else {
+                        self.mode_caches[mode.index()].as_mut()
+                    };
+                    if let Some(cache) = cache.filter(|c| {
+                        c.texture.id() == ready.texture && c.revision == ready.layout_generation
+                    }) {
+                        if self.mode == mode
+                            && self
+                                .selected
+                                .is_some_and(|slot| ready.projection.get(slot).is_none())
+                        {
+                            self.selected = None;
+                        }
+                        cache.projection = Some(ready.projection);
+                        cache.geometry = Some(ready.geometry);
+                        cache.recovery_projection = None;
+                        if let Some(parts) = cache.partitions.take() {
+                            defer_drop(parts);
+                        }
+                    }
+                }
+                scene_coordinator::Event::Prepared(prepared) => {
+                    self.coordinator_update_pending = false;
+                    let valid = self.projection_dirty
+                        && Some(prepared.base) == self.coordinator_version
+                        && prepared.rebuild.is_empty()
+                        && prepared.views.iter().all(|view| {
+                            let mode = ViewMode::from_scene(view.mode);
+                            let cache = if self.mode == mode {
+                                self.map_cache.as_ref()
+                            } else {
+                                self.mode_caches[mode.index()].as_ref()
+                            };
+                            cache.is_some_and(|c| {
+                                c.texture.id() == view.texture
+                                    && c.revision == view.layout_generation
+                            })
+                        });
+                    if !valid
+                        || self.coordinator.as_ref().is_none_or(|c| {
+                            c.try_send(scene_coordinator::Command::Commit(prepared.version))
+                                .is_err()
+                        })
+                    {
+                        self.abandon_coordinator();
+                        defer_drop(prepared);
+                        continue;
+                    }
+                    for view in prepared.views {
+                        let mode = ViewMode::from_scene(view.mode);
+                        let cache = if self.mode == mode {
+                            self.map_cache.as_mut()
+                        } else {
+                            self.mode_caches[mode.index()].as_mut()
+                        };
+                        if let Some(cache) = cache {
+                            if let Some(patch) = view.patch {
+                                cache.texture.set_partial(
+                                    patch.origin,
+                                    patch.image,
+                                    egui::TextureOptions::NEAREST,
+                                );
+                            }
+                            defer_drop(std::mem::replace(&mut cache.map, view.map));
+                            defer_drop(std::mem::replace(&mut cache.holes, view.holes));
+                            cache.projection = Some(view.projection);
+                            cache.geometry = Some(view.geometry);
+                        }
+                    }
+                    self.coordinator_hidden = self.hidden.clone();
+                    self.coordinator_version = Some(prepared.version);
+                    self.scene_source_dirty |= self.pending_scene_changes.is_some();
+                    self.pending_scene_changes = None;
+                    self.projection_dirty = false;
+                }
+                scene_coordinator::Event::Failed(reason) => {
+                    if self.projection_dirty {
+                        let text = match reason {
+                            scene_coordinator::Failure::TooManyChanges => {
+                                "变更较多，正在后台重建视图。"
+                            }
+                            scene_coordinator::Failure::Stale
+                            | scene_coordinator::Failure::Pending => {
+                                "视图状态已变化，正在重新更新。"
+                            }
+                            _ => "局部更新未完成，正在后台重建视图。",
+                        };
+                        self.set_notice(Notice::new(text.into(), NoticeKind::Info));
+                    }
+                    self.abandon_coordinator();
+                }
+            }
+        }
+    }
     fn hide_file(&mut self, id: usize) {
         if self.data.as_ref().is_none_or(|data| id >= data.files.len())
             || !Arc::make_mut(&mut self.hidden).insert(id)
@@ -1017,13 +1379,222 @@ impl App {
         if self.mode == ViewMode::Files && self.selected == Some(id) {
             self.selected = None;
         }
-        self.invalidate_folders();
-        if self.mode == ViewMode::Files {
+        self.begin_projection_update();
+    }
+    fn begin_projection_update(&mut self) {
+        self.folder_generation.fetch_add(1, Ordering::Relaxed);
+        if let Some(old) = self.folder_rx.take() {
+            defer_drop(old);
+        }
+        if let Some(old) = self.hybrid_rx.take() {
+            defer_drop(old);
+        }
+        if let Some(old) = self.projection_rx.take() {
+            defer_drop(old);
+        }
+        self.projection_dirty = true;
+        self.selected = None;
+        // A second deletion while a prepared scene is in flight invalidates
+        // its base; fall back rather than publishing a partially stale scene.
+        if self.coordinator_update_pending || self.coordinator_init_pending.iter().any(|p| *p) {
+            self.abandon_coordinator();
+        }
+        if self.layout_rx.take().is_some() {
+            let generation = self.layout_generation.fetch_add(1, Ordering::Relaxed) + 1;
             if let Some(cache) = &mut self.map_cache {
-                cache.hide(id);
+                cache.generation = generation;
             }
-        } else if let Some(cache) = &mut self.mode_caches[ViewMode::Files.index()] {
-            cache.hide(id);
+        }
+    }
+    /// Queue authoritative changes from a future filesystem reconciler. The
+    /// old frame remains bound to its old slot mapping until commit.
+    fn queue_scene_changes(&mut self, changes: Vec<scene_model::Change>) {
+        if changes.is_empty() {
+            return;
+        }
+        if self.projection_dirty || self.pending_scene_changes.is_some() {
+            self.abandon_coordinator();
+            self.pending_scene_changes = None;
+            self.projection_dirty = false;
+            self.scene_source_dirty = true;
+            self.launch_scan();
+            return;
+        }
+        self.pending_scene_changes = Some(changes);
+        self.begin_projection_update();
+    }
+    fn abandon_coordinator(&mut self) {
+        if let Some(coordinator) = self.coordinator.take() {
+            defer_drop(coordinator);
+        }
+        self.coordinator_version = None;
+        self.coordinator_source = None;
+        self.coordinator_disabled = true;
+        self.coordinator_init_pending = [false; 3];
+        self.coordinator_update_pending = false;
+    }
+
+    fn prepare_coordinator(&mut self, ctx: &egui::Context) {
+        if self.coordinator_disabled || self.projection_dirty || self.job.is_some() {
+            return;
+        }
+        let Some(source) = self.data.clone() else {
+            return;
+        };
+        if self
+            .coordinator_source
+            .as_ref()
+            .is_some_and(|prior| !Arc::ptr_eq(prior, &source))
+        {
+            self.abandon_coordinator();
+            self.coordinator_disabled = false;
+        }
+        if source.files.len().saturating_add(source.directories.len()) > MAX_INCREMENTAL_SLOTS {
+            self.coordinator_disabled = true;
+            return;
+        }
+        if self.coordinator.is_none() {
+            self.coordinator_source = Some(source.clone());
+            self.coordinator_hidden = self.hidden.clone();
+            self.coordinator = Some(scene_coordinator::Coordinator::start_with_hidden(
+                source,
+                self.coordinator_epoch,
+                self.coordinator_hidden.clone(),
+                ctx.clone(),
+            ));
+            return;
+        }
+        let Some(version) = self.coordinator_version else {
+            return;
+        };
+        if self.coordinator_update_pending {
+            return;
+        }
+        for mode in [ViewMode::Files, ViewMode::Folders, ViewMode::Hybrid] {
+            let index = mode.index();
+            if self.coordinator_init_pending[index] {
+                continue;
+            }
+            let cache = if self.mode == mode {
+                self.map_cache.as_ref()
+            } else {
+                self.mode_caches[index].as_ref()
+            };
+            let Some(cache) = cache else {
+                continue;
+            };
+            if cache.projection.is_some() || cache.needs_rebuild {
+                continue;
+            }
+            let retained = cache
+                .geometry
+                .clone()
+                .zip(cache.recovery_projection.clone())
+                .map(|(geometry, projection)| scene_coordinator::Retained {
+                    geometry,
+                    projection,
+                });
+            let partitions = cache.partitions.clone();
+            if retained.is_none() && partitions.is_none() {
+                continue;
+            }
+            let data = match mode {
+                ViewMode::Files => self.data.clone(),
+                ViewMode::Folders => self.folder_data.clone(),
+                ViewMode::Hybrid => self.hybrid_data.as_ref().map(|h| h.data.clone()),
+            };
+            let Some(data) = data else {
+                continue;
+            };
+            let source_ids = if mode == ViewMode::Hybrid {
+                self.hybrid_data
+                    .as_ref()
+                    .map(|h| h.source_ids.clone().into())
+            } else {
+                None
+            };
+            let input = scene_coordinator::ModeInput {
+                base: version,
+                mode: mode.scene_view(),
+                data,
+                source_ids,
+                partitions,
+                retained,
+                layout_generation: cache.revision,
+                texture: cache.texture.id(),
+                map: cache.map.snapshot_for_update(),
+                tombstones: if mode == ViewMode::Files {
+                    self.hidden.clone()
+                } else {
+                    self.projection_hidden[index].clone()
+                },
+            };
+            if self.coordinator.as_ref().is_some_and(|c| {
+                c.try_send(scene_coordinator::Command::InitMode(input))
+                    .is_ok()
+            }) {
+                self.coordinator_init_pending[index] = true;
+            }
+        }
+    }
+
+    fn try_coordinator_update(&mut self) -> bool {
+        if self.coordinator_update_pending {
+            return true;
+        }
+        let Some(version) = self.coordinator_version else {
+            return false;
+        };
+        if self.coordinator_init_pending.iter().any(|pending| *pending) {
+            return false;
+        }
+        let mut modes = Vec::new();
+        for mode in [ViewMode::Files, ViewMode::Folders, ViewMode::Hybrid] {
+            let cache = if self.mode == mode {
+                self.map_cache.as_ref()
+            } else {
+                self.mode_caches[mode.index()].as_ref()
+            };
+            if let Some(cache) = cache {
+                if cache.projection.is_none() {
+                    return false;
+                }
+                let [width, _] = cache.map.physical_size();
+                modes.push(scene_coordinator::ModeBase {
+                    mode: mode.scene_view(),
+                    layout_generation: cache.revision,
+                    texture: cache.texture.id(),
+                    map: cache.map.snapshot_for_update(),
+                    holes: cache.holes.clone(),
+                    pixels_per_point: width as f32 / cache.map.bounds.w.max(1.0),
+                    area_tolerance: 8192.0,
+                    max_patch_pixels: 1_048_576,
+                });
+            }
+        }
+        if modes.is_empty() {
+            return false;
+        }
+        let changes = match &self.pending_scene_changes {
+            Some(changes) => scene_coordinator::Changes::Explicit(changes.clone()),
+            None => scene_coordinator::Changes::HiddenDiff {
+                before: self.coordinator_hidden.clone(),
+                after: self.hidden.clone(),
+            },
+        };
+        let input = scene_coordinator::UpdateInput {
+            base: version,
+            changes,
+            modes,
+        };
+        if self.coordinator.as_ref().is_some_and(|c| {
+            c.try_send(scene_coordinator::Command::Update(input))
+                .is_ok()
+        }) {
+            self.coordinator_update_pending = true;
+            true
+        } else {
+            false
         }
     }
     fn invalidate_folders(&mut self) {
@@ -1062,6 +1633,10 @@ impl App {
     }
     fn set_mode(&mut self, mode: ViewMode) {
         if self.mode != mode {
+            let stale_target = self.scene_source_dirty
+                && self.mode_caches[mode.index()]
+                    .as_ref()
+                    .is_none_or(|cache| cache.projection.is_none());
             self.mode_caches[self.mode.index()] = self.map_cache.take();
             self.mode = mode;
             self.layout_generation.fetch_add(1, Ordering::Relaxed);
@@ -1075,6 +1650,10 @@ impl App {
                 cache.generation = generation;
                 cache.key
             });
+            if stale_target {
+                self.abandon_coordinator();
+                self.launch_scan();
+            }
         }
     }
     fn view_data(&self) -> Option<&Arc<scan::ScanResult>> {
@@ -1084,7 +1663,24 @@ impl App {
             ViewMode::Hybrid => self.hybrid_data.as_ref().map(|data| &data.data),
         }
     }
+    fn view_file(&self, slot: usize) -> Option<&scan::FileEntry> {
+        if let Some(projection) = self
+            .map_cache
+            .as_ref()
+            .and_then(|cache| cache.projection.as_ref())
+        {
+            return projection.get(slot);
+        }
+        self.view_data()?.files.get(slot)
+    }
     fn is_folder_tile(&self, id: usize) -> bool {
+        if let Some(projection) = self
+            .map_cache
+            .as_ref()
+            .and_then(|cache| cache.projection.as_ref())
+        {
+            return matches!(projection.id(id), Some(scene_model::TileId::Directory(_)));
+        }
         match self.mode {
             ViewMode::Files => false,
             ViewMode::Folders => true,
@@ -1096,6 +1692,113 @@ impl App {
         }
     }
     fn prepare_folders(&mut self, ctx: &egui::Context) {
+        if self.scene_source_dirty && self.coordinator_disabled && !self.projection_dirty {
+            return;
+        }
+        if self.projection_dirty {
+            if self.try_coordinator_update() {
+                return;
+            }
+            if self.coordinator.is_some() {
+                self.abandon_coordinator();
+            }
+            if self.pending_scene_changes.take().is_some() || self.scene_source_dirty {
+                self.scene_source_dirty = true;
+                self.projection_dirty = false;
+                self.launch_scan();
+                return;
+            }
+            if self.projection_rx.is_none() {
+                let Some(data) = self.data.clone() else {
+                    self.projection_dirty = false;
+                    return;
+                };
+                let old_folder = self.folder_data.clone();
+                let old_hybrid = self
+                    .hybrid_data
+                    .as_ref()
+                    .map(|h| (h.data.clone(), h.source_ids.clone()));
+                let prior_hidden = self.projection_hidden.clone();
+                let maps: [_; 3] = std::array::from_fn(|index| {
+                    let cache = if self.mode.index() == index {
+                        self.map_cache.as_ref()
+                    } else {
+                        self.mode_caches[index].as_ref()
+                    };
+                    cache.map(|cache| {
+                        (
+                            cache.texture.id(),
+                            cache.map.snapshot_for_update(),
+                            cache.holes.clone(),
+                        )
+                    })
+                });
+                {
+                    let hidden = self.hidden.clone();
+                    let token = self.folder_generation.clone();
+                    let generation = token.load(Ordering::Relaxed);
+                    let (tx, rx) = mpsc::channel();
+                    self.projection_rx = Some(rx);
+                    let ctx = ctx.clone();
+                    rayon::spawn(move || {
+                        let _wake = WakeOnDrop(ctx);
+                        let folder = old_folder.and_then(|old| {
+                            let fresh = folder_snapshot(&data, &hidden, &token, generation)?;
+                            let (data, removed) = anchor_projection(&old, &fresh);
+                            let mut tombstones = (*prior_hidden[1]).clone();
+                            tombstones.extend(removed);
+                            Some((data, Arc::new(tombstones)))
+                        });
+                        let hybrid = old_hybrid.and_then(|(old, source_ids)| {
+                            let fresh = hybrid::build(&data, &hidden, &token, generation)?;
+                            let (anchored, removed) = anchor_projection(&old, &fresh.data);
+                            let mut tombstones = (*prior_hidden[2]).clone();
+                            tombstones.extend(removed);
+                            Some((
+                                hybrid::HybridSnapshot {
+                                    data: Arc::new(anchored),
+                                    source_ids,
+                                },
+                                Arc::new(tombstones),
+                            ))
+                        });
+                        let ids: [Vec<usize>; 3] = [
+                            hidden.iter().copied().collect(),
+                            folder
+                                .as_ref()
+                                .map(|(_, removed)| removed.iter().copied().collect())
+                                .unwrap_or_default(),
+                            hybrid
+                                .as_ref()
+                                .map(|(_, removed)| removed.iter().copied().collect())
+                                .unwrap_or_default(),
+                        ];
+                        let mut maps = maps;
+                        for (index, item) in maps.iter_mut().enumerate() {
+                            if let Some((_, map, holes)) = item {
+                                let Some(new_holes) =
+                                    map.erase_many(&ids[index], &token, generation)
+                                else {
+                                    return;
+                                };
+                                if !new_holes.is_empty() {
+                                    Arc::make_mut(holes).extend(new_holes);
+                                }
+                            }
+                        }
+                        if token.load(Ordering::Relaxed) == generation {
+                            let _ = tx.send(ProjectionDelta {
+                                generation,
+                                folder,
+                                hybrid,
+                                maps,
+                            });
+                        }
+                    });
+                }
+            }
+            return;
+        }
         if self.mode == ViewMode::Hybrid {
             if self.hybrid_data.is_some() || self.hybrid_rx.is_some() {
                 return;
@@ -1160,15 +1863,31 @@ impl App {
     fn layout(&mut self, size: Vec2, pixels_per_point: f32, ctx: &egui::Context) {
         let key = LayoutKey::new(size, pixels_per_point);
         if self.layout_key != Some(key) {
+            // A sparse projection may contain appended/tombstoned slots not in
+            // the original scan vector. Reconcile it before a full resize
+            // until sparse-layout rebuilding is available.
+            if self
+                .map_cache
+                .as_ref()
+                .is_some_and(|cache| cache.projection.is_some())
+            {
+                self.abandon_coordinator();
+                self.begin_projection_update();
+            }
             self.layout_key = Some(key);
             self.layout_generation.fetch_add(1, Ordering::Relaxed);
         }
+        if self.projection_dirty {
+            return;
+        }
+        if self.scene_source_dirty && self.coordinator_disabled {
+            return;
+        }
         let generation = self.layout_generation.load(Ordering::Relaxed);
         if self.layout_rx.is_some()
-            || self
-                .map_cache
-                .as_ref()
-                .is_some_and(|cache| cache.generation == generation && cache.key == key)
+            || self.map_cache.as_ref().is_some_and(|cache| {
+                cache.generation == generation && cache.key == key && !cache.needs_rebuild
+            })
         {
             return;
         }
@@ -1176,15 +1895,39 @@ impl App {
             return;
         };
         let token = self.layout_generation.clone();
+        let excluded = self.projection_hidden[self.mode.index()].clone();
+        let keep = self.data.as_ref().is_some_and(|source| {
+            source.files.len().saturating_add(source.directories.len()) <= MAX_INCREMENTAL_SLOTS
+        }) && data.files.len() <= MAX_INCREMENTAL_SLOTS;
+        let hidden = if self.mode == ViewMode::Files {
+            Some(self.hidden.clone())
+        } else {
+            None
+        };
         let (tx, rx) = mpsc::channel();
         self.layout_rx = Some(rx);
         let ctx = ctx.clone();
         rayon::spawn(move || {
-            if let Some(map) = layout_snapshot(&data, key, &token, generation) {
+            if let Some((mut map, partitions)) =
+                layout_snapshot_excluding(&data, key, &token, generation, &excluded, keep)
+            {
+                let holes = match hidden {
+                    Some(hidden) if !hidden.is_empty() => {
+                        let ids: Vec<_> = hidden.iter().copied().collect();
+                        let Some(holes) = map.erase_many(&ids, &token, generation) else {
+                            ctx.request_repaint();
+                            return;
+                        };
+                        holes
+                    }
+                    _ => Vec::new(),
+                };
                 let _ = tx.send(LayoutOutput {
                     generation,
                     key,
                     map,
+                    holes,
+                    partitions,
                 });
             }
             drop(tx);
@@ -1195,17 +1938,45 @@ impl App {
         if self.reveal_rx.is_some() {
             return;
         }
-        let Some(data) = self.view_data() else {
+        let Some(file) = self.view_file(i) else {
             return;
         };
-        let Some(file) = data.files.get(i) else {
-            return;
+        let source_id = if let Some(projection) = self
+            .map_cache
+            .as_ref()
+            .and_then(|cache| cache.projection.as_ref())
+        {
+            match projection.id(i) {
+                Some(scene_model::TileId::File(id)) if id.generation == 0 => Some(id.slot as usize),
+                _ => None,
+            }
+        } else if self.mode == ViewMode::Files {
+            Some(i)
+        } else if self.mode == ViewMode::Hybrid {
+            self.hybrid_data
+                .as_ref()
+                .and_then(|data| data.source_ids.get(i))
+                .copied()
+                .flatten()
+        } else {
+            None
         };
+        if source_id.is_some_and(|id| self.hidden.contains(&id)) {
+            self.message = Some("文件已移到废纸篓，请等待视图更新。".into());
+            return;
+        }
         let path = file.path.clone();
+        let identity = file.identity;
+        let kind = if self.is_folder_tile(i) {
+            file_actions::TargetKind::Directory
+        } else {
+            file_actions::TargetKind::File
+        };
         let (tx, rx) = mpsc::channel();
         self.reveal_rx = Some(rx);
         std::thread::spawn(move || {
-            let result = platform::reveal(&path);
+            let result = file_actions::verify_target(&path, identity, kind)
+                .and_then(|_| platform::reveal(&path));
             let _ = tx.send(result);
         });
     }
@@ -1245,6 +2016,8 @@ impl App {
                                 ""
                             }
                         )
+                    } else if self.scene_source_dirty && self.coordinator_disabled {
+                        "视图尚未更新 · 请重新扫描".into()
                     } else if let Some(data) = &self.data {
                         format!(
                             "启动磁盘 · {:.1} 秒 · 跳过 {} 项",
@@ -1255,6 +2028,9 @@ impl App {
                         "启动磁盘 · 扫描已停止".into()
                     };
                     ui.add(egui::Label::new(RichText::new(status).small().color(MUTED)).truncate());
+                    if self.projection_dirty {
+                        ui.label(RichText::new("正在更新视图…").small().color(MUTED));
+                    }
                     if self.layout_rx.is_some() {
                         ui.spinner();
                     }
@@ -1322,6 +2098,7 @@ impl App {
     fn ui_contents(&mut self, ctx: &egui::Context) {
         self.canvas_rect = None;
         self.poll(ctx);
+        self.prepare_coordinator(ctx);
         if self.access != permission::Access::Granted {
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(BG))
@@ -1420,11 +2197,9 @@ impl App {
                     {
                         self.set_mode(ViewMode::Hybrid);
                     }
-                    let selected = self.selected.and_then(|i| {
-                        self.view_data()
-                            .and_then(|data| data.files.get(i))
-                            .map(|f| (i, f))
-                    });
+                    let selected = self
+                        .selected
+                        .and_then(|i| self.view_file(i).map(|f| (i, f)));
                     if ui
                         .add_enabled(
                             selected.is_some() && self.reveal_rx.is_none(),
@@ -1498,7 +2273,16 @@ impl App {
                 .frame(egui::Frame::new().fill(BG))
                 .show(ctx, |ui| {
                     ui.centered_and_justified(|ui| {
-                        ui.label("正在生成文件夹视图…");
+                        ui.label(
+                            if self.scene_source_dirty
+                                && self.coordinator_disabled
+                                && self.job.is_none()
+                            {
+                                "视图尚未更新，请重新扫描。"
+                            } else {
+                                "正在生成文件夹视图…"
+                            },
+                        );
                     });
                 });
             self.overlays(ctx);
@@ -1507,9 +2291,23 @@ impl App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(12.0))
             .show(ctx, |ui| {
-                if self.view_data().unwrap().files.is_empty() {
+                let empty = self
+                    .map_cache
+                    .as_ref()
+                    .and_then(|cache| cache.projection.as_ref())
+                    .map_or_else(
+                        || self.view_data().unwrap().files.is_empty(),
+                        |p| p.is_empty(),
+                    );
+                if empty {
                     ui.centered_and_justified(|ui| {
-                        ui.label("没有可显示的文件");
+                        ui.label(if self.scene_source_dirty && self.job.is_none() {
+                            "视图尚未更新，请重新扫描。"
+                        } else if self.scene_source_dirty {
+                            "正在更新视图…"
+                        } else {
+                            "没有可显示的文件"
+                        });
                     });
                     return;
                 }
@@ -1520,7 +2318,6 @@ impl App {
                 let painter = ui.painter_at(canvas);
                 let pointer = tooltip_pointer(&response);
                 let mut hovered = None;
-                let data = self.view_data().unwrap().clone();
                 if let Some(cache) = &self.map_cache {
                     let map = &cache.map;
                     painter.image(
@@ -1534,7 +2331,7 @@ impl App {
                         canvas.height() / map.bounds.h,
                     );
                     let mut holes = egui::Mesh::default();
-                    for hole in &cache.holes {
+                    for hole in cache.holes.iter() {
                         // Solid quads have no antialiased fringe over neighbors.
                         holes.add_colored_rect(
                             Rect::from_min_size(
@@ -1553,7 +2350,7 @@ impl App {
                             (p.y - canvas.min.y) / scale.y,
                         );
                     }
-                    for (id, width) in [(self.selected, 2.0), (hovered, 1.5)] {
+                    for (id, width) in [(self.selected, 2.0_f32), (hovered, 1.5_f32)] {
                         if let Some(r) = id.and_then(|i| map.rect(i)) {
                             let rect = Rect::from_min_size(
                                 canvas.min + Vec2::new(r.x * scale.x, r.y * scale.y),
@@ -1579,14 +2376,15 @@ impl App {
                     );
                 }
                 if let Some(i) = hovered {
-                    let f = &data.files[i];
                     if response.clicked() {
                         self.selected = Some(i);
                     }
-                    if self.is_folder_tile(i) {
-                        show_entry_tooltip(&response, f, true);
-                    } else {
-                        show_file_tooltip(&response, f);
+                    if let Some(f) = self.view_file(i) {
+                        if self.is_folder_tile(i) {
+                            show_entry_tooltip(&response, f, true);
+                        } else {
+                            show_file_tooltip(&response, f);
+                        }
                     }
                 }
             });
@@ -1677,6 +2475,7 @@ mod tests {
     fn snapshot() -> scan::ScanResult {
         scan::ScanResult {
             root: "/".into(),
+            directories: Vec::new().into(),
             files: vec![
                 scan::FileEntry {
                     parent_identity: scan::FileIdentity::default(),
@@ -1728,9 +2527,12 @@ mod tests {
             frame(app, ctx);
             if app.totals_rx.is_none()
                 && app.layout_rx.is_none()
+                && !app.projection_dirty
+                && app.projection_rx.is_none()
                 && app.totals_ready
                 && app.map_cache.as_ref().is_some_and(|cache| {
                     cache.generation == app.layout_generation.load(Ordering::Relaxed)
+                        && !cache.needs_rebuild
                 })
             {
                 break;
@@ -1818,7 +2620,7 @@ mod tests {
         assert!(folder_snapshot(&data, &BTreeSet::new(), &token, 0).is_none());
     }
     #[test]
-    fn mode_switch_isolates_selection_and_rebuilds_after_deletion() {
+    fn mode_switch_keeps_selection_and_cached_maps_safe_after_deletion() {
         let ctx = egui::Context::default();
         configure(&ctx);
         let mut app = App::default();
@@ -1848,8 +2650,9 @@ mod tests {
         // A file deletion can complete after switching to folder mode.
         app.hide_file(2);
         settle(&mut app, &ctx);
-        assert_eq!(app.folder_data.as_ref().unwrap().files.len(), 1);
-        assert_ne!(app.map_cache.as_ref().unwrap().texture.id(), folder_texture);
+        assert_eq!(app.folder_data.as_ref().unwrap().files.len(), 2);
+        assert_eq!(app.map_cache.as_ref().unwrap().map.rect(1), None);
+        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), folder_texture);
         app.set_mode(ViewMode::Files);
         settle(&mut app, &ctx);
         assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), file_texture);
@@ -1886,7 +2689,7 @@ mod tests {
         assert!(app.pending_folder_delete.is_some());
     }
     #[test]
-    fn hybrid_mode_preserves_tile_types_and_reuses_cache_until_hidden_changes() {
+    fn hybrid_mode_preserves_tile_slots_and_reuses_cache_after_deletion() {
         let ctx = egui::Context::default();
         configure(&ctx);
         let mut app = App::default();
@@ -1897,7 +2700,7 @@ mod tests {
         app.set_mode(ViewMode::Hybrid);
         settle(&mut app, &ctx);
         let hybrid = app.hybrid_data.as_ref().unwrap();
-        assert_eq!(hybrid.source_ids, vec![Some(0), Some(1), None]);
+        assert_eq!(&*hybrid.source_ids, &[Some(0), Some(1), None]);
         assert!(!app.is_folder_tile(0));
         assert!(app.is_folder_tile(2));
         let texture = app.map_cache.as_ref().unwrap().texture.id();
@@ -1911,10 +2714,383 @@ mod tests {
         assert_eq!(app.selected, None);
         settle(&mut app, &ctx);
         assert_eq!(
-            app.hybrid_data.as_ref().unwrap().source_ids,
-            vec![Some(0), None]
+            &*app.hybrid_data.as_ref().unwrap().source_ids,
+            &[Some(0), Some(1), None]
         );
-        assert_ne!(app.map_cache.as_ref().unwrap().texture.id(), texture);
+        assert_eq!(app.map_cache.as_ref().unwrap().map.rect(1), None);
+        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), texture);
+    }
+
+    #[test]
+    fn folder_deletion_updates_all_cached_modes_without_replacing_textures() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        let mut data = snapshot();
+        data.files[2].parent_is_leaf = true;
+        app.data = Some(Arc::new(data));
+        let mut textures = Vec::new();
+        for mode in [ViewMode::Files, ViewMode::Folders, ViewMode::Hybrid] {
+            app.set_mode(mode);
+            settle(&mut app, &ctx);
+            textures.push(app.map_cache.as_ref().unwrap().texture.id());
+        }
+        app.hide_folder(Arc::new(BTreeSet::from([0, 1])));
+        // The old view remains visible until the background update is ready.
+        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), textures[2]);
+        assert!(app.projection_dirty);
+        settle(&mut app, &ctx);
+        for (index, mode) in [ViewMode::Files, ViewMode::Folders, ViewMode::Hybrid]
+            .into_iter()
+            .enumerate()
+        {
+            app.set_mode(mode);
+            settle(&mut app, &ctx);
+            let cache = app.map_cache.as_ref().unwrap();
+            assert_eq!(cache.texture.id(), textures[index]);
+            assert!(cache.map.rect(0).is_none());
+            assert!(
+                cache
+                    .map
+                    .rect(2.min(if mode == ViewMode::Folders { 1 } else { 2 }))
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn failed_projection_never_leaves_deleted_items_interactive() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.data = Some(Arc::new(snapshot()));
+        settle(&mut app, &ctx);
+        app.hidden = Arc::new(BTreeSet::from([1]));
+        app.projection_dirty = true;
+        let (tx, rx) = mpsc::channel();
+        drop(tx);
+        app.projection_rx = Some(rx);
+        app.poll(&ctx);
+        assert!(app.map_cache.is_none());
+        assert!(app.message.as_deref().unwrap().contains("重新生成"));
+        settle(&mut app, &ctx);
+        assert!(app.map_cache.as_ref().unwrap().map.rect(1).is_none());
+    }
+
+    #[test]
+    fn cancelled_projection_wakes_idle_ui_on_worker_exit() {
+        let (ctx, wake) = idle_context_with_wake_receiver();
+        let worker = std::thread::spawn(move || {
+            let _wake = WakeOnDrop(ctx);
+            // Simulates an early cancelled return before producing a result.
+        });
+        worker.join().unwrap();
+        assert!(wake.recv_timeout(Duration::from_secs(2)).is_ok());
+    }
+
+    #[test]
+    fn old_frame_cannot_reveal_file_already_moved_to_trash() {
+        let mut app = App::default();
+        app.data = Some(Arc::new(snapshot()));
+        app.hidden = Arc::new(BTreeSet::from([1]));
+        app.reveal(1);
+        assert!(app.reveal_rx.is_none());
+        assert!(app.message.as_deref().unwrap().contains("视图更新"));
+    }
+
+    #[test]
+    fn file_deletion_uses_versioned_incremental_coordinator() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.data = Some(Arc::new(snapshot()));
+        settle(&mut app, &ctx);
+        let start = Instant::now();
+        while app
+            .map_cache
+            .as_ref()
+            .is_none_or(|cache| cache.projection.is_none())
+        {
+            frame(&mut app, &ctx);
+            assert!(
+                !app.coordinator_disabled,
+                "coordinator fell back during initialisation"
+            );
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let texture = app.map_cache.as_ref().unwrap().texture.id();
+        let before = app.coordinator_version.unwrap();
+        app.hide_file(0);
+        settle(&mut app, &ctx);
+        assert!(
+            !app.coordinator_disabled,
+            "incremental deletion unexpectedly fell back"
+        );
+        assert!(app.coordinator_version.unwrap().scene_version > before.scene_version);
+        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), texture);
+        assert!(app.view_file(0).is_none());
+        assert!(app.view_file(1).is_some());
+    }
+
+    #[test]
+    fn file_deletion_updates_three_versioned_modes_without_replacing_textures() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut data = snapshot();
+        data.files[2].parent_is_leaf = true;
+        data.directories = vec![
+            scan::DirectoryFact {
+                path: "/a".into(),
+                identity: scan::FileIdentity::default(),
+                enumeration_complete: true,
+                has_subdirectories: true,
+            },
+            scan::DirectoryFact {
+                path: "/b".into(),
+                identity: scan::FileIdentity::default(),
+                enumeration_complete: true,
+                has_subdirectories: false,
+            },
+        ]
+        .into();
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.data = Some(Arc::new(data));
+        let mut textures = Vec::new();
+        for mode in [ViewMode::Files, ViewMode::Folders, ViewMode::Hybrid] {
+            app.set_mode(mode);
+            settle(&mut app, &ctx);
+            let start = Instant::now();
+            while app
+                .map_cache
+                .as_ref()
+                .is_none_or(|cache| cache.projection.is_none())
+            {
+                frame(&mut app, &ctx);
+                assert!(
+                    !app.coordinator_disabled,
+                    "coordinator could not initialize {mode:?}"
+                );
+                assert!(start.elapsed() < Duration::from_secs(10));
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            textures.push(app.map_cache.as_ref().unwrap().texture.id());
+        }
+        let before = app.coordinator_version.unwrap();
+        app.hide_file(2);
+        settle(&mut app, &ctx);
+        assert!(!app.coordinator_disabled, "three-mode update fell back");
+        assert!(app.coordinator_version.unwrap().scene_version > before.scene_version);
+        for (index, mode) in [ViewMode::Files, ViewMode::Folders, ViewMode::Hybrid]
+            .into_iter()
+            .enumerate()
+        {
+            app.set_mode(mode);
+            settle(&mut app, &ctx);
+            let cache = app.map_cache.as_ref().unwrap();
+            assert_eq!(cache.texture.id(), textures[index]);
+            let deleted = if mode == ViewMode::Folders { 1 } else { 2 };
+            assert!(app.view_file(deleted).is_none());
+            assert!(cache.map.rect(deleted).is_none());
+        }
+    }
+
+    #[test]
+    fn scene_change_path_adds_resizes_and_removes_a_new_file() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.data = Some(Arc::new(snapshot()));
+        settle(&mut app, &ctx);
+        let start = Instant::now();
+        while app
+            .map_cache
+            .as_ref()
+            .is_none_or(|cache| cache.projection.is_none())
+        {
+            frame(&mut app, &ctx);
+            assert!(!app.coordinator_disabled);
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let texture = app.map_cache.as_ref().unwrap().texture.id();
+        let mut file = app.data.as_ref().unwrap().files[2].clone();
+        file.path = "/b/new".into();
+        file.size = 1;
+        app.queue_scene_changes(vec![scene_model::Change::UpsertFile(file.clone())]);
+        settle(&mut app, &ctx);
+        assert!(!app.coordinator_disabled, "insert fell back");
+        let projection = app.map_cache.as_ref().unwrap().projection.as_ref().unwrap();
+        let (slot, _, _) = projection
+            .iter()
+            .find(|(_, _, f)| f.path == file.path)
+            .unwrap();
+        assert_eq!(app.view_file(slot).unwrap().size, 1);
+        file.size = 2;
+        app.queue_scene_changes(vec![scene_model::Change::UpsertFile(file.clone())]);
+        settle(&mut app, &ctx);
+        assert!(!app.coordinator_disabled, "resize fell back");
+        assert_eq!(app.view_file(slot).unwrap().size, 2);
+        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), texture);
+        // A not-yet-built mode must not be projected from the stale scan.
+        app.access = permission::Access::Unverified;
+        app.set_mode(ViewMode::Folders);
+        app.prepare_folders(&ctx);
+        assert!(app.coordinator_disabled);
+        assert!(app.folder_data.is_none() && app.folder_rx.is_none());
+        // Continue the original mode by restoring the already-published cache.
+        app.set_mode(ViewMode::Files);
+        app.access = permission::Access::Granted;
+        // This fallback intentionally invalidates the incremental actor; the
+        // remaining delete path is covered in a separate test.
+    }
+
+    #[test]
+    fn newly_added_file_delete_uses_scene_identity_not_original_slot() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.data = Some(Arc::new(snapshot()));
+        settle(&mut app, &ctx);
+        let start = Instant::now();
+        while app
+            .map_cache
+            .as_ref()
+            .is_none_or(|cache| cache.projection.is_none())
+        {
+            frame(&mut app, &ctx);
+            assert!(!app.coordinator_disabled);
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let texture = app.map_cache.as_ref().unwrap().texture.id();
+        let mut file = app.data.as_ref().unwrap().files[2].clone();
+        file.path = "/b/new".into();
+        file.size = 1;
+        app.queue_scene_changes(vec![scene_model::Change::UpsertFile(file.clone())]);
+        settle(&mut app, &ctx);
+        let projection = app.map_cache.as_ref().unwrap().projection.as_ref().unwrap();
+        let (slot, _, _) = projection
+            .iter()
+            .find(|(_, _, f)| f.path == file.path)
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.trash_rx = Some(rx);
+        tx.send(TrashOutput {
+            source: app.data.clone().unwrap(),
+            id: None,
+            file_change: Some(scene_model::Change::RemoveFile {
+                path: file.path,
+                identity: file.identity,
+            }),
+            folder_hidden: None,
+            result: Ok(()),
+        })
+        .unwrap();
+        app.poll(&ctx);
+        settle(&mut app, &ctx);
+        assert!(!app.coordinator_disabled, "removal fell back");
+        assert!(app.view_file(slot).is_none());
+        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), texture);
+    }
+
+    #[test]
+    fn first_change_on_empty_snapshot_does_not_publish_stale_empty_view() {
+        let ctx = egui::Context::default();
+        let mut data = snapshot();
+        let file = data.files.pop().unwrap();
+        data.files.clear();
+        let mut app = App::default();
+        app.data = Some(Arc::new(data));
+        // No filesystem scan is started in this fixture; the state still has
+        // to remain marked stale until a real scan succeeds.
+        app.queue_scene_changes(vec![scene_model::Change::UpsertFile(file)]);
+        app.prepare_folders(&ctx);
+        assert!(app.scene_source_dirty);
+        assert!(app.map_cache.is_none());
+        assert!(!app.projection_dirty);
+    }
+
+    #[test]
+    fn failed_or_cancelled_stale_rescan_offers_retry_instead_of_busy_state() {
+        for cancelled in [false, true] {
+            let ctx = egui::Context::default();
+            configure(&ctx);
+            let mut app = App::default();
+            app.access = permission::Access::Granted;
+            app.data = Some(Arc::new(snapshot()));
+            app.mode = ViewMode::Folders;
+            app.scene_source_dirty = true;
+            app.coordinator_disabled = true;
+            let (tx, rx) = mpsc::channel();
+            tx.send(if cancelled {
+                Ok(snapshot())
+            } else {
+                Err("扫描失败。".into())
+            })
+            .unwrap();
+            app.job = Some(Job {
+                cancel: Arc::new(AtomicBool::new(cancelled)),
+                progress: Arc::default(),
+                rx,
+            });
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(1180.0, 780.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| app.ui(ctx),
+            );
+            assert!(app.job.is_none());
+            assert!(app.scene_source_dirty);
+            text_shape(&output, "视图尚未更新，请重新扫描。");
+        }
+    }
+
+    #[test]
+    fn coordinator_recovers_after_fallback_with_existing_tombstone() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.data = Some(Arc::new(snapshot()));
+        settle(&mut app, &ctx);
+        let wait = |app: &mut App| {
+            let start = Instant::now();
+            while app
+                .map_cache
+                .as_ref()
+                .is_none_or(|cache| cache.projection.is_none())
+            {
+                frame(app, &ctx);
+                assert!(!app.coordinator_disabled, "coordinator could not recover");
+                assert!(start.elapsed() < Duration::from_secs(10));
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        wait(&mut app);
+        app.hide_file(0);
+        settle(&mut app, &ctx);
+        app.abandon_coordinator();
+        app.begin_projection_update();
+        settle(&mut app, &ctx);
+        wait(&mut app);
+        assert!(app.view_file(0).is_none());
+        let before = app.coordinator_version.unwrap();
+        app.hide_file(2);
+        settle(&mut app, &ctx);
+        assert!(!app.coordinator_disabled);
+        assert!(app.coordinator_version.unwrap().scene_version > before.scene_version);
+        assert!(app.view_file(2).is_none());
     }
     #[test]
     fn bytes_are_binary_and_zero_is_exact() {
@@ -2100,6 +3276,8 @@ mod tests {
             generation: 0,
             key: LayoutKey::new(Vec2::new(30.0, 30.0), 1.0),
             map,
+            holes: Vec::new(),
+            partitions: None,
         })
         .unwrap();
         app.poll(&ctx);
@@ -2131,6 +3309,8 @@ mod tests {
             generation,
             key,
             map,
+            holes: Vec::new(),
+            partitions: None,
         })
         .unwrap();
         app.poll(ctx);
@@ -2159,6 +3339,8 @@ mod tests {
             generation: 1,
             key: initial,
             map: old_map,
+            holes: Vec::new(),
+            partitions: None,
         })
         .unwrap();
         app.poll(&ctx);
@@ -2216,7 +3398,8 @@ mod tests {
         tx.send(TrashOutput {
             source: source.clone(),
             folder_hidden: None,
-            id: 1,
+            id: Some(1),
+            file_change: None,
             result: Err("无法移到废纸篓。".into()),
         })
         .unwrap();
@@ -2229,11 +3412,13 @@ mod tests {
         tx.send(TrashOutput {
             source: source.clone(),
             folder_hidden: None,
-            id: 1,
+            id: Some(1),
+            file_change: None,
             result: Ok(()),
         })
         .unwrap();
         app.poll(&ctx);
+        settle(&mut app, &ctx);
         app.totals(&ctx);
         assert!(Arc::ptr_eq(app.data.as_ref().unwrap(), &source));
         assert_eq!(app.data.as_ref().unwrap().files.len(), 3);
@@ -2288,13 +3473,16 @@ mod tests {
         settle(&mut app, &ctx);
         let key = LayoutKey::new(Vec2::new(700.0, 400.0), 2.0);
         let generation = app.layout_generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let map = layout_snapshot(
+        let mut map = layout_snapshot(
             app.data.as_ref().unwrap(),
             key,
             &app.layout_generation,
             generation,
         )
         .unwrap();
+        let holes = map
+            .erase_many(&[1], &app.layout_generation, generation)
+            .unwrap();
         app.layout_key = Some(key);
         let (tx, rx) = mpsc::channel();
         app.layout_rx = Some(rx);
@@ -2302,6 +3490,8 @@ mod tests {
             generation,
             key,
             map,
+            holes,
+            partitions: None,
         })
         .unwrap();
         app.poll(&ctx);
@@ -2335,7 +3525,8 @@ mod tests {
         tx.send(TrashOutput {
             source,
             folder_hidden: None,
-            id: 0,
+            id: Some(0),
+            file_change: None,
             result: Ok(()),
         })
         .unwrap();
@@ -2908,6 +4099,7 @@ mod tests {
         let data = Arc::new(scan::ScanResult {
             root: "/".into(),
             files,
+            directories: Vec::new().into(),
             skipped: 0,
             errors: vec![],
             elapsed: Duration::ZERO,

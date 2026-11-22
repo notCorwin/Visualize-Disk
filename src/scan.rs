@@ -68,9 +68,32 @@ pub struct FileEntry {
 pub struct ScanResult {
     pub root: PathBuf,
     pub files: Vec<FileEntry>,
+    /// Directory facts from this scan, including empty and skipped directories.
+    pub directories: Arc<[DirectoryFact]>,
     pub skipped: u64,
     pub errors: Vec<String>,
     pub elapsed: Duration,
+}
+
+/// Facts established for a single directory entry. A directory whose children
+/// could not be enumerated must never be assumed to be a leaf.
+#[derive(Clone, Debug)]
+pub struct DirectoryFact {
+    pub path: PathBuf,
+    pub identity: FileIdentity,
+    pub enumeration_complete: bool,
+    pub has_subdirectories: bool,
+}
+
+impl DirectoryFact {
+    fn skipped(directory: &PendingDirectory) -> Self {
+        Self {
+            path: directory.path.clone(),
+            identity: directory.identity,
+            enumeration_complete: false,
+            has_subdirectories: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -94,13 +117,19 @@ pub fn scan(
     }
     *progress.lock().unwrap_or_else(|e| e.into_inner()) = ScanProgress::default();
     let real_root = fs::canonicalize(&root).map_err(|e| root_error(&e))?;
+    let root_identity = FileIdentity::from_path(&root, &metadata).map_err(|e| root_error(&e))?;
     let excluded_trash = excluded_trash_path();
     if excluded_trash.as_ref().is_some_and(|trash| {
         is_excluded_trash(&root, trash) || is_excluded_trash(&real_root, trash)
     }) {
         return Ok(ScanResult {
-            root,
+            root: root.clone(),
             files: Vec::new(),
+            directories: vec![DirectoryFact::skipped(&PendingDirectory {
+                path: root.clone(),
+                identity: root_identity,
+            })]
+            .into(),
             skipped: 0,
             errors: Vec::new(),
             elapsed: started.elapsed(),
@@ -110,8 +139,13 @@ pub fn scan(
     match macos::trash_relationship(&real_root) {
         Ok(true) => {
             return Ok(ScanResult {
-                root,
+                root: root.clone(),
                 files: Vec::new(),
+                directories: vec![DirectoryFact::skipped(&PendingDirectory {
+                    path: root.clone(),
+                    identity: root_identity,
+                })]
+                .into(),
                 skipped: 0,
                 errors: Vec::new(),
                 elapsed: started.elapsed(),
@@ -120,7 +154,6 @@ pub fn scan(
         Ok(false) => {}
         Err(()) => return Err("无法确认扫描位置是否位于废纸篓，请检查磁盘和访问权限。".into()),
     }
-    let root_identity = FileIdentity::from_path(&root, &metadata).map_err(|e| root_error(&e))?;
     let traversal = Traversal {
         root: &root,
         real_root: &real_root,
@@ -162,6 +195,7 @@ pub fn scan(
     }
     let TraversalState {
         mut files,
+        directories,
         errors,
         root_failure,
         ..
@@ -180,6 +214,7 @@ pub fn scan(
     Ok(ScanResult {
         root,
         files,
+        directories: directories.into(),
         skipped: state.skipped,
         errors,
         elapsed: started.elapsed(),
@@ -229,6 +264,7 @@ fn compare_scanned_paths(a: &Path, b: &Path) -> std::cmp::Ordering {
 struct TraversalState {
     visited: HashSet<DirectoryIdentity>,
     files: Vec<FileEntry>,
+    directories: Vec<DirectoryFact>,
     errors: Vec<String>,
     deferred_data: Option<PendingDirectory>,
     root_failure: Option<String>,
@@ -261,14 +297,20 @@ impl Traversal<'_> {
                 if self
                     .skip_trash_or_unknown(&directory.path, macos::trash_relationship(&real_path))
                 {
+                    self.state
+                        .lock()
+                        .unwrap()
+                        .directories
+                        .push(DirectoryFact::skipped(&directory));
                     return;
                 }
             }
             let mut report = scan_directory(&directory, self.cancel, self.progress);
-            let parent_is_leaf = report.directories.is_empty()
-                && report.errors.is_empty()
+            let enumeration_complete = report.errors.is_empty()
                 && !report.uncertain_entries
                 && report.unreadable.is_none();
+            let has_subdirectories = !report.directories.is_empty();
+            let parent_is_leaf = enumeration_complete && !has_subdirectories;
             for file in &mut report.files {
                 file.parent_identity = directory.identity;
                 file.parent_is_leaf = parent_is_leaf;
@@ -285,6 +327,12 @@ impl Traversal<'_> {
                     state.root_failure = Some(root_error(&error));
                     return;
                 }
+                state.directories.push(DirectoryFact {
+                    path: directory.path.clone(),
+                    identity: directory.identity,
+                    enumeration_complete,
+                    has_subdirectories,
+                });
                 if state.files.is_empty() {
                     state.files = report.files;
                 } else {
@@ -359,12 +407,14 @@ impl Traversal<'_> {
         }) || (cfg!(windows) && child.identity.device != self.root_device)
             || (self.startup_disk && excluded_from_startup_disk(&child.path))
         {
+            state.directories.push(DirectoryFact::skipped(&child));
             *skipped += 1;
         } else if self.startup_disk && child.path == Path::new("/System/Volumes/Data") {
             state.deferred_data = Some(child);
         } else if state.visited.insert(child.identity) {
             return Some(child);
         } else {
+            state.directories.push(DirectoryFact::skipped(&child));
             *skipped += 1;
         }
         None
@@ -424,6 +474,7 @@ fn scan_directory_batches(
     match fs::symlink_metadata(directory) {
         Ok(metadata) if !is_link_or_reparse(&metadata) && metadata.is_dir() => {}
         Ok(_) => {
+            report.uncertain_entries = true;
             publish(
                 progress,
                 ScanProgress {
@@ -807,6 +858,86 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn scan_retains_empty_and_non_leaf_directory_facts() {
+        let temp = Temp::new();
+        let empty = temp.0.join("empty");
+        let parent = temp.0.join("parent");
+        fs::create_dir(&empty).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(parent.join("child")).unwrap();
+        fs::write(parent.join("file"), b"data").unwrap();
+        let result = scan(
+            temp.0.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(ScanProgress::default())),
+        )
+        .unwrap();
+        let fact = |path: &Path| result.directories.iter().find(|d| d.path == path).unwrap();
+        assert!(fact(&temp.0).enumeration_complete);
+        assert!(fact(&temp.0).has_subdirectories);
+        assert!(fact(&parent).enumeration_complete);
+        assert!(fact(&parent).has_subdirectories);
+        assert!(fact(&empty).enumeration_complete);
+        assert!(!fact(&empty).has_subdirectories);
+        assert_eq!(fact(&empty).identity, directory_identity(&empty).unwrap());
+        assert!(fact(&parent.join("child")).enumeration_complete);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unclassified_entry_makes_directory_fact_incomplete() {
+        let temp = Temp::new();
+        std::os::unix::fs::symlink("missing", temp.0.join("link")).unwrap();
+        let result = scan(
+            temp.0.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(ScanProgress::default())),
+        )
+        .unwrap();
+        let fact = result
+            .directories
+            .iter()
+            .find(|d| d.path == temp.0)
+            .unwrap();
+        assert!(!fact.enumeration_complete);
+        assert!(!fact.has_subdirectories);
+    }
+
+    #[test]
+    fn skipped_child_is_retained_as_an_incomplete_directory_fact() {
+        let cancel = AtomicBool::new(false);
+        let progress = Mutex::new(ScanProgress::default());
+        let traversal = Traversal {
+            root: Path::new("/"),
+            real_root: Path::new("/"),
+            root_device: 1,
+            startup_disk: true,
+            excluded_trash: None,
+            cancel: &cancel,
+            progress: &progress,
+            state: Mutex::default(),
+        };
+        let mut state = TraversalState::default();
+        let mut skipped = 0;
+        let child = PendingDirectory {
+            path: "/Volumes".into(),
+            identity: FileIdentity {
+                device: 1,
+                inode: 42,
+            },
+        };
+        assert!(
+            traversal
+                .queue_child(&mut state, child, &mut skipped)
+                .is_none()
+        );
+        assert_eq!(skipped, 1);
+        assert_eq!(state.directories.len(), 1);
+        assert_eq!(state.directories[0].path, Path::new("/Volumes"));
+        assert!(!state.directories[0].enumeration_complete);
     }
 
     #[cfg(target_os = "macos")]
