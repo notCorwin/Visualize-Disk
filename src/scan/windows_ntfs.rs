@@ -261,6 +261,7 @@ fn build_entry(
         EntryReport::Directory(PendingDirectory { path, identity })
     } else {
         EntryReport::File(FileEntry {
+            can_trash: true,
             path,
             size: info.EndOfFile as u64,
             parent: Arc::clone(parent),

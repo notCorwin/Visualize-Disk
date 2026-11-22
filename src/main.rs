@@ -103,10 +103,6 @@ fn configure(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-fn is_trash_path(path: &std::path::Path) -> bool {
-    file_actions::already_in_trash(path)
-}
-
 fn wrapped_text(ui: &mut egui::Ui, text: String, size: f32, color: Color32) -> egui::Response {
     let mut job = egui::text::LayoutJob::simple(
         text,
@@ -144,17 +140,6 @@ fn path_text(ui: &mut egui::Ui, path: &std::path::Path) -> egui::Response {
         },
     );
     ui.add(egui::Label::new(job).wrap())
-}
-
-fn selected_path(ui: &mut egui::Ui, path: &std::path::Path) -> egui::Response {
-    let label = path_text(ui, path);
-    ui.interact(
-        label.rect,
-        egui::Id::new("copy-selected-path"),
-        Sense::click(),
-    )
-    .on_hover_cursor(egui::CursorIcon::PointingHand)
-    .on_hover_text("点击复制完整路径")
 }
 
 fn show_file_tooltip(
@@ -264,9 +249,8 @@ fn relocate_snapshot(
     })
 }
 
-struct FilterOutput {
+struct TotalsOutput {
     generation: u64,
-    indices: Vec<usize>,
     bytes: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -308,47 +292,17 @@ impl MapCache {
     }
 }
 
-fn filter_snapshot(
+fn totals_snapshot(
     data: &scan::ScanResult,
-    query: &str,
-    known_bytes: Option<u64>,
-    hidden: &BTreeSet<usize>,
     token: &AtomicU64,
     generation: u64,
-) -> Option<FilterOutput> {
-    let query = query.to_lowercase();
-    let parts: Result<Vec<Vec<usize>>, ()> = data
+) -> Option<TotalsOutput> {
+    let bytes = data
         .files
-        .par_chunks(4096)
-        .enumerate()
-        .map(|(chunk, files)| {
-            if token.load(Ordering::Relaxed) != generation {
-                return Err(());
-            }
-            Ok(files
-                .iter()
-                .enumerate()
-                .filter_map(|(offset, file)| {
-                    (!hidden.contains(&(chunk * 4096 + offset))
-                        && (query.is_empty()
-                            || file.path.to_string_lossy().to_lowercase().contains(&query)))
-                    .then_some(chunk * 4096 + offset)
-                })
-                .collect())
-        })
-        .collect();
-    let indices = parts.ok()?.into_iter().flatten().collect();
-    let bytes = known_bytes.unwrap_or_else(|| {
-        data.files
-            .par_iter()
-            .map(|file| file.size)
-            .reduce(|| 0, u64::saturating_add)
-    });
-    (token.load(Ordering::Relaxed) == generation).then_some(FilterOutput {
-        generation,
-        indices,
-        bytes,
-    })
+        .par_iter()
+        .map(|file| file.size)
+        .reduce(|| 0, u64::saturating_add);
+    (token.load(Ordering::Relaxed) == generation).then_some(TotalsOutput { generation, bytes })
 }
 
 fn layout_snapshot(
@@ -418,7 +372,6 @@ struct App {
     job: Option<Job>,
     reveal_rx: Option<mpsc::Receiver<Result<(), String>>>,
     trash_rx: Option<mpsc::Receiver<TrashOutput>>,
-    query: String,
     selected: Option<usize>,
     message: Option<String>,
     action_notice: Option<String>,
@@ -433,13 +386,9 @@ struct App {
     recoveries_dirty: bool,
     restore_rx: Option<mpsc::Receiver<RestoreOutput>>,
     canvas_rect: Option<Rect>,
-    filtered: Vec<usize>,
-    file_list: file_list::WrappedFileList,
     total_bytes: u64,
-    dirty: bool,
-    filter_rx: Option<mpsc::Receiver<FilterOutput>>,
-    filter_generation: Arc<AtomicU64>,
-    filter_applied: u64,
+    totals_rx: Option<mpsc::Receiver<TotalsOutput>>,
+    totals_generation: Arc<AtomicU64>,
     totals_ready: bool,
     layout_rx: Option<mpsc::Receiver<LayoutOutput>>,
     layout_generation: Arc<AtomicU64>,
@@ -457,7 +406,6 @@ impl Default for App {
             job: None,
             reveal_rx: None,
             trash_rx: None,
-            query: String::new(),
             selected: None,
             message: None,
             action_notice: None,
@@ -472,13 +420,9 @@ impl Default for App {
             recoveries_dirty: false,
             restore_rx: None,
             canvas_rect: None,
-            filtered: Vec::new(),
-            file_list: file_list::WrappedFileList::default(),
             total_bytes: 0,
-            dirty: true,
-            filter_rx: None,
-            filter_generation: Arc::new(AtomicU64::new(0)),
-            filter_applied: 0,
+            totals_rx: None,
+            totals_generation: Arc::new(AtomicU64::new(0)),
             totals_ready: false,
             layout_rx: None,
             layout_generation: Arc::new(AtomicU64::new(0)),
@@ -541,9 +485,9 @@ impl App {
         if let Some(old) = self.data.replace(Arc::new(data)) {
             defer_drop(old);
         }
-        self.filter_generation.fetch_add(1, Ordering::Relaxed);
+        self.totals_generation.fetch_add(1, Ordering::Relaxed);
         self.layout_generation.fetch_add(1, Ordering::Relaxed);
-        if let Some(old) = self.filter_rx.take() {
+        if let Some(old) = self.totals_rx.take() {
             defer_drop(old);
         }
         if let Some(old) = self.layout_rx.take() {
@@ -552,12 +496,9 @@ impl App {
         if let Some(old) = self.map_cache.take() {
             defer_drop(old);
         }
-        self.filtered.clear();
         self.total_bytes = 0;
         self.totals_ready = false;
         self.selected = None;
-        self.query.clear();
-        self.dirty = true;
         self.layout_key = None;
     }
     fn trash(&mut self, id: usize) {
@@ -574,6 +515,9 @@ impl App {
         let Some(file) = source.files.get(id) else {
             return;
         };
+        if !file.can_trash || !file_actions::can_move_to_trash(&file.path) {
+            return;
+        }
         let path = file.path.clone();
         let identity = file.identity;
         let (tx, rx) = mpsc::channel();
@@ -942,20 +886,18 @@ impl App {
             }
         }
         self.pump_recoveries();
-        if let Some(rx) = &self.filter_rx {
+        if let Some(rx) = &self.totals_rx {
             match rx.try_recv() {
                 Ok(output) => {
-                    self.filter_rx = None;
-                    if output.generation == self.filter_generation.load(Ordering::Relaxed) {
-                        self.filter_applied = output.generation;
-                        defer_drop(std::mem::replace(&mut self.filtered, output.indices));
+                    self.totals_rx = None;
+                    if output.generation == self.totals_generation.load(Ordering::Relaxed) {
                         self.total_bytes = output.bytes;
                         self.totals_ready = true;
                     } else {
                         defer_drop(output);
                     }
                 }
-                Err(mpsc::TryRecvError::Disconnected) => self.filter_rx = None,
+                Err(mpsc::TryRecvError::Disconnected) => self.totals_rx = None,
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
@@ -1004,18 +946,6 @@ impl App {
         {
             return;
         }
-        let current = self.filter_rx.is_none()
-            && !self.dirty
-            && self.filter_applied == self.filter_generation.load(Ordering::Relaxed);
-        let generation = self.filter_generation.fetch_add(1, Ordering::Relaxed) + 1;
-        if let Some(old) = self.filter_rx.take() {
-            defer_drop(old);
-        }
-        // Reuse an applied query; an in-flight query is restarted with hidden ids.
-        self.filtered.retain(|&file| file != id);
-        if current {
-            self.filter_applied = generation;
-        }
         if self.selected == Some(id) {
             self.selected = None;
         }
@@ -1023,31 +953,22 @@ impl App {
             cache.hide(id);
         }
     }
-    fn filter(&mut self, ctx: &egui::Context) {
-        if self.dirty {
-            self.dirty = false;
-            self.filter_generation.fetch_add(1, Ordering::Relaxed);
-        }
-        let generation = self.filter_generation.load(Ordering::Relaxed);
-        if self.filter_rx.is_some() || self.filter_applied == generation {
+    fn totals(&mut self, ctx: &egui::Context) {
+        let generation = self.totals_generation.load(Ordering::Relaxed);
+        if self.totals_rx.is_some() || self.totals_ready {
             return;
         }
         let Some(data) = self.data.clone() else {
             return;
         };
-        let query = self.query.clone();
-        let known = self.totals_ready.then_some(self.total_bytes);
-        let hidden = self.hidden.clone();
-        let token = self.filter_generation.clone();
+        let token = self.totals_generation.clone();
         let (tx, rx) = mpsc::channel();
-        self.filter_rx = Some(rx);
+        self.totals_rx = Some(rx);
         let ctx = ctx.clone();
         rayon::spawn(move || {
-            if let Some(output) = filter_snapshot(&data, &query, known, &hidden, &token, generation)
-            {
+            if let Some(output) = totals_snapshot(&data, &token, generation) {
                 let _ = tx.send(output);
             }
-            // Publish data (or channel closure) before waking an idle event loop.
             drop(tx);
             ctx.request_repaint();
         });
@@ -1185,13 +1106,21 @@ impl App {
     }
     fn ui(&mut self, ctx: &egui::Context) {
         self.ui_contents(ctx);
+        if !ctx.wants_keyboard_input()
+            && ctx.input_mut(|input| {
+                input.consume_key(egui::Modifiers::COMMAND, egui::Key::Backspace)
+            })
+            && let Some(id) = self.selected
+        {
+            self.trash(id);
+        }
         if self.job.is_some()
             || self.reveal_rx.is_some()
             || self.trash_rx.is_some()
             || self.restore_rx.is_some()
             || self.recovery_rx.is_some()
             || self.permission_rx.is_some()
-            || self.filter_rx.is_some()
+            || self.totals_rx.is_some()
             || self.layout_rx.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(100));
@@ -1258,6 +1187,9 @@ impl App {
         if !file_actions::SYSTEM_RECOVERY && !self.recoveries_loaded && self.recovery_rx.is_none() {
             self.load_recoveries();
         }
+        let mut reveal = None;
+        let mut trash = None;
+        let mut restore = None;
         egui::TopBottomPanel::top("toolbar")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(16.0))
             .show(ctx, |ui| {
@@ -1296,54 +1228,92 @@ impl App {
                             self.load_recoveries();
                         }
                     }
+                    let selected = self.selected.and_then(|i| {
+                        self.data
+                            .as_ref()
+                            .and_then(|data| data.files.get(i))
+                            .map(|f| (i, f))
+                    });
+                    if ui
+                        .add_enabled(
+                            selected.is_some() && self.reveal_rx.is_none(),
+                            egui::Button::new(platform::REVEAL_LABEL),
+                        )
+                        .clicked()
+                    {
+                        reveal = selected.map(|(i, _)| i);
+                    }
+                    if selected.is_none_or(|(_, f)| {
+                        f.can_trash && file_actions::can_move_to_trash(&f.path)
+                    }) && ui
+                        .add_enabled(
+                            selected.is_some()
+                                && self.trash_rx.is_none()
+                                && self.restore_rx.is_none(),
+                            egui::Button::new(format!("移到{}", platform::TRASH_NAME)),
+                        )
+                        .clicked()
+                    {
+                        trash = selected.map(|(i, _)| i);
+                    }
+                    if let Some((_, f)) = selected {
+                        if let Some(record) = self.recovery_records.iter().find(|record| {
+                            record.trash_path.as_ref() == Some(&f.path)
+                                && record.identity == f.identity
+                        }) {
+                            if ui
+                                .add_enabled(
+                                    self.restore_rx.is_none() && self.trash_rx.is_none(),
+                                    egui::Button::new("放回原处"),
+                                )
+                                .clicked()
+                            {
+                                restore = Some(record.id.clone());
+                            }
+                        }
+                    }
                     if let Some(data) = &self.data {
-                        let count = format!("{} 个文件", data.files.len());
                         let total = if self.totals_ready {
                             bytes(self.total_bytes)
                         } else {
                             "统计中…".into()
                         };
-                        let font = egui::TextStyle::Body.resolve(ui.style());
-                        let text_width = |text: &str| {
-                            ui.painter()
-                                .layout_no_wrap(text.into(), font.clone(), TEXT)
-                                .size()
-                                .x
-                        };
-                        let gap = ui.spacing().item_spacing.x;
-                        let summary_width = text_width(&count) + gap + text_width(&total);
-                        let clear_width = text_width("清除") + 2.0 * padding.x;
-                        let search_width =
-                            (ui.available_width() - summary_width - clear_width - 2.0 * gap)
-                                .clamp(80.0, 360.0);
-                        let response = ui.add_sized(
-                            [search_width, control_height],
-                            egui::TextEdit::singleline(&mut self.query)
-                                .hint_text("搜索文件列表")
-                                .margin(padding)
-                                .desired_width(search_width),
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(total).strong().color(ACCENT))
+                                .on_hover_text("文件逻辑大小");
+                            ui.label(format!("{} 个文件", data.files.len()));
+                        });
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.set_min_height(control_height);
+                    if let Some(f) = self.selected.and_then(|i| self.data.as_ref()?.files.get(i)) {
+                        let path = f.path.to_string_lossy();
+                        let label = ui.add(
+                            egui::Label::new(format!("{}  {}", bytes(f.size), path)).truncate(),
                         );
-                        if response.changed() {
-                            self.dirty = true;
+                        let response = ui
+                            .interact(
+                                label.rect,
+                                egui::Id::new("copy-selected-path"),
+                                Sense::click(),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text("点击复制完整路径");
+                        if response.clicked() {
+                            if let Some(exact) = f.path.to_str() {
+                                ctx.copy_text(exact.to_owned());
+                                self.action_notice = Some("路径已复制。".into());
+                            } else {
+                                self.message = Some(
+                                    "路径包含无法复制为文本的字符，请在文件管理器中查看。".into(),
+                                );
+                            }
                         }
-                        if ui
-                            .add_enabled(!self.query.is_empty(), egui::Button::new("清除"))
-                            .clicked()
-                        {
-                            self.query.clear();
-                            self.dirty = true;
-                        }
-                        let spare = ui.available_width() - summary_width;
-                        if spare > gap {
-                            ui.add_space(spare);
-                        }
-                        ui.label(count);
-                        ui.label(RichText::new(total).strong().color(ACCENT))
-                            .on_hover_text("文件逻辑大小");
                     }
                 });
             });
-        self.filter(ctx);
+        self.totals(ctx);
         if self.data.is_none() {
             self.status_bar(ctx);
             egui::CentralPanel::default()
@@ -1367,87 +1337,6 @@ impl App {
             self.overlays(ctx);
             return;
         }
-        let mut reveal = None;
-        let mut trash = None;
-        let mut restore = None;
-        egui::SidePanel::right("files")
-            .default_width(280.0)
-            .min_width(230.0)
-            .max_width(450.0)
-            .resizable(true)
-            .frame(egui::Frame::new().fill(PANEL).inner_margin(16.0))
-            .show(ctx, |ui| {
-                if let Some(i) = self.selected {
-                    let f = &self.data.as_ref().unwrap().files[i];
-                    ui.label(RichText::new(bytes(f.size)).size(24.0).color(ACCENT));
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button(platform::REVEAL_LABEL).clicked() {
-                            reveal = Some(i);
-                        }
-                        if ui
-                            .add_enabled(
-                                self.trash_rx.is_none()
-                                    && self.restore_rx.is_none()
-                                    && !is_trash_path(&f.path),
-                                egui::Button::new(format!("移到{}", platform::TRASH_NAME)),
-                            )
-                            .clicked()
-                        {
-                            trash = Some(i);
-                        }
-                    });
-                    if let Some(record) = self.recovery_records.iter().find(|record| {
-                        record.trash_path.as_ref() == Some(&f.path) && record.identity == f.identity
-                    }) {
-                        let id = record.id.clone();
-                        if ui
-                            .add_enabled(
-                                self.restore_rx.is_none() && self.trash_rx.is_none(),
-                                egui::Button::new("放回原处"),
-                            )
-                            .clicked()
-                        {
-                            restore = Some(id);
-                        }
-                    }
-                    if selected_path(ui, &f.path).clicked() {
-                        if let Some(exact) = f.path.to_str() {
-                            ctx.copy_text(exact.to_owned());
-                            self.action_notice = Some("路径已复制。".into());
-                        } else {
-                            self.message =
-                                Some("路径包含无法复制为文本的字符，请在文件管理器中查看。".into());
-                        }
-                    }
-                    ui.separator();
-                }
-                let status = if self.filter_rx.is_some() {
-                    Some("更新中…")
-                } else if self.filtered.is_empty() {
-                    Some("没有匹配的文件")
-                } else {
-                    None
-                };
-                if let Some(status) = status {
-                    ui.add(egui::Label::new(RichText::new(status).color(MUTED)).truncate());
-                }
-                let data = self.data.as_ref().unwrap();
-                if let Some(selected) = self.file_list.show(
-                    ui,
-                    self.filter_applied,
-                    &data.files,
-                    &self.filtered,
-                    self.selected,
-                    |id| {
-                        self.map_cache
-                            .as_ref()
-                            .and_then(|cache| cache.map.color(id))
-                            .unwrap_or_else(|| color(&data.files[id].parent))
-                    },
-                ) {
-                    self.selected = Some(selected);
-                }
-            });
         self.status_bar(ctx);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(12.0))
@@ -1553,7 +1442,7 @@ impl Drop for App {
         if let Some(job) = &self.job {
             job.cancel.store(true, Ordering::Relaxed);
         }
-        self.filter_generation.fetch_add(1, Ordering::Relaxed);
+        self.totals_generation.fetch_add(1, Ordering::Relaxed);
         self.layout_generation.fetch_add(1, Ordering::Relaxed);
         if let Some(data) = self.data.take() {
             defer_drop(data);
@@ -1571,7 +1460,8 @@ fn native_options() -> eframe::Result<eframe::NativeOptions> {
         viewport: egui::ViewportBuilder::default()
             .with_icon(icon)
             .with_inner_size([1180.0, 780.0])
-            .with_min_inner_size([860.0, 560.0]),
+            .with_min_inner_size([860.0, 560.0])
+            .with_maximized(true),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     })
@@ -1651,18 +1541,21 @@ mod tests {
             root: "/".into(),
             files: vec![
                 scan::FileEntry {
+                    can_trash: true,
                     path: "/a/empty".into(),
                     parent: Path::new("/a").into(),
                     size: 0,
                     identity: scan::FileIdentity::default(),
                 },
                 scan::FileEntry {
+                    can_trash: true,
                     path: "/a/large".into(),
                     parent: Path::new("/a").into(),
                     size: 1_000_000,
                     identity: scan::FileIdentity::default(),
                 },
                 scan::FileEntry {
+                    can_trash: true,
                     path: "/b/other".into(),
                     parent: Path::new("/b").into(),
                     size: 42,
@@ -1690,9 +1583,9 @@ mod tests {
         let start = std::time::Instant::now();
         loop {
             frame(app, ctx);
-            if app.filter_rx.is_none()
+            if app.totals_rx.is_none()
                 && app.layout_rx.is_none()
-                && app.filter_applied == app.filter_generation.load(Ordering::Relaxed)
+                && app.totals_ready
                 && app.map_cache.as_ref().is_some_and(|cache| {
                     cache.generation == app.layout_generation.load(Ordering::Relaxed)
                 })
@@ -1703,6 +1596,55 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
     }
+    #[test]
+    fn command_backspace_respects_protection_and_keyboard_focus() {
+        for (protected, focused, expected) in [
+            (false, false, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            let ctx = egui::Context::default();
+            configure(&ctx);
+            let mut app = App::default();
+            app.access = permission::Access::Granted;
+            app.recoveries_loaded = true;
+            let mut data = snapshot();
+            data.files[0].can_trash = !protected;
+            app.data = Some(Arc::new(data));
+            app.selected = Some(0);
+            let modifiers = egui::Modifiers::COMMAND;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1180.0, 780.0),
+                )),
+                modifiers,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Backspace,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            };
+            let mut text = String::new();
+            let _ = ctx.run(input, |ctx| {
+                if focused {
+                    egui::Area::new(egui::Id::new("test-input")).show(ctx, |ui| {
+                        ui.text_edit_singleline(&mut text).request_focus();
+                    });
+                }
+                app.ui(ctx);
+            });
+            assert_eq!(
+                app.trash_rx.is_some(),
+                expected,
+                "protected={protected}, focused={focused}"
+            );
+        }
+    }
+
     #[test]
     fn bytes_are_binary_and_zero_is_exact() {
         assert_eq!(bytes(0), "0 B");
@@ -1732,8 +1674,7 @@ mod tests {
     fn workers_preserve_all_files_and_cancel_stale_generations() {
         let data = snapshot();
         let token = AtomicU64::new(1);
-        let list = filter_snapshot(&data, "empty", None, &BTreeSet::new(), &token, 1).unwrap();
-        assert_eq!(list.indices, vec![0]);
+        let list = totals_snapshot(&data, &token, 1).unwrap();
         assert_eq!(list.bytes, 1_000_042);
         let map = layout_snapshot(
             &data,
@@ -1745,7 +1686,7 @@ mod tests {
         for id in 0..3 {
             assert!(map.rect(id).is_some());
         }
-        assert!(filter_snapshot(&data, "", None, &BTreeSet::new(), &token, 0).is_none());
+        assert!(totals_snapshot(&data, &token, 0).is_none());
         assert!(
             layout_snapshot(
                 &data,
@@ -1796,7 +1737,7 @@ mod tests {
             |ctx| app.ui(ctx),
         );
         assert!(app.job.is_none());
-        assert!(app.filter_rx.is_some());
+        assert!(app.totals_rx.is_some());
         assert!(app.layout_rx.is_some());
         assert!(
             output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
@@ -1813,7 +1754,7 @@ mod tests {
             if layout {
                 app.layout(Vec2::new(800.0, 600.0), 1.0, &ctx);
             } else {
-                app.filter(&ctx);
+                app.totals(&ctx);
             }
             // No UI frames run while the worker computes. Its completion must
             // wake the host before the result can be consumed by the next frame.
@@ -1824,9 +1765,8 @@ mod tests {
                 assert!(app.layout_rx.is_none());
                 assert!(app.map_cache.is_some());
             } else {
-                assert!(app.filter_rx.is_none());
+                assert!(app.totals_rx.is_none());
                 assert!(app.totals_ready);
-                assert_eq!(app.filtered.len(), 3);
             }
         }
     }
@@ -1845,51 +1785,28 @@ mod tests {
                     app.layout(Vec2::new(800.0, 600.0), 1.0, &ctx);
                     app.layout_generation.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    app.filter(&ctx);
-                    app.filter_generation.fetch_add(1, Ordering::Relaxed);
+                    app.totals(&ctx);
+                    app.totals_generation.fetch_add(1, Ordering::Relaxed);
                 }
             });
             wake.recv_timeout(Duration::from_secs(5))
                 .expect("cancelled worker must wake the idle event loop");
             app.poll(&ctx);
-            assert!(app.filter_rx.is_none());
+            assert!(app.totals_rx.is_none());
             assert!(app.layout_rx.is_none());
             assert!(!app.totals_ready);
             assert!(app.map_cache.is_none());
         }
     }
     #[test]
-    fn completed_scan_shows_all_files_and_search_only_changes_list() {
+    fn completed_scan_shows_all_files_and_totals() {
         let ctx = egui::Context::default();
         configure(&ctx);
         let mut app = App::default();
         app.access = permission::Access::Granted;
-        app.query = "old".into();
-        let (tx, rx) = mpsc::channel();
-        app.job = Some(Job {
-            cancel: Arc::new(AtomicBool::new(false)),
-            progress: Arc::default(),
-            rx,
-        });
-        tx.send(Ok(snapshot())).unwrap();
-        app.poll(&ctx);
-        assert!(app.query.is_empty());
+        app.replace_snapshot(snapshot());
         settle(&mut app, &ctx);
-        settle(&mut app, &ctx);
-        settle(&mut app, &ctx);
-        assert_eq!(app.filtered.len(), 3);
         assert_eq!(app.total_bytes, 1_000_042);
-        let applied_generation = app.map_cache.as_ref().unwrap().generation;
-        let texture = app.map_cache.as_ref().unwrap().texture.id();
-        app.query = "no-match".into();
-        app.dirty = true;
-        settle(&mut app, &ctx);
-        assert!(app.filtered.is_empty());
-        assert_eq!(
-            app.map_cache.as_ref().unwrap().generation,
-            applied_generation
-        );
-        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), texture);
         for id in 0..3 {
             assert!(app.map_cache.as_ref().unwrap().map.rect(id).is_some());
         }
@@ -2015,7 +1932,6 @@ mod tests {
         let mut app = App::default();
         app.access = permission::Access::Granted;
         app.data = Some(Arc::new(snapshot()));
-        app.query = "large".into();
         settle(&mut app, &ctx);
         let source = app.data.clone().unwrap();
         let cache = app.map_cache.as_ref().unwrap();
@@ -2046,14 +1962,12 @@ mod tests {
         })
         .unwrap();
         app.poll(&ctx);
-        app.filter(&ctx);
+        app.totals(&ctx);
         assert!(Arc::ptr_eq(app.data.as_ref().unwrap(), &source));
         assert_eq!(app.data.as_ref().unwrap().files.len(), 3);
         assert_eq!(app.total_bytes, 1_000_042); // Trash still occupies disk space.
-        assert_eq!(app.query, "large");
-        assert!(app.filtered.is_empty());
         assert_eq!(app.selected, None);
-        assert!(app.filter_rx.is_none());
+        assert!(app.totals_rx.is_none());
         assert!(app.layout_rx.is_none());
         let cache = app.map_cache.as_ref().unwrap();
         assert_eq!(cache.texture.id(), texture);
@@ -2088,32 +2002,18 @@ mod tests {
         assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), texture);
         assert_eq!(app.layout_generation.load(Ordering::Relaxed), generation);
         assert!(app.layout_rx.is_none());
-        assert!(app.filter_rx.is_none());
+        assert!(app.totals_rx.is_none());
     }
     #[test]
-    fn deletions_invalidate_inflight_filters_and_mask_inflight_resizes() {
+    fn deletions_mask_inflight_resizes() {
         let ctx = egui::Context::default();
         configure(&ctx);
         let mut app = App::default();
         app.access = permission::Access::Granted;
         app.data = Some(Arc::new(snapshot()));
         settle(&mut app, &ctx);
-        let stale_generation = app.filter_generation.load(Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel();
-        app.filter_rx = Some(rx);
-        tx.send(FilterOutput {
-            generation: stale_generation,
-            indices: vec![0, 1, 2],
-            bytes: 1_000_042,
-        })
-        .unwrap();
         app.hide_file(1);
         settle(&mut app, &ctx);
-        assert!(!app.filtered.contains(&1));
-        app.query = "large".into();
-        app.dirty = true;
-        settle(&mut app, &ctx);
-        assert!(app.filtered.is_empty());
         let key = LayoutKey::new(Vec2::new(700.0, 400.0), 2.0);
         let generation = app.layout_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let map = layout_snapshot(
@@ -2143,7 +2043,6 @@ mod tests {
         app.replace_snapshot(snapshot());
         assert!(app.hidden.is_empty());
         settle(&mut app, &ctx);
-        assert_eq!(app.filtered.len(), 3);
         assert!(app.map_cache.as_ref().unwrap().map.rect(1).is_some());
     }
     #[test]
@@ -2217,7 +2116,7 @@ mod tests {
         assert!(app.selected.is_none());
     }
     #[test]
-    fn clicking_wrapped_path_copies_full_unicode_path_without_layout_change() {
+    fn clicking_top_path_copies_full_unicode_path_without_layout_change() {
         let ctx = egui::Context::default();
         configure(&ctx);
         let mut data = snapshot();
@@ -2355,10 +2254,10 @@ mod tests {
         });
         check(&mut app);
         defer_drop(app.job.take());
-        let (_filter_tx, filter_rx) = mpsc::channel();
-        app.filter_rx = Some(filter_rx);
+        let (_totals_tx, totals_rx) = mpsc::channel();
+        app.totals_rx = Some(totals_rx);
         check(&mut app);
-        app.filter_rx = None;
+        app.totals_rx = None;
         let (_layout_tx, layout_rx) = mpsc::channel();
         app.layout_rx = Some(layout_rx);
         check(&mut app);
@@ -2375,7 +2274,7 @@ mod tests {
         app.show_recoveries = false;
     }
     #[test]
-    fn wrapped_selected_path_does_not_expand_sidebar_or_canvas() {
+    fn long_selected_path_does_not_resize_canvas() {
         let ctx = egui::Context::default();
         configure(&ctx);
         let mut data = snapshot();
@@ -2426,7 +2325,7 @@ mod tests {
     }
 
     #[test]
-    fn realistic_paths_and_long_file_names_wrap_fully_without_a_scroll_view() {
+    fn selected_paths_are_truncated_within_the_toolbar() {
         let ctx = egui::Context::default();
         configure(&ctx);
         let paths = [
@@ -2453,9 +2352,10 @@ mod tests {
                         |ctx| app.ui(ctx),
                     ));
                 }
-                let (shape, clip) = text_shape(last.as_ref().unwrap(), path);
-                assert!(!shape.galley.elided);
-                assert!(shape.galley.rows.len() > 1);
+                let (shape, clip) =
+                    text_shape(last.as_ref().unwrap(), &format!("{}  {}", bytes(0), path));
+                assert!(shape.galley.elided);
+                assert_eq!(shape.galley.rows.len(), 1);
                 let rect = shape.galley.rect.translate(shape.pos.to_vec2());
                 assert!(
                     rect.left() >= clip.left() - 1.0 && rect.right() <= clip.right() + 1.0,
@@ -2643,10 +2543,8 @@ mod tests {
             })
             .collect();
         let start = ctx.input(|input| input.time);
-        let mut list_points = Vec::new();
         let mut heights = Vec::new();
-        // Warm up the first Area sizing pass, then alternate long/short files,
-        // leave the canvas, and move across list rows and back to the canvas.
+        // Warm up the first Area sizing pass, alternate files, and leave the canvas.
         for (step, hovered) in [
             Some(0),
             Some(0),
@@ -2666,11 +2564,9 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let point = match (step, hovered) {
-                (6..=11, Some(index)) => list_points[index],
-                (_, Some(index)) => points[index],
-                _ => egui::pos2(1.0, 1.0),
-            };
+            let point = hovered
+                .map(|index| points[index])
+                .unwrap_or(egui::pos2(1.0, 1.0));
             let output = ctx.run(
                 egui::RawInput {
                     screen_rect: Some(Rect::from_min_size(
@@ -2683,19 +2579,6 @@ mod tests {
                 },
                 |ctx| app.ui(ctx),
             );
-            if list_points.is_empty() {
-                list_points = app
-                    .data
-                    .as_ref()
-                    .unwrap()
-                    .files
-                    .iter()
-                    .map(|file| {
-                        let name = file.path.file_name().unwrap().to_string_lossy();
-                        text_shape(&output, &name).0.pos + Vec2::splat(3.0)
-                    })
-                    .collect();
-            }
             let mut frame_rects = Vec::new();
             let mut tooltip_paths = Vec::new();
             for shape in &output.shapes {
@@ -2791,6 +2674,7 @@ mod tests {
         let files: Vec<_> = (0..n)
             .into_par_iter()
             .map(|i| scan::FileEntry {
+                can_trash: true,
                 path: format!(
                     "/volume{}/folder{}/group{}/file{i}",
                     i / 350000,
@@ -2872,17 +2756,8 @@ mod tests {
         let output = ctx.run(resized, |ctx| app.ui(ctx));
         let _ = ctx.tessellate(output.shapes, output.pixels_per_point);
         let resize_request = now.elapsed();
-        let now = std::time::Instant::now();
-        app.query = "file123".into();
-        app.dirty = true;
-        frame(&mut app, &ctx);
-        let search_request = now.elapsed();
-        app.query = "file999".into();
-        app.dirty = true;
-        frame(&mut app, &ctx);
         assert!(resize_request.as_secs_f64() * 1000.0 < 16.7);
-        assert!(search_request.as_secs_f64() * 1000.0 < 16.7);
-        eprintln!("request CPU resize={resize_request:?}, search={search_request:?}");
+        eprintln!("request CPU resize={resize_request:?}");
         eprintln!(
             "3.5m build={build:?}, steady p50={:.3}ms p95={:.3}ms max={:.3}ms rayon_threads={}",
             times[30],

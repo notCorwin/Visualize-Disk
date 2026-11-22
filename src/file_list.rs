@@ -340,6 +340,7 @@ mod tests {
     }
     fn fixture(name: &str) -> FileEntry {
         FileEntry {
+            can_trash: true,
             path: Path::new("/data").join(name),
             parent: Path::new("/data").into(),
             size: 1024,

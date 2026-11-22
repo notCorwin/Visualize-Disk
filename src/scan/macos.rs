@@ -151,6 +151,7 @@ fn read_batch(
                 delta.files += 1;
                 delta.bytes = delta.bytes.saturating_add(size);
                 report.files.push(FileEntry {
+                    can_trash: true,
                     path: child_path(directory, entry.name),
                     parent: Arc::clone(parent.get_or_insert_with(|| Arc::from(directory))),
                     size,

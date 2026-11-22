@@ -58,6 +58,7 @@ pub struct FileEntry {
     /// Shared by entries produced by the same directory scan.
     pub parent: Arc<Path>,
     pub identity: FileIdentity,
+    pub can_trash: bool,
 }
 
 #[derive(Debug)]
@@ -89,11 +90,26 @@ pub fn scan(
         return Err("扫描位置不是可读取的真实目录；不扫描符号链接。".into());
     }
     *progress.lock().unwrap_or_else(|e| e.into_inner()) = ScanProgress::default();
+    let real_root = fs::canonicalize(&root).map_err(|e| root_error(&e))?;
+    let excluded_trash = excluded_trash_path();
+    if excluded_trash.as_ref().is_some_and(|trash| {
+        is_excluded_trash(&root, trash) || is_excluded_trash(&real_root, trash)
+    }) {
+        return Ok(ScanResult {
+            root,
+            files: Vec::new(),
+            skipped: 0,
+            errors: Vec::new(),
+            elapsed: started.elapsed(),
+        });
+    }
     let root_identity = FileIdentity::from_path(&root, &metadata).map_err(|e| root_error(&e))?;
     let traversal = Traversal {
         root: &root,
+        real_root: &real_root,
         root_device: root_identity.device,
         startup_disk: cfg!(target_os = "macos") && root == Path::new("/"),
+        excluded_trash,
         cancel: &cancel,
         progress: &progress,
         state: Mutex::new(TraversalState::default()),
@@ -203,8 +219,10 @@ struct TraversalState {
 
 struct Traversal<'a> {
     root: &'a Path,
+    real_root: &'a Path,
     root_device: u64,
     startup_disk: bool,
+    excluded_trash: Option<PathBuf>,
     cancel: &'a AtomicBool,
     progress: &'a Mutex<ScanProgress>,
     state: Mutex<TraversalState>,
@@ -217,6 +235,11 @@ impl Traversal<'_> {
                 return;
             }
             let mut report = scan_directory(&directory, self.cancel, self.progress);
+            for file in &mut report.files {
+                file.can_trash = crate::file_actions::can_move_to_trash(&file.path)
+                    && (self.root == self.real_root
+                        || crate::file_actions::can_move_to_trash(&self.real_path(&file.path)));
+            }
             let mut skipped = 0;
             let children: Vec<_> = {
                 let mut state = self.state.lock().unwrap();
@@ -259,13 +282,21 @@ impl Traversal<'_> {
         });
     }
 
+    fn real_path(&self, path: &Path) -> PathBuf {
+        mapped_real_path(path, self.root, self.real_root)
+    }
+
     fn queue_child(
         &self,
         state: &mut TraversalState,
         child: PendingDirectory,
         skipped: &mut u64,
     ) -> Option<PendingDirectory> {
-        if (cfg!(windows) && child.identity.device != self.root_device)
+        if self.excluded_trash.as_ref().is_some_and(|trash| {
+            is_excluded_trash(&child.path, trash)
+                || (self.root != self.real_root
+                    && is_excluded_trash(&self.real_path(&child.path), trash))
+        }) || (cfg!(windows) && child.identity.device != self.root_device)
             || (self.startup_disk && excluded_from_startup_disk(&child.path))
         {
             *skipped += 1;
@@ -454,6 +485,7 @@ fn report_entry(
     } else {
         EntryReport::File(FileEntry {
             identity,
+            can_trash: true,
             size: metadata.len(),
             path,
             parent: Arc::clone(parent),
@@ -610,6 +642,36 @@ fn directory_identity(path: &std::path::Path) -> std::io::Result<DirectoryIdenti
     FileIdentity::from_path(path, &fs::symlink_metadata(path)?)
 }
 
+/// The Data volume is also traversed through its visible startup-disk paths.
+pub(crate) fn startup_data_relative(path: &Path) -> &Path {
+    path.strip_prefix("/System/Volumes/Data")
+        .or_else(|_| path.strip_prefix("/"))
+        .unwrap_or(path)
+}
+
+fn mapped_real_path(path: &Path, root: &Path, real_root: &Path) -> PathBuf {
+    path.strip_prefix(root)
+        .map(|suffix| real_root.join(suffix))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn is_excluded_trash(path: &Path, trash: &Path) -> bool {
+    startup_data_relative(path).starts_with(startup_data_relative(trash))
+}
+
+fn excluded_trash_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::file_actions::home_directory()
+            .ok()
+            .map(|home| fs::canonicalize(&home).unwrap_or(home).join(".Trash"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 fn excluded_from_startup_disk(path: &std::path::Path) -> bool {
     // These are device or other-disk/network mount namespaces, not files on the
     // startup disk. Do not apply this policy when explicitly scanning a folder.
@@ -680,6 +742,30 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_root_mapping_handles_symlink_ancestors_without_changing_display_paths() {
+        let temp = Temp::new();
+        std::os::unix::fs::symlink("/System", temp.0.join("system-link")).unwrap();
+        let root = temp.0.join("system-link/Library");
+        let real_root = fs::canonicalize(&root).unwrap();
+        let displayed = root.join("Fonts/example");
+        let actual = mapped_real_path(&displayed, &root, &real_root);
+        assert_eq!(displayed, temp.0.join("system-link/Library/Fonts/example"));
+        assert!(!crate::file_actions::can_move_to_trash(&actual));
+
+        fs::create_dir_all(temp.0.join("home/.Trash/inside")).unwrap();
+        std::os::unix::fs::symlink(temp.0.join("home"), temp.0.join("home-link")).unwrap();
+        let root = temp.0.join("home-link/.Trash/inside");
+        let real_root = fs::canonicalize(&root).unwrap();
+        let trash = fs::canonicalize(temp.0.join("home/.Trash")).unwrap();
+        assert!(is_excluded_trash(&real_root, &trash));
+        assert!(is_excluded_trash(
+            &mapped_real_path(&root.join("file"), &root, &real_root),
+            &trash
+        ));
+    }
+
     #[test]
     fn startup_scope_excludes_only_other_mount_namespaces() {
         for path in [
@@ -702,6 +788,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn trash_exclusion_matches_home_and_data_alias_only() {
+        let trash = Path::new("/Users/me/.Trash");
+        for path in [
+            "/Users/me/.Trash",
+            "/Users/me/.Trash/file",
+            "/System/Volumes/Data/Users/me/.Trash/file",
+        ] {
+            assert!(is_excluded_trash(Path::new(path), trash), "{path}");
+        }
+        for path in ["/Users/me/.Trash-other/file", "/Users/other/.Trash/file"] {
+            assert!(!is_excluded_trash(Path::new(path), trash), "{path}");
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn startup_data_root_does_not_claim_identity_before_canonical_phase() {
@@ -709,8 +810,10 @@ mod tests {
         let progress = Mutex::new(ScanProgress::default());
         let traversal = Traversal {
             root: Path::new("/"),
+            real_root: Path::new("/"),
             root_device: 1,
             startup_disk: true,
+            excluded_trash: None,
             cancel: &cancel,
             progress: &progress,
             state: Mutex::default(),
@@ -747,8 +850,10 @@ mod tests {
         let progress = Mutex::new(ScanProgress::default());
         let traversal = Traversal {
             root: Path::new(r"C:\"),
+            real_root: Path::new(r"C:\"),
             root_device: 1,
             startup_disk: false,
+            excluded_trash: None,
             cancel: &cancel,
             progress: &progress,
             state: Mutex::default(),

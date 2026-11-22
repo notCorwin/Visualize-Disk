@@ -40,6 +40,9 @@ pub use windows::open_recycle_bin;
 
 /// Use the native recoverable trash operation; never fall back to permanent deletion.
 pub fn move_to_trash(path: &Path, expected: FileIdentity) -> Result<Option<FileEntry>, String> {
+    if is_system_path(path) || fs::canonicalize(path).is_ok_and(|p| is_system_path(&p)) {
+        return Err("系统文件夹中的内容不能移到废纸篓。".into());
+    }
     if already_in_trash(path) {
         return Err(if cfg!(windows) {
             "文件已在回收站中，请在系统回收站中还原；不会再次删除。"
@@ -50,6 +53,18 @@ pub fn move_to_trash(path: &Path, expected: FileIdentity) -> Result<Option<FileE
     }
     verify_file(path, expected)?;
     native_trash(path, expected)
+}
+
+/// Whether a scanned file may be offered as a trash action.
+pub fn can_move_to_trash(path: &Path) -> bool {
+    !already_in_trash(path) && !is_system_path(path)
+}
+
+fn is_system_path(path: &Path) -> bool {
+    // Refuse ambiguous paths rather than letting parent components bypass the guard.
+    path.components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+        || crate::scan::startup_data_relative(path).starts_with("System")
 }
 
 pub fn already_in_trash(path: &Path) -> bool {
@@ -189,7 +204,7 @@ fn native_trash(_path: &Path, _expected: FileIdentity) -> Result<Option<FileEntr
 }
 
 #[cfg(target_os = "macos")]
-fn home_directory() -> Result<std::path::PathBuf, String> {
+pub(crate) fn home_directory() -> Result<std::path::PathBuf, String> {
     use std::{
         ffi::{CStr, OsStr},
         os::unix::ffi::OsStrExt,
@@ -380,6 +395,8 @@ fn destination_entry(path: std::path::PathBuf) -> Option<FileEntry> {
         return None;
     }
     Some(FileEntry {
+        can_trash: can_move_to_trash(&path)
+            && fs::canonicalize(&path).is_ok_and(|p| can_move_to_trash(&p)),
         parent: path.parent()?.into(),
         size: metadata.len(),
         identity: FileIdentity::from_path(&path, &metadata).ok()?,
@@ -494,6 +511,26 @@ mod tests {
         assert_eq!(entry.identity, identity);
         assert!(destination_entry(temp.0.join("missing")).is_none());
         assert!(destination_entry(temp.0.clone()).is_none());
+    }
+
+    #[test]
+    fn system_files_cannot_be_trashed_but_data_volume_user_files_can() {
+        for path in ["/System/Library/file", "/System/Volumes/Data/System/file"] {
+            assert!(!can_move_to_trash(Path::new(path)), "{path}");
+            assert!(
+                move_to_trash(Path::new(path), FileIdentity::default())
+                    .unwrap_err()
+                    .contains("系统文件夹")
+            );
+        }
+        for path in [
+            "/Systematic/file",
+            "/Users/me/file",
+            "/System/Volumes/Data/Users/me/file",
+        ] {
+            assert!(can_move_to_trash(Path::new(path)), "{path}");
+        }
+        assert!(!can_move_to_trash(Path::new("/Users/me/.Trash/file")));
     }
 
     #[test]
