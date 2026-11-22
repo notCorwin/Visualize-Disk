@@ -239,7 +239,7 @@ fn file_tooltip(ui: &mut egui::Ui, file: &scan::FileEntry, width: f32, folder: b
 
 fn tooltip_size(size: u64, folder: bool) -> String {
     if folder {
-        format!("直接文件 {}", bytes(size))
+        format!("文件夹 {}", bytes(size))
     } else {
         bytes(size)
     }
@@ -317,9 +317,9 @@ struct TotalsOutput {
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ViewMode {
-    #[default]
     Files,
     Folders,
+    #[default]
     Hybrid,
 }
 
@@ -625,7 +625,7 @@ impl Default for App {
             permission_rx: None,
             pending_scan: false,
             data: None,
-            mode: ViewMode::Files,
+            mode: ViewMode::default(),
             folder_data: None,
             folder_rx: None,
             folder_generation: Arc::new(AtomicU64::new(0)),
@@ -2186,7 +2186,7 @@ impl App {
                     }
                     if ui
                         .selectable_label(self.mode == ViewMode::Folders, "文件夹")
-                        .on_hover_text("按文件夹中的直接文件汇总")
+                        .on_hover_text("按文件夹汇总")
                         .clicked()
                     {
                         self.set_mode(ViewMode::Folders);
@@ -2542,6 +2542,12 @@ mod tests {
         }
     }
     #[test]
+    fn default_view_is_hybrid_and_folder_size_uses_folder_label() {
+        assert_eq!(App::default().mode, ViewMode::Hybrid);
+        assert_eq!(tooltip_size(42, true), "文件夹 42 B");
+        assert_eq!(tooltip_size(42, false), "42 B");
+    }
+    #[test]
     fn command_backspace_respects_protection_and_keyboard_focus() {
         for (protected, focused, expected) in [
             (false, false, true),
@@ -2551,6 +2557,7 @@ mod tests {
             let ctx = egui::Context::default();
             configure(&ctx);
             let mut app = App::default();
+            app.mode = ViewMode::Files;
             app.access = permission::Access::Granted;
             let mut data = snapshot();
             data.files[0].can_trash = !protected;
@@ -2624,6 +2631,7 @@ mod tests {
         let ctx = egui::Context::default();
         configure(&ctx);
         let mut app = App::default();
+        app.mode = ViewMode::Files;
         app.access = permission::Access::Granted;
         app.data = Some(Arc::new(snapshot()));
         settle(&mut app, &ctx);
@@ -2764,6 +2772,7 @@ mod tests {
         let ctx = egui::Context::default();
         configure(&ctx);
         let mut app = App::default();
+        app.mode = ViewMode::Files;
         app.access = permission::Access::Granted;
         app.data = Some(Arc::new(snapshot()));
         settle(&mut app, &ctx);
@@ -2793,6 +2802,7 @@ mod tests {
     #[test]
     fn old_frame_cannot_reveal_file_already_moved_to_trash() {
         let mut app = App::default();
+        app.mode = ViewMode::Files;
         app.data = Some(Arc::new(snapshot()));
         app.hidden = Arc::new(BTreeSet::from([1]));
         app.reveal(1);
@@ -3184,7 +3194,7 @@ mod tests {
         );
         assert!(app.job.is_none());
         assert!(app.totals_rx.is_some());
-        assert!(app.layout_rx.is_some());
+        assert!(app.hybrid_rx.is_some() || app.layout_rx.is_some());
         assert!(
             output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
                 <= Duration::from_millis(100),
@@ -3196,6 +3206,7 @@ mod tests {
         for layout in [false, true] {
             let (ctx, wake) = idle_context_with_wake_receiver();
             let mut app = App::default();
+            app.mode = ViewMode::Files;
             app.data = Some(Arc::new(snapshot()));
             if layout {
                 app.layout(Vec2::new(800.0, 600.0), 1.0, &ctx);
@@ -3225,6 +3236,7 @@ mod tests {
         for layout in [false, true] {
             let (ctx, wake) = idle_context_with_wake_receiver();
             let mut app = App::default();
+            app.mode = ViewMode::Files;
             app.data = Some(Arc::new(snapshot()));
             pool.install(|| {
                 if layout {

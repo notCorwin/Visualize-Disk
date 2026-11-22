@@ -311,12 +311,26 @@ impl Traversal<'_> {
                 && report.unreadable.is_none();
             let has_subdirectories = !report.directories.is_empty();
             let parent_is_leaf = enumeration_complete && !has_subdirectories;
+            // All entries share this validated directory. Checking its path once
+            // avoids walking the same ancestor components for every file. Keep
+            // the exact path check for special names and protected parents.
+            #[cfg(target_os = "macos")]
+            let parent_can_trash = crate::file_actions::can_move_to_trash(&directory.path)
+                && (self.root == self.real_root
+                    || crate::file_actions::can_move_to_trash(&self.real_path(&directory.path)));
             for file in &mut report.files {
                 file.parent_identity = directory.identity;
                 file.parent_is_leaf = parent_is_leaf;
-                file.can_trash = crate::file_actions::can_move_to_trash(&file.path)
-                    && (self.root == self.real_root
-                        || crate::file_actions::can_move_to_trash(&self.real_path(&file.path)));
+                #[cfg(target_os = "macos")]
+                let ordinary_child = ordinary_trash_child(&file.path, parent_can_trash);
+                #[cfg(not(target_os = "macos"))]
+                let ordinary_child = false;
+                file.can_trash = ordinary_child
+                    || (crate::file_actions::can_move_to_trash(&file.path)
+                        && (self.root == self.real_root
+                            || crate::file_actions::can_move_to_trash(
+                                &self.real_path(&file.path),
+                            )));
             }
             let mut skipped = 0;
             let children: Vec<_> = {
@@ -419,6 +433,14 @@ impl Traversal<'_> {
         }
         None
     }
+}
+
+#[cfg(target_os = "macos")]
+fn ordinary_trash_child(path: &Path, parent_can_trash: bool) -> bool {
+    parent_can_trash
+        && path
+            .file_name()
+            .is_some_and(|name| name != ".Trash" && name != ".Trashes" && name != "System")
 }
 
 type DirectoryIdentity = FileIdentity;
@@ -835,6 +857,45 @@ fn record_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_parent_trash_guard_matches_full_path_checks() {
+        for (root, real_root, parent) in [
+            ("/", "/", "/"),
+            ("/", "/", "/System"),
+            ("/", "/", "/System/Volumes/Data"),
+            ("/", "/", "/Users/me/.Trash"),
+            ("/", "/", "/Users/me/Documents"),
+            ("/alias", "/System", "/alias/Library"),
+            ("/alias", "/Users/me", "/alias/Documents"),
+        ] {
+            let root = Path::new(root);
+            let real_root = Path::new(real_root);
+            let parent = Path::new(parent);
+            let parent_allowed = crate::file_actions::can_move_to_trash(parent)
+                && (root == real_root
+                    || crate::file_actions::can_move_to_trash(&mapped_real_path(
+                        parent, root, real_root,
+                    )));
+            for name in ["file", "System", ".Trash", ".Trashes", "文件"] {
+                let path = parent.join(name);
+                let exact = crate::file_actions::can_move_to_trash(&path)
+                    && (root == real_root
+                        || crate::file_actions::can_move_to_trash(&mapped_real_path(
+                            &path, root, real_root,
+                        )));
+                assert_eq!(
+                    ordinary_trash_child(&path, parent_allowed) || exact,
+                    exact,
+                    "{} mapped from {} to {}",
+                    path.display(),
+                    root.display(),
+                    real_root.display()
+                );
+            }
+        }
+    }
     use std::sync::atomic::AtomicU64;
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
