@@ -296,6 +296,10 @@ fn affected(scene: &Scene, changes: &[Change]) -> BTreeSet<PathBuf> {
                     paths.insert(parent.to_path_buf());
                 }
             }
+            Change::RemoveLeafDirectory { path, parent, .. } => {
+                paths.insert(path.clone());
+                paths.insert(parent.path.clone());
+            }
         }
     }
     paths
@@ -328,10 +332,21 @@ fn leaf_transitions(scene: &Scene, changes: &[Change]) -> BTreeSet<PathBuf> {
                 Some(fact.enumeration_complete && !fact.has_subdirectories),
             ),
             Change::RemoveDirectory { path, .. } => (path, None),
+            Change::RemoveLeafDirectory { path, .. } => (path, None),
             _ => continue,
         };
         if scene.directory_leaf(path) != new_leaf {
             changed.insert(path.clone());
+        }
+    }
+    // A leaf removal may turn its parent into a hybrid aggregate. Its files
+    // must be captured before and after even when no file path changed.
+    for change in changes {
+        if let Change::RemoveLeafDirectory { parent, .. } = change {
+            let new_leaf = parent.enumeration_complete && !parent.has_subdirectories;
+            if scene.directory_leaf(&parent.path) != Some(new_leaf) {
+                changed.insert(parent.path.clone());
+            }
         }
     }
     changed
@@ -480,6 +495,72 @@ mod tests {
             .rx
             .recv_timeout(Duration::from_secs(5))
             .expect("actor response")
+    }
+    #[test]
+    fn removing_leaf_captures_subtree_and_parent_hybrid_transition() {
+        let fact = |path: &str, id: u64, children| scan::DirectoryFact {
+            path: path.into(),
+            identity: identity(id),
+            enumeration_complete: true,
+            has_subdirectories: children,
+        };
+        let data = scan::ScanResult {
+            root: "/disk".into(),
+            files: vec![file("/disk/p/x", 3, 3, 2), file("/disk/p/a/y", 4, 5, 4)],
+            directories: vec![
+                fact("/disk", 1, true),
+                fact("/disk/p", 2, true),
+                fact("/disk/p/a", 4, false),
+            ]
+            .into(),
+            skipped: 0,
+            errors: vec![],
+            elapsed: Duration::ZERO,
+        };
+        let actor = SceneActor::start(
+            Scene::from_scan(Arc::new(data)),
+            9,
+            egui::Context::default(),
+        );
+        actor
+            .try_submit(UpdateRequest {
+                base: Version {
+                    source_generation: 9,
+                    scene_version: 0,
+                },
+                changes: vec![Change::RemoveLeafDirectory {
+                    path: "/disk/p/a".into(),
+                    identity: identity(4),
+                    parent: fact("/disk/p", 2, false),
+                }],
+            })
+            .unwrap();
+        let Event::Prepared(p) = get(&actor) else {
+            panic!("prepared")
+        };
+        assert!(p.projections.files.iter().any(|d| {
+            d.before
+                .as_ref()
+                .is_some_and(|t| t.path == PathBuf::from("/disk/p/a/y"))
+                && d.after.is_none()
+        }));
+        assert!(p.projections.folders.iter().any(|d| {
+            d.before
+                .as_ref()
+                .is_some_and(|t| t.path == PathBuf::from("/disk/p/a"))
+                && d.after.is_none()
+        }));
+        assert!(p.projections.hybrid.iter().any(|d| {
+            d.before
+                .as_ref()
+                .is_some_and(|t| t.path == PathBuf::from("/disk/p/x"))
+                && d.after.is_none()
+        }));
+        assert!(p.projections.hybrid.iter().any(|d| {
+            d.after
+                .as_ref()
+                .is_some_and(|t| t.path == PathBuf::from("/disk/p"))
+        }));
     }
     #[test]
     fn prepares_sparse_updates_and_requires_commit_before_next_batch() {

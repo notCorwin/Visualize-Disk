@@ -5,7 +5,7 @@
 //! scene version. If a structural change would move a nested directory, or the
 //! requested area error is exceeded, the caller must rebuild the full scene.
 use crate::{
-    directory_map::{DirectoryPartition, PartitionItemId},
+    directory_map::{DirectoryPartition, PartitionItem, PartitionItemId},
     incremental_layout::{self, Partition, Placement},
     scan,
     scene_model::{Scene, TileId},
@@ -122,6 +122,94 @@ pub struct GeometryUpdate {
 }
 
 impl IncrementalGeometry {
+    /// Export the currently published allocations, rather than the original
+    /// scan's allocations, so a structural update can keep unrelated regions.
+    pub fn export_partitions(
+        &self,
+        projection: &crate::sparse_projection::SparseProjection,
+        platforms: &[crate::render::Platform],
+    ) -> Result<Vec<DirectoryPartition>, Error> {
+        let by_id: BTreeMap<_, _> = self
+            .parents
+            .iter()
+            .map(|(path, (_, id))| (*id, path))
+            .collect();
+        let rect_key = |r: Rect| [r.x.to_bits(), r.y.to_bits(), r.w.to_bits(), r.h.to_bits()];
+        let mut surfaces = BTreeMap::<[u32; 4], Option<PathBuf>>::new();
+        for (path, partition) in &self.partitions {
+            let key = rect_key(partition.bounds());
+            let depth = |p: &Option<PathBuf>| p.as_ref().map_or(0, |p| p.components().count());
+            match surfaces.get_mut(&key) {
+                Some(existing) if depth(path) < depth(existing) => *existing = path.clone(),
+                None => {
+                    surfaces.insert(key, path.clone());
+                }
+                _ => {}
+            }
+        }
+        let mut owner = BTreeMap::<Option<PathBuf>, crate::render::Platform>::new();
+        for platform in platforms {
+            let matched = surfaces
+                .get(&rect_key(platform.top))
+                .ok_or(Error::Rebuild)?;
+            if owner.insert(matched.clone(), *platform).is_some() {
+                return Err(Error::Rebuild);
+            }
+        }
+        let mut out = Vec::with_capacity(self.partitions.len());
+        for (path, partition) in &self.partitions {
+            let platform = owner.get(path).copied();
+            let mut items = Vec::new();
+            for (id, placement) in partition.entries() {
+                let id = match id {
+                    Item::Directory(id) => {
+                        PartitionItemId::Directory((*by_id.get(id).ok_or(Error::Rebuild)?).clone())
+                    }
+                    Item::Tile(id) => {
+                        PartitionItemId::File(projection.slot(*id).ok_or(Error::Rebuild)?)
+                    }
+                };
+                items.push(PartitionItem {
+                    id,
+                    rect: placement.rect,
+                    weight: placement.weight,
+                });
+            }
+            out.push(DirectoryPartition {
+                path: path.clone(),
+                bounds: partition.bounds(),
+                platform,
+                items,
+            });
+        }
+        Ok(out)
+    }
+
+    /// A fixed outer allocation can be retained only while its ancestors'
+    /// discrepancy from their new weights remains within the pixel budget.
+    pub fn ancestor_area_error(&self, path: &std::path::Path, pixels_per_point: f32) -> f64 {
+        self.partitions
+            .iter()
+            .filter(|(key, _)| key.as_ref().is_none_or(|p| path.starts_with(p)))
+            .map(|(_, p)| p.max_area_error(pixels_per_point))
+            .fold(0.0, f64::max)
+    }
+
+    /// Leaf folder deletion is local only when its parent platform remains
+    /// present and at least two independently drawn tiles share the parent.
+    /// Nested directory allocations remain fixed during adjacency compaction.
+    pub fn can_compact_leaf_parent(&self, path: &std::path::Path) -> bool {
+        self.partitions
+            .get(&Some(path.to_path_buf()))
+            .is_some_and(|partition| {
+                partition
+                    .entries()
+                    .filter(|(item, _)| matches!(item, Item::Tile(_)))
+                    .take(2)
+                    .count()
+                    == 2
+            })
+    }
     /// Translate original render slots to stable typed tile handles once.
     pub fn from_layout(parts: &[DirectoryPartition], slots: &[TileId]) -> Result<Self, Error> {
         Self::from_layout_mapped(
@@ -353,6 +441,57 @@ impl IncrementalGeometry {
         token: &AtomicU64,
         generation: u64,
     ) -> Result<GeometryUpdate, Error> {
+        self.apply_inner(
+            changes,
+            pixels_per_point,
+            tolerance_pixels,
+            token,
+            generation,
+            false,
+        )
+    }
+
+    pub fn apply_compacting(
+        &mut self,
+        changes: &[TileDelta],
+        pixels_per_point: f32,
+        tolerance_pixels: f64,
+        token: &AtomicU64,
+        generation: u64,
+    ) -> Result<GeometryUpdate, Error> {
+        let result = self.apply_inner(
+            changes,
+            pixels_per_point,
+            tolerance_pixels,
+            token,
+            generation,
+            true,
+        );
+        // Compaction is optional: retain the old hole behavior if a nested
+        // platform or its ancestor would otherwise require a whole rebuild.
+        if matches!(result, Err(Error::Rebuild)) {
+            self.apply_inner(
+                changes,
+                pixels_per_point,
+                tolerance_pixels,
+                token,
+                generation,
+                false,
+            )
+        } else {
+            result
+        }
+    }
+
+    fn apply_inner(
+        &mut self,
+        changes: &[TileDelta],
+        pixels_per_point: f32,
+        tolerance_pixels: f64,
+        token: &AtomicU64,
+        generation: u64,
+        compact: bool,
+    ) -> Result<GeometryUpdate, Error> {
         if token.load(Ordering::Relaxed) != generation {
             return Err(Error::Cancelled);
         }
@@ -362,6 +501,14 @@ impl IncrementalGeometry {
             dirty: Vec::new(),
             tiles: BTreeMap::new(),
         };
+        let deletion_batch = compact
+            && changes.iter().all(|c| match (&c.before, &c.after) {
+                (Some(_), None) => true,
+                (Some(old), Some(new)) => {
+                    old.id == new.id && old.parent == new.parent && new.weight <= old.weight
+                }
+                _ => false,
+            });
         for change in changes {
             if change.before.is_none() && change.after.is_none() {
                 return Err(Error::InvalidDelta);
@@ -369,6 +516,26 @@ impl IncrementalGeometry {
             if let (Some(old), Some(new)) = (&change.before, &change.after) {
                 if old.id != new.id {
                     return Err(Error::InvalidDelta);
+                }
+                // Updating a folder aggregate during a deletion must not
+                // temporarily insert it into its own vacated slot.
+                if deletion_batch && old.parent == new.parent {
+                    let key = Some(old.parent.clone());
+                    if !self.partitions.contains_key(&key) {
+                        return Err(Error::MissingPartition);
+                    }
+                    let p = staged
+                        .entry(key.clone())
+                        .or_insert_with(|| self.partitions[&key].as_ref().clone());
+                    if p.get(&Item::Tile(old.id))
+                        .is_none_or(|entry| entry.weight.max(1) != old.weight.max(1))
+                    {
+                        return Err(Error::InvalidDelta);
+                    }
+                    p.set_weight(&Item::Tile(old.id), new.weight)
+                        .map_err(|_| Error::InvalidDelta)?;
+                    touched.insert(key);
+                    continue;
                 }
             }
             // Removing and re-adding ensures a size change can use its old slot
@@ -429,6 +596,51 @@ impl IncrementalGeometry {
                     }
                 }
                 touched.insert(key);
+            }
+        }
+        // A removal leaves a vacant rectangle. Compact the affected partition
+        // in the background so its surviving tiles can transition into place.
+        // A nested directory owns its own platform and descendants; moving it
+        // requires a structural relayout, so retain the vacancy in that case.
+        if deletion_batch {
+            for key in &touched {
+                let p = staged.get_mut(key).ok_or(Error::MissingPartition)?;
+                if p.entries()
+                    .any(|(item, _)| matches!(item, Item::Directory(_)))
+                {
+                    let updates = p
+                        .compact_adjacent(|item| matches!(item, Item::Tile(_)), token, generation)
+                        .map_err(|e| {
+                            if e == incremental_layout::Error::Cancelled {
+                                Error::Cancelled
+                            } else {
+                                Error::InvalidDelta
+                            }
+                        })?;
+                    for update in updates {
+                        result.dirty.push(update.dirty);
+                        for (item, rect) in update.moved {
+                            if let Item::Tile(id) = item {
+                                result.tiles.insert(id, Some(rect));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let bounds = p.bounds();
+                let update = p.repack(bounds, token, generation).map_err(|e| {
+                    if e == incremental_layout::Error::Cancelled {
+                        Error::Cancelled
+                    } else {
+                        Error::InvalidDelta
+                    }
+                })?;
+                result.dirty.push(update.dirty);
+                for (item, rect) in update.moved {
+                    if let Item::Tile(id) = item {
+                        result.tiles.insert(id, Some(rect));
+                    }
+                }
             }
         }
         // Update child aggregate weights up the exported directory hierarchy.
@@ -566,6 +778,73 @@ mod tests {
             .unwrap();
         assert_eq!(add.tiles[&tile(2)], Some(rect(0.0, 50.0)));
         assert!(!add.tiles.contains_key(&tile(1)));
+    }
+
+    #[test]
+    fn mixed_partition_deletion_compacts_adjacent_tile_without_moving_directory() {
+        let parts = vec![
+            DirectoryPartition {
+                path: None,
+                bounds: rect(0.0, 100.0),
+                platform: None,
+                items: vec![PartitionItem {
+                    id: PartitionItemId::Directory("/disk/a".into()),
+                    rect: rect(0.0, 100.0),
+                    weight: 100,
+                }],
+            },
+            DirectoryPartition {
+                path: Some("/disk/a".into()),
+                bounds: rect(0.0, 100.0),
+                platform: None,
+                items: vec![
+                    PartitionItem {
+                        id: PartitionItemId::File(0),
+                        rect: rect(0.0, 25.0),
+                        weight: 25,
+                    },
+                    PartitionItem {
+                        id: PartitionItemId::File(1),
+                        rect: rect(25.0, 25.0),
+                        weight: 25,
+                    },
+                    PartitionItem {
+                        id: PartitionItemId::Directory("/disk/a/nested".into()),
+                        rect: rect(50.0, 50.0),
+                        weight: 50,
+                    },
+                ],
+            },
+            DirectoryPartition {
+                path: Some("/disk/a/nested".into()),
+                bounds: rect(50.0, 50.0),
+                platform: None,
+                items: vec![PartitionItem {
+                    id: PartitionItemId::File(2),
+                    rect: rect(50.0, 50.0),
+                    weight: 50,
+                }],
+            },
+        ];
+        let mut geometry =
+            IncrementalGeometry::from_layout(&parts, &[tile(0), tile(1), tile(2)]).unwrap();
+        assert!(geometry.can_compact_leaf_parent(std::path::Path::new("/disk/a")));
+        let token = AtomicU64::new(1);
+        let changed = geometry
+            .apply_compacting(
+                &[TileDelta {
+                    before: Some(state(0, 25)),
+                    after: None,
+                }],
+                1.0,
+                10000.0,
+                &token,
+                1,
+            )
+            .unwrap();
+        assert_eq!(changed.tiles[&tile(0)], None);
+        assert_eq!(changed.tiles[&tile(1)], Some(rect(0.0, 50.0)));
+        assert!(!changed.tiles.contains_key(&tile(2)));
     }
 
     #[test]

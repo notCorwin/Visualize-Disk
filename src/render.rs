@@ -29,7 +29,7 @@ const FILE_SHADE_LIGHT: f64 = 1.20;
 const FILE_SHADE_X: f64 = 0.18;
 const FILE_SHADE_Y: f64 = 0.12;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Platform {
     pub bounds: Rect,
     pub top: Rect,
@@ -723,6 +723,17 @@ pub struct RasterPatch {
     pub image: ColorImage,
     owners: Vec<u32>,
     full_size: [usize; 2],
+}
+
+impl RasterPatch {
+    /// Make a texture atlas containing only pixels owned by the requested
+    /// tiles. This prevents cropped tile quads from copying adjacent files or
+    /// the directory platform during a transition.
+    pub fn owner_at(&self, x: usize, y: usize) -> Option<usize> {
+        let width = self.image.size[0];
+        let owner = *self.owners.get(y.checked_mul(width)?.checked_add(x)?)?;
+        (owner != NONE).then_some(owner as usize)
+    }
 }
 
 impl RenderMap {

@@ -509,6 +509,46 @@ fn scan_directory(
     scan_directory_batches(directory, cancel, progress, || {})
 }
 
+/// Refresh just one directory after a child was removed. Identity is checked
+/// on both sides of enumeration so a replacement cannot supply new facts.
+pub(crate) fn directory_fact_after_change(
+    path: &Path,
+    expected: FileIdentity,
+) -> Result<DirectoryFact, String> {
+    let identity = || -> Result<FileIdentity, String> {
+        let metadata = fs::symlink_metadata(path).map_err(|e| root_error(&e))?;
+        if !metadata.is_dir() || is_link_or_reparse(&metadata) {
+            return Err("文件夹已更改，请重新扫描。".into());
+        }
+        FileIdentity::from_path(path, &metadata).map_err(|e| root_error(&e))
+    };
+    if identity()? != expected {
+        return Err("文件夹已更改，请重新扫描。".into());
+    }
+    let pending = PendingDirectory {
+        path: path.into(),
+        identity: expected,
+    };
+    let report = scan_directory(
+        &pending,
+        &AtomicBool::new(false),
+        &Mutex::new(ScanProgress::default()),
+    );
+    if report.unreadable.is_some()
+        || !report.errors.is_empty()
+        || report.uncertain_entries
+        || identity()? != expected
+    {
+        return Err("无法确认文件夹状态，请重新扫描。".into());
+    }
+    Ok(DirectoryFact {
+        path: path.into(),
+        identity: expected,
+        enumeration_complete: true,
+        has_subdirectories: !report.directories.is_empty(),
+    })
+}
+
 fn scan_directory_batches(
     pending: &PendingDirectory,
     cancel: &AtomicBool,
@@ -948,6 +988,17 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn refreshed_parent_fact_detects_children_and_rejects_wrong_identity() {
+        let temp = Temp::new();
+        fs::create_dir(temp.0.join("empty-child")).unwrap();
+        let metadata = fs::symlink_metadata(&temp.0).unwrap();
+        let identity = FileIdentity::from_path(&temp.0, &metadata).unwrap();
+        let fact = directory_fact_after_change(&temp.0, identity).unwrap();
+        assert!(fact.enumeration_complete && fact.has_subdirectories);
+        assert!(directory_fact_after_change(&temp.0, FileIdentity::default()).is_err());
     }
 
     #[test]

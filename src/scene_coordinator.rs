@@ -25,6 +25,18 @@ use std::{
 // Conservative safety limit; larger batches use the background rebuild path.
 const MAX_BATCH_CHANGES: usize = 4096;
 
+/// Removing a leaf eliminates its own platform in Files mode. In Hybrid mode
+/// a newly leaf parent changes its projection and platform topology. These
+/// cases require a fresh layout rather than reusing the old platform raster.
+fn requires_structural_rebuild(mode: View, changes: &[Change]) -> bool {
+    changes.iter().any(|change| match change {
+        Change::RemoveLeafDirectory { parent, .. } => {
+            mode == View::Files || (mode == View::Hybrid && !parent.has_subdirectories)
+        }
+        _ => false,
+    })
+}
+
 pub struct ModeInput {
     pub base: Version,
     pub mode: View,
@@ -99,6 +111,7 @@ pub struct ModeUpdate {
     pub map: RenderMap,
     pub patch: Option<RasterPatch>,
     pub holes: Arc<Vec<Rect>>,
+    pub transition: Option<incremental_update::Transition>,
 }
 pub struct Prepared {
     pub base: Version,
@@ -391,6 +404,21 @@ impl Coordinator {
                                     match changes {
                                         Err(e) => Some(Event::Failed(e)),
                                         Ok(changes) => {
+                                            let structural_rebuild =
+                                                [View::Files, View::Folders, View::Hybrid].map(
+                                                    |mode| {
+                                                        requires_structural_rebuild(mode, &changes)
+                                                    },
+                                                );
+                                            let removed_leaf_parents: Vec<_> = changes
+                                                .iter()
+                                                .filter_map(|change| match change {
+                                                    Change::RemoveLeafDirectory {
+                                                        parent, ..
+                                                    } => Some(parent.path.clone()),
+                                                    _ => None,
+                                                })
+                                                .collect();
                                             let request = scene_actor::UpdateRequest {
                                                 base: version,
                                                 changes,
@@ -420,6 +448,17 @@ impl Coordinator {
                                                         let state = old
                                                             .remove(&key)
                                                             .expect("validated mode");
+                                                        let structural = structural_rebuild
+                                                            [key as usize]
+                                                            || removed_leaf_parents.iter().any(
+                                                                |path| {
+                                                                    !state
+                                                                        .geometry
+                                                                        .can_compact_leaf_parent(
+                                                                            path,
+                                                                        )
+                                                                },
+                                                            );
                                                         let deltas = match mode.mode {
                                                             View::Files => {
                                                                 &prepared.projections.files
@@ -431,18 +470,35 @@ impl Coordinator {
                                                                 &prepared.projections.hybrid
                                                             }
                                                         };
-                                                        match incremental_update::prepare(
-                                                            (*state.geometry).clone(),
-                                                            mode.map,
-                                                            &state.projection,
-                                                            &mode.holes,
-                                                            deltas,
-                                                            mode.pixels_per_point,
-                                                            mode.area_tolerance,
-                                                            mode.max_patch_pixels,
-                                                            &work_token,
-                                                            0,
-                                                        ) {
+                                                        let result = if structural {
+                                                            incremental_update::prepare_structural(
+                                                                &state.geometry,
+                                                                mode.map,
+                                                                &state.projection,
+                                                                &mode.holes,
+                                                                deltas,
+                                                                &removed_leaf_parents[0],
+                                                                mode.pixels_per_point,
+                                                                mode.area_tolerance,
+                                                                mode.max_patch_pixels,
+                                                                &work_token,
+                                                                0,
+                                                            )
+                                                        } else {
+                                                            incremental_update::prepare(
+                                                                (*state.geometry).clone(),
+                                                                mode.map,
+                                                                &state.projection,
+                                                                &mode.holes,
+                                                                deltas,
+                                                                mode.pixels_per_point,
+                                                                mode.area_tolerance,
+                                                                mode.max_patch_pixels,
+                                                                &work_token,
+                                                                0,
+                                                            )
+                                                        };
+                                                        match result {
                                                             Ok(updated) => {
                                                                 let holes = Arc::new(updated.holes);
                                                                 let geometry =
@@ -471,6 +527,7 @@ impl Coordinator {
                                                                     map: updated.map,
                                                                     patch: updated.patch,
                                                                     holes,
+                                                                    transition: updated.transition,
                                                                 });
                                                             }
                                                             Err(_) => rebuild.push(mode.mode),
@@ -536,6 +593,338 @@ mod tests {
             device: n,
             ..Default::default()
         }
+    }
+    #[test]
+    fn removed_leaf_rebuilds_modes_with_changed_platform_topology() {
+        let make = |has_subdirectories| {
+            vec![Change::RemoveLeafDirectory {
+                path: "/disk/a".into(),
+                identity: identity(2),
+                parent: scan::DirectoryFact {
+                    path: "/disk".into(),
+                    identity: identity(1),
+                    enumeration_complete: true,
+                    has_subdirectories,
+                },
+            }]
+        };
+        let sibling_remains = make(true);
+        assert!(requires_structural_rebuild(View::Files, &sibling_remains));
+        assert!(!requires_structural_rebuild(
+            View::Folders,
+            &sibling_remains
+        ));
+        assert!(!requires_structural_rebuild(View::Hybrid, &sibling_remains));
+        let parent_became_leaf = make(false);
+        assert!(requires_structural_rebuild(
+            View::Files,
+            &parent_became_leaf
+        ));
+        assert!(!requires_structural_rebuild(
+            View::Folders,
+            &parent_became_leaf
+        ));
+        assert!(requires_structural_rebuild(
+            View::Hybrid,
+            &parent_became_leaf
+        ));
+    }
+    #[test]
+    fn files_leaf_directory_deletion_keeps_outer_texture_and_updates_platform_locally() {
+        let fact = |path: &str, n: u64, has_subdirectories| scan::DirectoryFact {
+            path: path.into(),
+            identity: identity(n),
+            enumeration_complete: true,
+            has_subdirectories,
+        };
+        let file = |parent: &str, n: u64, size: u64| scan::FileEntry {
+            path: format!("{parent}/f").into(),
+            parent: Arc::from(Path::new(parent)),
+            size,
+            identity: identity(n + 10),
+            parent_identity: identity(n),
+            parent_is_leaf: true,
+            can_trash: true,
+        };
+        let source = Arc::new(scan::ScanResult {
+            root: "/disk".into(),
+            files: vec![
+                file("/disk/a/x", 3, 2),
+                file("/disk/a/y", 4, 2),
+                file("/disk/b", 5, 100),
+            ],
+            directories: vec![
+                fact("/disk", 1, true),
+                fact("/disk/a", 2, true),
+                fact("/disk/a/x", 3, false),
+                fact("/disk/a/y", 4, false),
+                fact("/disk/b", 5, false),
+            ]
+            .into(),
+            skipped: 0,
+            errors: vec![],
+            elapsed: Duration::ZERO,
+        });
+        let token = AtomicU64::new(1);
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 400.0,
+            h: 200.0,
+        };
+        let layout = directory_map::layout_with_partitions(
+            [
+                (Path::new("/disk/a/x"), vec![(0, 2)]),
+                (Path::new("/disk/a/y"), vec![(1, 2)]),
+                (Path::new("/disk/b"), vec![(2, 100)]),
+            ],
+            Path::new("/disk"),
+            bounds,
+            1.0,
+            &token,
+            1,
+        )
+        .unwrap();
+        let map = RenderMap::build_with_platforms(
+            layout.entries,
+            layout.platforms,
+            bounds,
+            [400, 200],
+            &token,
+            1,
+        )
+        .unwrap();
+        let stable = map.rect(2);
+        let coordinator = Coordinator::start(source.clone(), 71, egui::Context::default());
+        let Event::Ready(base) = event(&coordinator) else {
+            panic!("ready")
+        };
+        let texture = TextureId::Managed(71);
+        coordinator
+            .try_send(Command::InitMode(ModeInput {
+                base,
+                mode: View::Files,
+                data: source,
+                source_ids: None,
+                partitions: Some(Arc::new(layout.partitions)),
+                retained: None,
+                tombstones: Arc::new(BTreeSet::new()),
+                map: map.snapshot_for_update(),
+                layout_generation: 1,
+                texture,
+            }))
+            .ok()
+            .unwrap();
+        assert!(matches!(event(&coordinator), Event::ModeReady(_)));
+        coordinator
+            .try_send(Command::Update(UpdateInput {
+                base,
+                changes: Changes::Explicit(vec![Change::RemoveLeafDirectory {
+                    path: "/disk/a/x".into(),
+                    identity: identity(3),
+                    parent: fact("/disk/a", 2, true),
+                }]),
+                modes: vec![ModeBase {
+                    mode: View::Files,
+                    layout_generation: 1,
+                    texture,
+                    map,
+                    holes: Arc::new(vec![]),
+                    pixels_per_point: 1.0,
+                    area_tolerance: 8192.0,
+                    max_patch_pixels: 79999,
+                }],
+            }))
+            .ok()
+            .unwrap();
+        let Event::Prepared(result) = event(&coordinator) else {
+            panic!("prepared")
+        };
+        assert!(result.rebuild.is_empty());
+        let view = &result.views[0];
+        assert_eq!(view.texture, texture);
+        assert_eq!(view.map.rect(2), stable);
+        assert!(view.projection.get(0).is_none());
+        assert!(view.transition.is_some());
+        let patch = view.patch.as_ref().unwrap();
+        assert!(patch.image.size[0] * patch.image.size[1] < 400 * 200);
+    }
+    #[test]
+    fn hybrid_leaf_folder_delete_transitions_sibling_without_replacing_texture() {
+        let fact = |path: &str, n: u64, has_subdirectories| scan::DirectoryFact {
+            path: path.into(),
+            identity: identity(n),
+            enumeration_complete: true,
+            has_subdirectories,
+        };
+        let file = |name: &str, dir_id, file_id| scan::FileEntry {
+            path: format!("/disk/{name}/f").into(),
+            parent: Arc::from(PathBuf::from(format!("/disk/{name}"))),
+            size: 50,
+            identity: identity(file_id),
+            parent_identity: identity(dir_id),
+            parent_is_leaf: true,
+            can_trash: true,
+        };
+        let source = Arc::new(scan::ScanResult {
+            root: "/disk".into(),
+            files: vec![file("a", 2, 4), file("b", 3, 5)],
+            directories: vec![
+                fact("/disk", 1, true),
+                fact("/disk/a", 2, false),
+                fact("/disk/b", 3, false),
+            ]
+            .into(),
+            skipped: 0,
+            errors: vec![],
+            elapsed: Duration::ZERO,
+        });
+        let projected = Arc::new(scan::ScanResult {
+            root: source.root.clone(),
+            files: ["a", "b"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| scan::FileEntry {
+                    path: format!("/disk/{name}").into(),
+                    parent: Arc::from(Path::new("/disk")),
+                    size: 50,
+                    identity: identity(2 + i as u64),
+                    parent_identity: Default::default(),
+                    parent_is_leaf: false,
+                    can_trash: true,
+                })
+                .collect(),
+            directories: source.directories.clone(),
+            skipped: 0,
+            errors: vec![],
+            elapsed: Duration::ZERO,
+        });
+        let token = AtomicU64::new(1);
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
+        let layout = directory_map::layout_with_partitions(
+            [(Path::new("/disk"), vec![(0, 50), (1, 50)])],
+            Path::new("/disk"),
+            bounds,
+            1.0,
+            &token,
+            1,
+        )
+        .unwrap();
+        let map = RenderMap::build_with_platforms(
+            layout.entries,
+            layout.platforms,
+            bounds,
+            [100, 100],
+            &token,
+            1,
+        )
+        .unwrap();
+        let files_layout = directory_map::layout_with_partitions(
+            [
+                (Path::new("/disk/a"), vec![(0, 50)]),
+                (Path::new("/disk/b"), vec![(1, 50)]),
+            ],
+            Path::new("/disk"),
+            bounds,
+            1.0,
+            &token,
+            1,
+        )
+        .unwrap();
+        let files_map = RenderMap::build_with_platforms(
+            files_layout.entries,
+            files_layout.platforms,
+            bounds,
+            [100, 100],
+            &token,
+            1,
+        )
+        .unwrap();
+        let coordinator = Coordinator::start(source.clone(), 13, egui::Context::default());
+        let Event::Ready(base) = event(&coordinator) else {
+            panic!("ready")
+        };
+        let texture = TextureId::Managed(41);
+        coordinator
+            .try_send(Command::InitMode(ModeInput {
+                base,
+                mode: View::Hybrid,
+                data: projected,
+                source_ids: Some(Arc::from([None, None])),
+                partitions: Some(Arc::new(layout.partitions)),
+                retained: None,
+                tombstones: Arc::new(BTreeSet::new()),
+                map: map.snapshot_for_update(),
+                layout_generation: 1,
+                texture,
+            }))
+            .ok()
+            .unwrap();
+        assert!(matches!(event(&coordinator), Event::ModeReady(_)));
+        let files_texture = TextureId::Managed(42);
+        coordinator
+            .try_send(Command::InitMode(ModeInput {
+                base,
+                mode: View::Files,
+                data: source,
+                source_ids: None,
+                partitions: Some(Arc::new(files_layout.partitions)),
+                retained: None,
+                tombstones: Arc::new(BTreeSet::new()),
+                map: files_map.snapshot_for_update(),
+                layout_generation: 2,
+                texture: files_texture,
+            }))
+            .ok()
+            .unwrap();
+        assert!(matches!(event(&coordinator), Event::ModeReady(_)));
+        coordinator
+            .try_send(Command::Update(UpdateInput {
+                base,
+                changes: Changes::Explicit(vec![Change::RemoveLeafDirectory {
+                    path: "/disk/a".into(),
+                    identity: identity(2),
+                    parent: fact("/disk", 1, true),
+                }]),
+                modes: vec![
+                    ModeBase {
+                        mode: View::Hybrid,
+                        layout_generation: 1,
+                        texture,
+                        map,
+                        holes: Arc::new(vec![]),
+                        pixels_per_point: 1.0,
+                        area_tolerance: 10000.0,
+                        max_patch_pixels: 10000,
+                    },
+                    ModeBase {
+                        mode: View::Files,
+                        layout_generation: 2,
+                        texture: files_texture,
+                        map: files_map,
+                        holes: Arc::new(vec![]),
+                        pixels_per_point: 1.0,
+                        area_tolerance: 10000.0,
+                        max_patch_pixels: 10000,
+                    },
+                ],
+            }))
+            .ok()
+            .unwrap();
+        let Event::Prepared(update) = event(&coordinator) else {
+            panic!("prepared")
+        };
+        assert_eq!(update.rebuild, vec![View::Files]);
+        assert_eq!(update.views.len(), 1);
+        assert_eq!(update.views[0].texture, texture);
+        assert!(update.views[0].transition.is_some());
+        assert!(update.views[0].projection.get(0).is_none());
+        assert!(update.views[0].projection.get(1).is_some());
     }
     fn fixture() -> Arc<scan::ScanResult> {
         let file = |name: &str, n: u64| scan::FileEntry {
@@ -655,7 +1044,8 @@ mod tests {
         assert!(prepared.rebuild.is_empty());
         let updated = &prepared.views[0];
         assert_eq!(map.hit_test(at.0, at.1), Some(0));
-        assert_eq!(updated.map.hit_test(at.0, at.1), None);
+        assert_eq!(updated.map.hit_test(at.0, at.1), Some(1));
+        assert!(updated.transition.is_some());
         assert!(updated.projection.get(0).is_none());
         coordinator
             .try_send(Command::Update(UpdateInput {

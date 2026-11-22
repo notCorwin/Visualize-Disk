@@ -157,6 +157,13 @@ pub enum Change {
         path: PathBuf,
         identity: scan::FileIdentity,
     },
+    /// Remove a previously fully enumerated leaf and its direct files. The
+    /// parent fact must be freshly enumerated after the filesystem operation.
+    RemoveLeafDirectory {
+        path: PathBuf,
+        identity: scan::FileIdentity,
+        parent: scan::DirectoryFact,
+    },
 }
 #[derive(Default, Debug)]
 pub struct Impact {
@@ -430,6 +437,60 @@ impl Scene {
     pub fn apply(&mut self, change: Change) -> Result<Impact, ChangeError> {
         let mut impact = Impact::default();
         match change {
+            Change::RemoveLeafDirectory {
+                path,
+                identity,
+                parent,
+            } => {
+                if path == self.root {
+                    return Err(ChangeError::InvalidParent);
+                }
+                let id = self.directory_id(&path).ok_or(ChangeError::MissingEntry)?;
+                let dir = self.directory(id).unwrap();
+                if dir.fact.identity != identity {
+                    return Err(ChangeError::IdentityMismatch);
+                }
+                if !dir.leaf()
+                    || self
+                        .directory_paths
+                        .keys()
+                        .any(|p| p != &path && p.starts_with(&path))
+                {
+                    return Err(ChangeError::NonEmptyDirectory);
+                }
+                if path.parent() != Some(parent.path.as_path()) || !parent.enumeration_complete {
+                    return Err(ChangeError::InvalidParent);
+                }
+                let parent_id = self
+                    .directory_id(&parent.path)
+                    .ok_or(ChangeError::MissingParent)?;
+                if self.directory(parent_id).unwrap().fact.identity != parent.identity {
+                    return Err(ChangeError::IdentityMismatch);
+                }
+                // A post-delete leaf fact contradicts a still-cached sibling:
+                // another external change occurred and requires a rescan.
+                if !parent.has_subdirectories
+                    && self.directory_paths.keys().any(|other| {
+                        other != &path && other.parent() == Some(parent.path.as_path())
+                    })
+                {
+                    return Err(ChangeError::ConflictingBatch);
+                }
+                let files = dir.files.clone();
+                for id in files {
+                    let file = self.file(id).expect("live directory file").clone();
+                    self.detach(id, &file);
+                    self.unlink_path(&file.path, id);
+                    self.files.remove(id.slot, id.generation);
+                    impact.removed.insert(TileId::File(id));
+                }
+                self.directories.remove(id.slot, id.generation);
+                self.directory_paths.remove(&path);
+                self.directory_mut(parent_id).unwrap().fact = parent.clone();
+                impact.directories.insert(path);
+                impact.directories.insert(parent.path);
+                impact.removed.insert(TileId::Directory(id));
+            }
             Change::UpsertDirectory(fact) => {
                 if self.file_id(&fact.path).is_some() {
                     return Err(ChangeError::DestinationExists);
@@ -529,6 +590,17 @@ impl Scene {
     /// before any mutation. Conflicting paths are rejected for reconciliation.
     pub fn apply_batch(&mut self, changes: Vec<Change>) -> Result<Impact, ChangeError> {
         use std::collections::{HashMap, HashSet};
+        // A leaf removal is a self-contained atomic operation: mixing it with
+        // other paths would require validating interactions before mutation.
+        if changes
+            .iter()
+            .any(|c| matches!(c, Change::RemoveLeafDirectory { .. }))
+        {
+            if changes.len() != 1 {
+                return Err(ChangeError::ConflictingBatch);
+            }
+            return self.apply(changes.into_iter().next().unwrap());
+        }
         let mut paths = HashSet::new();
         let mut dirs = HashMap::new();
         for change in &changes {
@@ -841,6 +913,36 @@ mod tests {
                 .iter()
                 .any(|t| t.path == Path::new("/disk/b/h") && matches!(t.id, TileId::File(_)))
         );
+        assert!(scene.directory_id(Path::new("/disk/empty")).is_some());
+    }
+    #[test]
+    fn leaf_removal_checks_identity_and_parent_before_mutating() {
+        let mut scene = Scene::from_scan(Arc::new(fixture()));
+        let action = |id, parent_id| Change::RemoveLeafDirectory {
+            path: "/disk/a".into(),
+            identity: identity(id),
+            parent: dir("/disk", parent_id, true, true),
+        };
+        assert!(matches!(
+            scene.apply_batch(vec![action(99, 1)]),
+            Err(ChangeError::IdentityMismatch)
+        ));
+        assert!(matches!(
+            scene.apply_batch(vec![action(2, 99)]),
+            Err(ChangeError::IdentityMismatch)
+        ));
+        assert!(matches!(
+            scene.apply_batch(vec![Change::RemoveLeafDirectory {
+                path: "/disk/a".into(),
+                identity: identity(2),
+                parent: dir("/disk", 1, true, false),
+            }]),
+            Err(ChangeError::ConflictingBatch)
+        ));
+        assert_eq!(scene.project(View::Files).len(), 3);
+        scene.apply_batch(vec![action(2, 1)]).unwrap();
+        assert_eq!(scene.project(View::Files).len(), 1);
+        assert!(scene.directory_id(Path::new("/disk/a")).is_none());
         assert!(scene.directory_id(Path::new("/disk/empty")).is_some());
     }
     #[test]

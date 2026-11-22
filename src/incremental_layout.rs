@@ -148,6 +148,74 @@ impl<K: Ord + Clone> Partition<K> {
         })
     }
 
+    /// Grow a movable neighbor into an exactly adjacent vacancy without moving
+    /// any directory allocation. No geometry is committed on cancellation.
+    pub fn compact_adjacent(
+        &mut self,
+        movable: impl Fn(&K) -> bool,
+        token: &AtomicU64,
+        generation: u64,
+    ) -> Result<Vec<Update<K>>, Error> {
+        let mut staged = self.clone();
+        let mut changes = Vec::new();
+        // Bounded work on very large deletion batches; remaining holes stay
+        // valid and can be reused by later insertions.
+        for vacancy in staged.vacant.clone().into_iter().take(64) {
+            if token.load(Ordering::Relaxed) != generation {
+                return Err(Error::Cancelled);
+            }
+            let mut found = None;
+            for (i, (id, placement)) in staged.entries.iter().enumerate() {
+                if i % 1024 == 0 && token.load(Ordering::Relaxed) != generation {
+                    return Err(Error::Cancelled);
+                }
+                if !movable(id) {
+                    continue;
+                }
+                let a = placement.rect;
+                let b = vacancy;
+                let union = if a.y == b.y && a.h == b.h && (a.x + a.w == b.x || b.x + b.w == a.x) {
+                    Some(Rect {
+                        x: a.x.min(b.x),
+                        y: a.y,
+                        w: a.w + b.w,
+                        h: a.h,
+                    })
+                } else if a.x == b.x && a.w == b.w && (a.y + a.h == b.y || b.y + b.h == a.y) {
+                    Some(Rect {
+                        x: a.x,
+                        y: a.y.min(b.y),
+                        w: a.w,
+                        h: a.h + b.h,
+                    })
+                } else {
+                    None
+                };
+                if let Some(union) = union {
+                    found = Some((id.clone(), union));
+                    break;
+                }
+            }
+            if let Some((id, rect)) = found {
+                let Some(index) = staged.vacant.iter().position(|r| *r == vacancy) else {
+                    continue;
+                };
+                staged.vacant.swap_remove(index);
+                staged.entries.get_mut(&id).expect("selected entry").rect = rect;
+                changes.push(Update {
+                    dirty: rect,
+                    moved: vec![(id, rect)],
+                    repacked: false,
+                });
+            }
+        }
+        if token.load(Ordering::Relaxed) != generation {
+            return Err(Error::Cancelled);
+        }
+        *self = staged;
+        Ok(changes)
+    }
+
     /// Reuse a vacant slot only when its area is within the caller's pixel-area
     /// tolerance of the new item's ideal share. Other entries are left untouched.
     /// Otherwise repack this partition atomically; stale generations cannot
@@ -324,6 +392,49 @@ mod tests {
         assert!(!inserted.repacked);
         assert_eq!(p.get(&2).unwrap(), neighbor);
         assert_eq!(p.get(&3).unwrap().rect, deleted.dirty);
+    }
+    #[test]
+    fn adjacent_compaction_grows_only_an_allowed_neighbor_and_is_atomic_on_cancel() {
+        let token = AtomicU64::new(1);
+        let mut p = Partition::from_layout(
+            rect(0.0, 100.0),
+            [
+                (
+                    1,
+                    Placement {
+                        rect: rect(0.0, 25.0),
+                        weight: 25,
+                    },
+                ),
+                (
+                    2,
+                    Placement {
+                        rect: rect(25.0, 25.0),
+                        weight: 25,
+                    },
+                ),
+                (
+                    3,
+                    Placement {
+                        rect: rect(50.0, 50.0),
+                        weight: 50,
+                    },
+                ),
+            ],
+        )
+        .unwrap();
+        p.remove(&1).unwrap();
+        let fixed = p.get(&3);
+        assert_eq!(
+            p.compact_adjacent(|id| *id != 3, &token, 2).unwrap_err(),
+            Error::Cancelled
+        );
+        assert_eq!(p.get(&2).unwrap().rect, rect(25.0, 25.0));
+        let moves = p.compact_adjacent(|id| *id != 3, &token, 1).unwrap();
+        assert_eq!(moves.len(), 1);
+        assert_eq!(p.get(&2).unwrap().rect, rect(0.0, 50.0));
+        assert_eq!(p.get(&3), fixed);
+        assert!(p.vacancies().is_empty());
     }
     #[test]
     fn unsuitable_hole_rebuilds_only_fixed_partition() {

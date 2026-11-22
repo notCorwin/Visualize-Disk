@@ -59,7 +59,9 @@ pub fn layout<'a>(
     token: &AtomicU64,
     generation: u64,
 ) -> Option<DirectoryLayout> {
-    layout_internal(groups, root, bounds, pixel_size, token, generation, false)
+    layout_internal(
+        groups, root, bounds, pixel_size, token, generation, false, None,
+    )
 }
 
 /// Export fixed directory surfaces and allocations for an incremental scene.
@@ -72,7 +74,33 @@ pub fn layout_with_partitions<'a>(
     token: &AtomicU64,
     generation: u64,
 ) -> Option<DirectoryLayout> {
-    layout_internal(groups, root, bounds, pixel_size, token, generation, true)
+    layout_internal(
+        groups, root, bounds, pixel_size, token, generation, true, None,
+    )
+}
+
+/// Lay out a single directory subtree within its existing outer allocation.
+/// `depth` is the number of visible ancestor platforms below the scan root.
+pub fn layout_subtree<'a>(
+    groups: impl IntoIterator<Item = (&'a Path, Vec<(usize, u64)>)>,
+    root: &Path,
+    scope: &'a Path,
+    depth: u8,
+    bounds: Rect,
+    pixel_size: f32,
+    token: &AtomicU64,
+    generation: u64,
+) -> Option<DirectoryLayout> {
+    layout_internal(
+        groups,
+        root,
+        bounds,
+        pixel_size,
+        token,
+        generation,
+        true,
+        Some((scope, depth)),
+    )
 }
 
 fn layout_internal<'a>(
@@ -83,13 +111,20 @@ fn layout_internal<'a>(
     token: &AtomicU64,
     generation: u64,
     export_partitions: bool,
+    scope: Option<(&'a Path, u8)>,
 ) -> Option<DirectoryLayout> {
     let cancelled = || token.load(Ordering::Relaxed) != generation;
     if cancelled() {
         return None;
     }
-    let mut directories = vec![Directory::default()];
+    let mut directories = vec![Directory {
+        path: scope.map(|(path, _)| path),
+        ..Directory::default()
+    }];
     let mut indices: HashMap<&Path, usize> = HashMap::new();
+    if let Some((path, _)) = scope {
+        indices.insert(path, 0);
+    }
     let mut file_count = 0;
     // Group files with hashing, then order only distinct paths so terrace
     // placement remains deterministic regardless of hash/Rayon iteration order.
@@ -103,6 +138,9 @@ fn layout_internal<'a>(
     }
     for (path, files) in groups {
         if cancelled() {
+            return None;
+        }
+        if scope.is_some_and(|(scope, _)| !path.starts_with(scope)) {
             return None;
         }
         file_count += files.len();
@@ -157,7 +195,7 @@ fn layout_internal<'a>(
     let mut partitions = Vec::new();
     // Iterative breadth-first publication paints a whole parent before its
     // children. Unary paths do not consume shoulder space or extra elevation.
-    let mut pending = vec![(0, bounds, None::<u8>)];
+    let mut pending = vec![(0, bounds, scope.map(|(_, depth)| depth))];
     while !pending.is_empty() {
         if cancelled() {
             return None;

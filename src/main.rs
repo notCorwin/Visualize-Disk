@@ -306,12 +306,6 @@ struct TrashOutput {
     result: Result<(), String>,
 }
 
-struct PendingFolderDelete {
-    source: Arc<scan::ScanResult>,
-    path: std::path::PathBuf,
-    identity: scan::FileIdentity,
-}
-
 struct TotalsOutput {
     generation: u64,
     bytes: u64,
@@ -480,7 +474,19 @@ struct MapCache {
     projection: Option<Arc<sparse_projection::SparseProjection>>,
     geometry: Option<Arc<incremental_geometry::IncrementalGeometry>>,
     recovery_projection: Option<Arc<sparse_projection::SparseProjection>>,
+    transition: Option<MapTransition>,
 }
+
+struct MapTransition {
+    atlas: egui::TextureHandle,
+    background: egui::TextureHandle,
+    origin: [usize; 2],
+    size: [usize; 2],
+    started: f64,
+    tiles: Vec<incremental_update::TransitionTile>,
+}
+
+const TRANSITION_SECONDS: f64 = 0.24;
 
 fn totals_snapshot(
     data: &scan::ScanResult,
@@ -605,7 +611,6 @@ struct App {
     job: Option<Job>,
     reveal_rx: Option<mpsc::Receiver<Result<(), String>>>,
     trash_rx: Option<mpsc::Receiver<TrashOutput>>,
-    pending_folder_delete: Option<PendingFolderDelete>,
     selected: Option<usize>,
     message: Option<String>,
     action_notice: Option<String>,
@@ -655,7 +660,6 @@ impl Default for App {
             job: None,
             reveal_rx: None,
             trash_rx: None,
-            pending_folder_delete: None,
             selected: None,
             message: None,
             action_notice: None,
@@ -699,7 +703,6 @@ impl App {
             job.cancel.store(true, Ordering::Relaxed);
             defer_drop(job);
         }
-        self.pending_folder_delete = None;
         let (tx, rx) = mpsc::channel();
         self.demo_rx = Some(rx);
         self.message = None;
@@ -806,7 +809,7 @@ impl App {
             return;
         }
         if self.is_folder_tile(id) {
-            if self.trash_rx.is_some() || self.pending_folder_delete.is_some() {
+            if self.trash_rx.is_some() {
                 return;
             }
             if let (Some(source), Some(folder)) = (self.data.as_ref(), self.view_file(id)) {
@@ -817,11 +820,7 @@ impl App {
                         file_actions::TargetKind::Directory,
                     )
                 {
-                    self.pending_folder_delete = Some(PendingFolderDelete {
-                        source: source.clone(),
-                        path: folder.path.clone(),
-                        identity: folder.identity,
-                    });
+                    self.trash_folder(source.clone(), folder.path.clone(), folder.identity);
                 }
             }
             return;
@@ -911,17 +910,19 @@ impl App {
             });
         });
     }
-    fn confirm_folder_delete(&mut self) {
-        let Some(pending) = self.pending_folder_delete.take() else {
-            return;
-        };
+    fn trash_folder(
+        &mut self,
+        source: Arc<scan::ScanResult>,
+        path: std::path::PathBuf,
+        identity: scan::FileIdentity,
+    ) {
         if self.trash_rx.is_some()
             || (self.demo && self.demo_root.is_none())
             || self.access != permission::Access::Granted
             || !self
                 .data
                 .as_ref()
-                .is_some_and(|data| Arc::ptr_eq(data, &pending.source))
+                .is_some_and(|data| Arc::ptr_eq(data, &source))
         {
             return;
         }
@@ -938,15 +939,15 @@ impl App {
         rayon::spawn(move || {
             let result = if let Some(root) = demo_root.as_ref() {
                 file_actions::move_target_to_trash_guarded(
-                    &pending.path,
-                    pending.identity,
+                    &path,
+                    identity,
                     file_actions::TargetKind::Directory,
-                    || root.allow_target(&pending.path),
+                    || root.allow_target(&path),
                 )
             } else {
                 file_actions::move_target_to_trash(
-                    &pending.path,
-                    pending.identity,
+                    &path,
+                    identity,
                     file_actions::TargetKind::Directory,
                 )
             }
@@ -954,19 +955,30 @@ impl App {
             let folder_hidden = result.is_ok().then(|| {
                 let mut updated = (*hidden).clone();
                 updated.extend(
-                    pending
-                        .source
+                    source
                         .files
                         .iter()
                         .enumerate()
-                        .filter_map(|(id, f)| f.path.starts_with(&pending.path).then_some(id)),
+                        .filter_map(|(id, f)| f.path.starts_with(&path).then_some(id)),
                 );
                 Arc::new(updated)
             });
+            // Only a verified leaf removal has an incremental scene delta.
+            // Anything ambiguous is reconciled by a full background scan.
+            let file_change = folder_hidden.as_ref().and_then(|updated| {
+                if updated.difference(&hidden).take(4097).count() > 4096 { return None; }
+                let leaf = source.directories.iter().find(|fact| fact.path == path)?;
+                if leaf.identity != identity || !leaf.enumeration_complete || leaf.has_subdirectories { return None; }
+                let parent_path = path.parent()?;
+                let parent = source.directories.iter().find(|fact| fact.path == parent_path)?;
+                if !matches!(std::fs::symlink_metadata(&path), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound) { return None; }
+                let fact = scan::directory_fact_after_change(parent_path, parent.identity).ok()?;
+                Some(scene_model::Change::RemoveLeafDirectory { path: path.clone(), identity, parent: fact })
+            });
             let _ = tx.send(TrashOutput {
-                source: pending.source,
+                source,
                 id: None,
-                file_change: None,
+                file_change,
                 folder_hidden,
                 result,
             });
@@ -1080,7 +1092,7 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        self.poll_coordinator();
+        self.poll_coordinator(ctx);
         if let Some(rx) = &self.projection_rx {
             match rx.try_recv() {
                 Ok(output) => {
@@ -1244,18 +1256,24 @@ impl App {
                                 .is_some_and(|current| Arc::ptr_eq(current, &output.source))
                             {
                                 let deleted_folder = output.folder_hidden.is_some();
+                                let folder_incremental =
+                                    deleted_folder && output.file_change.is_some();
+                                let scan_was_running = self.job.is_some();
                                 if let Some(hidden) = output.folder_hidden {
-                                    self.hide_folder(hidden);
-                                    // The deleted directory changes its parent's
-                                    // leaf status. Re-enumerate to establish it.
-                                    self.launch_scan();
+                                    if let Some(change) = output.file_change {
+                                        defer_drop(std::mem::replace(&mut self.hidden, hidden));
+                                        self.queue_scene_changes(vec![change]);
+                                    } else {
+                                        self.hide_folder(hidden);
+                                        self.launch_scan();
+                                    }
                                 } else if let Some(id) = output.id {
                                     self.hide_file(id);
                                 } else if let Some(change) = output.file_change {
                                     self.queue_scene_changes(vec![change]);
                                 }
                                 // A running scan may have read the old path already.
-                                if self.job.is_some() && !deleted_folder {
+                                if scan_was_running && (!deleted_folder || folder_incremental) {
                                     self.launch_scan();
                                 }
                             } else {
@@ -1317,6 +1335,7 @@ impl App {
                                 projection: None,
                                 geometry: None,
                                 recovery_projection: None,
+                                transition: None,
                             };
                             if let Some(old) = self.map_cache.replace(cache) {
                                 defer_drop(old);
@@ -1333,7 +1352,22 @@ impl App {
             }
         }
     }
-    fn poll_coordinator(&mut self) {
+    fn poll_coordinator(&mut self, ctx: &egui::Context) {
+        // A second prepared update is based on the current target geometry.
+        // Let the previous animation reach that geometry before publishing it,
+        // so a rapid second deletion cannot jump back to a later rectangle.
+        if self.coordinator_update_pending
+            && self
+                .map_cache
+                .as_ref()
+                .and_then(|cache| cache.transition.as_ref())
+                .is_some_and(|transition| {
+                    ctx.input(|input| input.time) - transition.started < TRANSITION_SECONDS
+                })
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return;
+        }
         loop {
             let event = match self.coordinator.as_ref().map(|c| c.try_recv()) {
                 Some(Ok(event)) => event,
@@ -1384,9 +1418,19 @@ impl App {
                 }
                 scene_coordinator::Event::Prepared(prepared) => {
                     self.coordinator_update_pending = false;
+                    let allow_inactive_rebuild =
+                        self.pending_scene_changes.as_ref().is_some_and(|changes| {
+                            changes.iter().any(|change| {
+                                matches!(change, scene_model::Change::RemoveLeafDirectory { .. })
+                            })
+                        });
                     let valid = self.projection_dirty
                         && Some(prepared.base) == self.coordinator_version
-                        && prepared.rebuild.is_empty()
+                        && (prepared.rebuild.is_empty() || allow_inactive_rebuild)
+                        && !prepared
+                            .rebuild
+                            .iter()
+                            .any(|mode| ViewMode::from_scene(*mode) == self.mode)
                         && prepared.views.iter().all(|view| {
                             let mode = ViewMode::from_scene(view.mode);
                             let cache = if self.mode == mode {
@@ -1409,6 +1453,15 @@ impl App {
                         defer_drop(prepared);
                         continue;
                     }
+                    // Unusable inactive modes are dropped independently. They
+                    // will be rebuilt from an authoritative scan on switch;
+                    // the active local update can still be published now.
+                    for mode in &prepared.rebuild {
+                        let index = ViewMode::from_scene(*mode).index();
+                        if let Some(old) = self.mode_caches[index].take() {
+                            defer_drop(old);
+                        }
+                    }
                     for view in prepared.views {
                         let mode = ViewMode::from_scene(view.mode);
                         let cache = if self.mode == mode {
@@ -1417,6 +1470,29 @@ impl App {
                             self.mode_caches[mode.index()].as_mut()
                         };
                         if let Some(cache) = cache {
+                            cache.transition = if self.mode == mode {
+                                view.transition.map(|transition| {
+                                    let size = transition.background.size;
+                                    MapTransition {
+                                        atlas: ctx.load_texture(
+                                            "transition-tiles",
+                                            transition.atlas,
+                                            egui::TextureOptions::NEAREST,
+                                        ),
+                                        background: ctx.load_texture(
+                                            "transition-background",
+                                            transition.background,
+                                            egui::TextureOptions::NEAREST,
+                                        ),
+                                        origin: transition.origin,
+                                        size,
+                                        started: ctx.input(|input| input.time),
+                                        tiles: transition.tiles,
+                                    }
+                                })
+                            } else {
+                                None
+                            };
                             if let Some(patch) = view.patch {
                                 cache.texture.set_partial(
                                     patch.origin,
@@ -2165,24 +2241,7 @@ impl App {
     }
     fn ui(&mut self, ctx: &egui::Context) {
         self.ui_contents(ctx);
-        if let Some(pending) = &self.pending_folder_delete {
-            let path = pending.path.to_string_lossy().into_owned();
-            let mut confirm = false;
-            let mut cancel = false;
-            egui::Window::new("移到废纸篓").collapsible(false).resizable(false).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).show(ctx, |ui| {
-                ui.label("将整个文件夹及其所有子文件夹和文件移到废纸篓，包括未扫描或后来新增的内容：");
-                ui.add(egui::Label::new(path).wrap());
-                ui.horizontal(|ui| { cancel = ui.button("取消").clicked(); confirm = ui.button(format!("移到{}", platform::TRASH_NAME)).clicked(); });
-            });
-            if cancel {
-                self.pending_folder_delete = None;
-            }
-            if confirm {
-                self.confirm_folder_delete();
-            }
-        }
-        if self.pending_folder_delete.is_none()
-            && !ctx.wants_keyboard_input()
+        if !ctx.wants_keyboard_input()
             && ctx.input_mut(|input| {
                 input.consume_key(egui::Modifiers::COMMAND, egui::Key::Backspace)
             })
@@ -2442,7 +2501,7 @@ impl App {
                 let painter = ui.painter_at(canvas);
                 let pointer = tooltip_pointer(&response);
                 let mut hovered = None;
-                if let Some(cache) = &self.map_cache {
+                if let Some(cache) = &mut self.map_cache {
                     let map = &cache.map;
                     painter.image(
                         cache.texture.id(),
@@ -2468,11 +2527,63 @@ impl App {
                     if !holes.is_empty() {
                         painter.add(holes);
                     }
-                    if let Some(p) = pointer {
-                        hovered = map.hit_test(
-                            (p.x - canvas.min.x) / scale.x,
-                            (p.y - canvas.min.y) / scale.y,
+                    let now = ctx.input(|input| input.time);
+                    if cache.transition.as_ref().is_some_and(|a| {
+                        now - a.started >= TRANSITION_SECONDS
+                            || LayoutKey::new(viewport, ctx.pixels_per_point()) != cache.key
+                    }) {
+                        cache.transition = None;
+                    }
+                    let mut transition_area = None;
+                    if let Some(transition) = &cache.transition {
+                        let [pw, ph] = map.physical_size();
+                        let x = transition.origin[0] as f32 / pw as f32;
+                        let y = transition.origin[1] as f32 / ph as f32;
+                        let w = transition.size[0] as f32 / pw as f32;
+                        let h = transition.size[1] as f32 / ph as f32;
+                        let area = Rect::from_min_size(
+                            canvas.min + Vec2::new(x * canvas.width(), y * canvas.height()),
+                            Vec2::new(w * canvas.width(), h * canvas.height()),
                         );
+                        painter.image(
+                            transition.background.id(),
+                            area,
+                            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            Color32::WHITE,
+                        );
+                        let raw = ((now - transition.started) / TRANSITION_SECONDS).clamp(0.0, 1.0)
+                            as f32;
+                        let t = raw * raw * (3.0 - 2.0 * raw);
+                        for tile in &transition.tiles {
+                            let lerp = |a: f32, b: f32| a + (b - a) * t;
+                            let from = tile.from;
+                            let to = tile.to;
+                            let r = treemap::Rect {
+                                x: lerp(from.x, to.x),
+                                y: lerp(from.y, to.y),
+                                w: lerp(from.w, to.w),
+                                h: lerp(from.h, to.h),
+                            };
+                            let dst = Rect::from_min_size(
+                                canvas.min
+                                    + Vec2::new(
+                                        (r.x - map.bounds.x) * scale.x,
+                                        (r.y - map.bounds.y) * scale.y,
+                                    ),
+                                Vec2::new(r.w * scale.x, r.h * scale.y),
+                            );
+                            painter.image(transition.atlas.id(), dst, tile.uv, Color32::WHITE);
+                        }
+                        transition_area = Some(area);
+                        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                    }
+                    if let Some(p) = pointer {
+                        if !transition_area.is_some_and(|area| area.contains(p)) {
+                            hovered = map.hit_test(
+                                (p.x - canvas.min.x) / scale.x,
+                                (p.y - canvas.min.y) / scale.y,
+                            );
+                        }
                     }
                     for (id, width) in [(self.selected, 2.0_f32), (hovered, 1.5_f32)] {
                         if let Some(r) = id.and_then(|i| map.rect(i)) {
@@ -2480,7 +2591,10 @@ impl App {
                                 canvas.min + Vec2::new(r.x * scale.x, r.y * scale.y),
                                 Vec2::new(r.w * scale.x, r.h * scale.y),
                             );
-                            if rect.width() > 1.0 && rect.height() > 1.0 {
+                            if rect.width() > 1.0
+                                && rect.height() > 1.0
+                                && !transition_area.is_some_and(|area| area.intersects(rect))
+                            {
                                 painter.rect_stroke(
                                     rect.shrink(0.5),
                                     0.0,
@@ -2778,9 +2892,6 @@ mod tests {
         settle(&mut app, &ctx);
         let folder_texture = app.map_cache.as_ref().unwrap().texture.id();
         assert_eq!(app.folder_data.as_ref().unwrap().files[0].size, 0);
-        app.selected = Some(0);
-        app.trash(0);
-        assert!(app.trash_rx.is_none());
         app.set_mode(ViewMode::Files);
         assert_eq!(app.selected, None);
         settle(&mut app, &ctx);
@@ -2802,7 +2913,7 @@ mod tests {
         assert!(app.hidden.contains(&2));
     }
     #[test]
-    fn folder_mode_delete_shortcut_requests_confirmation() {
+    fn folder_mode_delete_shortcut_starts_trash_without_confirmation() {
         let ctx = egui::Context::default();
         configure(&ctx);
         let mut app = App::default();
@@ -2828,8 +2939,7 @@ mod tests {
             ..Default::default()
         };
         let _ = ctx.run(input, |ctx| app.ui(ctx));
-        assert!(app.trash_rx.is_none());
-        assert!(app.pending_folder_delete.is_some());
+        assert!(app.trash_rx.is_some());
     }
     #[test]
     fn hybrid_mode_preserves_tile_slots_and_reuses_cache_after_deletion() {
@@ -3042,6 +3152,86 @@ mod tests {
             assert!(app.view_file(deleted).is_none());
             assert!(cache.map.rect(deleted).is_none());
         }
+    }
+
+    #[test]
+    fn leaf_folder_receipt_animates_sibling_and_keeps_unaffected_texture() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let id = |device| scan::FileIdentity {
+            device,
+            ..Default::default()
+        };
+        let fact = |path: &str, device, has_subdirectories| scan::DirectoryFact {
+            path: path.into(),
+            identity: id(device),
+            enumeration_complete: true,
+            has_subdirectories,
+        };
+        let file = |name: &str, directory, device| scan::FileEntry {
+            path: format!("/disk/{name}/f").into(),
+            parent: Arc::from(PathBuf::from(format!("/disk/{name}"))),
+            size: 50,
+            identity: id(device),
+            parent_identity: id(directory),
+            parent_is_leaf: true,
+            can_trash: true,
+        };
+        let source = Arc::new(scan::ScanResult {
+            root: "/disk".into(),
+            files: vec![file("a", 2, 4), file("b", 3, 5)],
+            directories: vec![
+                fact("/disk", 1, true),
+                fact("/disk/a", 2, false),
+                fact("/disk/b", 3, false),
+            ]
+            .into(),
+            skipped: 0,
+            errors: vec![],
+            elapsed: Duration::ZERO,
+        });
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.data = Some(source.clone());
+        settle(&mut app, &ctx);
+        let started = Instant::now();
+        while app
+            .map_cache
+            .as_ref()
+            .is_none_or(|c| c.projection.is_none())
+        {
+            frame(&mut app, &ctx);
+            assert!(!app.coordinator_disabled);
+            assert!(started.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let texture = app.map_cache.as_ref().unwrap().texture.id();
+        let (tx, rx) = mpsc::channel();
+        app.trash_rx = Some(rx);
+        tx.send(TrashOutput {
+            source,
+            id: None,
+            file_change: Some(scene_model::Change::RemoveLeafDirectory {
+                path: "/disk/a".into(),
+                identity: id(2),
+                parent: fact("/disk", 1, true),
+            }),
+            folder_hidden: Some(Arc::new(BTreeSet::from([0]))),
+            result: Ok(()),
+        })
+        .unwrap();
+        settle(&mut app, &ctx);
+        let cache = app.map_cache.as_ref().unwrap();
+        assert_eq!(cache.texture.id(), texture);
+        assert!(app.view_file(0).is_none());
+        assert!(
+            cache.transition.is_some(),
+            "surviving sibling should transition"
+        );
+        assert!(
+            app.job.is_none(),
+            "verified leaf deletion should avoid a full scan"
+        );
     }
 
     #[test]
