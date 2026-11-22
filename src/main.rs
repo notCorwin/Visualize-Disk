@@ -117,20 +117,123 @@ fn show_file_tooltip(
     response: &egui::Response,
     file: &scan::FileEntry,
 ) -> Option<egui::InnerResponse<()>> {
-    if !response.enabled() || !response.hovered() {
+    show_entry_tooltip(response, file, false)
+}
+
+fn show_entry_tooltip(
+    response: &egui::Response,
+    file: &scan::FileEntry,
+    folder: bool,
+) -> Option<egui::InnerResponse<()>> {
+    if !response.enabled() || tooltip_pointer(response).is_none() {
         return None;
     }
-    let width = (response.ctx.content_rect().width() - 32.0).clamp(1.0, 420.0);
+    let available = (response.ctx.content_rect().width() - 32.0).max(1.0);
+    let natural = response.ctx.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(
+                file.path.to_string_lossy().into_owned(),
+                FontId::proportional(14.0),
+                MUTED,
+            )
+            .size()
+            .x
+    });
+    let width = natural.max(220.0).min(360.0).min(available);
     // Skip the standard tooltip delay so moving across files updates immediately.
     egui::Tooltip::for_widget(response)
         .at_pointer()
         .width(width)
-        .show(|ui| file_tooltip(ui, file))
+        .show(|ui| file_tooltip(ui, file, width, folder))
 }
 
-fn file_tooltip(ui: &mut egui::Ui, file: &scan::FileEntry) {
-    let available = (ui.ctx().content_rect().width() - 32.0).max(1.0);
-    ui.set_width(available.min(420.0));
+fn tooltip_pointer(response: &egui::Response) -> Option<egui::Pos2> {
+    response.hover_pos().or_else(|| {
+        egui::Tooltip::was_tooltip_open_last_frame(&response.ctx, response.id)
+            .then(|| response.ctx.pointer_hover_pos())
+            .flatten()
+            .filter(|pos| response.rect.contains(*pos))
+    })
+}
+
+// Prefer breaks after directory separators while allowing the text layout to
+// break an individual component that is wider than the available space.
+fn wrap_path(ctx: &egui::Context, path: &str, width: f32) -> String {
+    let mut result = String::with_capacity(path.len());
+    let mut line = String::new();
+    for part in path.split_inclusive(['/', '\\']) {
+        let mut candidate = line.clone();
+        candidate.push_str(part);
+        let candidate_width = ctx.fonts_mut(|fonts| {
+            fonts
+                .layout_no_wrap(candidate, FontId::proportional(14.0), MUTED)
+                .size()
+                .x
+        });
+        if !line.is_empty() && candidate_width > width {
+            result.push_str(&line);
+            result.push('\n');
+            line.clear();
+        }
+        line.push_str(part);
+    }
+    result.push_str(&line);
+    result
+}
+
+fn file_tooltip(ui: &mut egui::Ui, file: &scan::FileEntry, width: f32, folder: bool) {
+    ui.set_width(width);
+    let path = wrap_path(ui.ctx(), &file.path.to_string_lossy(), width);
+    let name = file.path.file_name().unwrap_or_default().to_string_lossy();
+    let content_height = ui.ctx().fonts_mut(|fonts| {
+        let layout = |text: String, size| {
+            let mut job =
+                egui::text::LayoutJob::simple(text, FontId::proportional(size), TEXT, width);
+            job.wrap.break_anywhere = true;
+            job
+        };
+        fonts.layout_job(layout(name.into_owned(), 15.0)).size().y
+            + fonts
+                .layout_job(layout(tooltip_size(file.size, folder), 14.0))
+                .size()
+                .y
+            + fonts.layout_job(layout(path, 14.0)).size().y
+    }) + 2.0 * ui.spacing().item_spacing.y;
+    let max_height = (ui.ctx().content_rect().height() * 0.5 - 50.0).max(1.0);
+    if content_height <= max_height {
+        file_tooltip_content(ui, file, folder);
+        return;
+    }
+    let scroll_id = egui::Id::new(("file-tooltip-scroll", &file.path));
+    let previous_offset = ui
+        .ctx()
+        .data(|data| data.get_temp::<f32>(scroll_id))
+        .unwrap_or(0.0);
+    // The pointer remains over the file tile, so forward its wheel input to the
+    // tooltip instead of requiring the user to move into the transient popup.
+    let wheel = ui.ctx().input(|input| input.raw_scroll_delta.y);
+    let content = egui::ScrollArea::vertical()
+        .id_salt(scroll_id)
+        .max_height(max_height)
+        .auto_shrink([false, true])
+        .vertical_scroll_offset((previous_offset - wheel).max(0.0))
+        .show(ui, |ui| file_tooltip_content(ui, file, folder));
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(scroll_id, content.state.offset.y));
+    if content.content_size.y > content.inner_rect.height() {
+        ui.label(RichText::new("滚动查看完整路径").color(MUTED).small());
+    }
+}
+
+fn tooltip_size(size: u64, folder: bool) -> String {
+    if folder {
+        format!("直接文件 {}", bytes(size))
+    } else {
+        bytes(size)
+    }
+}
+
+fn file_tooltip_content(ui: &mut egui::Ui, file: &scan::FileEntry, folder: bool) {
     wrapped_text(
         ui,
         file.path
@@ -141,8 +244,9 @@ fn file_tooltip(ui: &mut egui::Ui, file: &scan::FileEntry) {
         15.0,
         TEXT,
     );
-    ui.label(bytes(file.size));
-    wrapped_text(ui, file.path.to_string_lossy().into_owned(), 14.0, MUTED);
+    ui.label(tooltip_size(file.size, folder));
+    let path = wrap_path(ui.ctx(), &file.path.to_string_lossy(), ui.available_width());
+    wrapped_text(ui, path, 14.0, MUTED);
 }
 
 fn defer_drop<T: Send + 'static>(value: T) {
@@ -183,6 +287,56 @@ struct TrashOutput {
 struct TotalsOutput {
     generation: u64,
     bytes: u64,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ViewMode {
+    #[default]
+    Files,
+    Folders,
+}
+
+struct FolderOutput {
+    generation: u64,
+    data: scan::ScanResult,
+}
+
+// Each directory tile represents only files directly inside that directory.
+// Child directories receive their own tiles, so every scanned file is counted once.
+fn folder_snapshot(
+    data: &scan::ScanResult,
+    hidden: &BTreeSet<usize>,
+    token: &AtomicU64,
+    generation: u64,
+) -> Option<scan::ScanResult> {
+    let mut groups: HashMap<&std::path::Path, u64> = HashMap::new();
+    for (id, file) in data.files.iter().enumerate() {
+        if id % 1024 == 0 && token.load(Ordering::Relaxed) != generation {
+            return None;
+        }
+        if !hidden.contains(&id) {
+            let size = groups.entry(file.parent.as_ref()).or_default();
+            *size = size.saturating_add(file.size);
+        }
+    }
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let files = groups
+        .into_iter()
+        .map(|(path, size)| scan::FileEntry {
+            path: path.to_path_buf(),
+            parent: Arc::from(path.parent().unwrap_or(path)),
+            size,
+            identity: scan::FileIdentity::default(),
+            can_trash: false,
+        })
+        .collect();
+    (token.load(Ordering::Relaxed) == generation).then(|| scan::ScanResult {
+        root: data.root.clone(),
+        files,
+        skipped: data.skipped,
+        errors: Vec::new(),
+        elapsed: data.elapsed,
+    })
 }
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct LayoutKey {
@@ -299,6 +453,10 @@ struct App {
     permission_rx: Option<mpsc::Receiver<permission::Access>>,
     pending_scan: bool,
     data: Option<Arc<scan::ScanResult>>,
+    mode: ViewMode,
+    folder_data: Option<Arc<scan::ScanResult>>,
+    folder_rx: Option<mpsc::Receiver<FolderOutput>>,
+    folder_generation: Arc<AtomicU64>,
     hidden: Arc<BTreeSet<usize>>,
     job: Option<Job>,
     reveal_rx: Option<mpsc::Receiver<Result<(), String>>>,
@@ -317,6 +475,7 @@ struct App {
     layout_generation: Arc<AtomicU64>,
     layout_key: Option<LayoutKey>,
     map_cache: Option<MapCache>,
+    inactive_map_cache: Option<MapCache>,
 }
 impl Default for App {
     fn default() -> Self {
@@ -325,6 +484,10 @@ impl Default for App {
             permission_rx: None,
             pending_scan: false,
             data: None,
+            mode: ViewMode::Files,
+            folder_data: None,
+            folder_rx: None,
+            folder_generation: Arc::new(AtomicU64::new(0)),
             hidden: Arc::default(),
             job: None,
             reveal_rx: None,
@@ -343,6 +506,7 @@ impl Default for App {
             layout_generation: Arc::new(AtomicU64::new(0)),
             layout_key: None,
             map_cache: None,
+            inactive_map_cache: None,
         }
     }
 }
@@ -396,6 +560,7 @@ impl App {
         self.message = None;
     }
     fn replace_snapshot(&mut self, data: scan::ScanResult) {
+        self.invalidate_folders();
         defer_drop(std::mem::take(&mut self.hidden));
         if let Some(old) = self.data.replace(Arc::new(data)) {
             defer_drop(old);
@@ -411,13 +576,17 @@ impl App {
         if let Some(old) = self.map_cache.take() {
             defer_drop(old);
         }
+        if let Some(old) = self.inactive_map_cache.take() {
+            defer_drop(old);
+        }
         self.total_bytes = 0;
         self.totals_ready = false;
         self.selected = None;
         self.layout_key = None;
     }
     fn trash(&mut self, id: usize) {
-        if self.access != permission::Access::Granted
+        if self.mode != ViewMode::Files
+            || self.access != permission::Access::Granted
             || self.trash_rx.is_some()
             || self.hidden.contains(&id)
         {
@@ -531,6 +700,18 @@ impl App {
         }
     }
     fn poll(&mut self, ctx: &egui::Context) {
+        if let Some(rx) = &self.folder_rx {
+            match rx.try_recv() {
+                Ok(output) => {
+                    self.folder_rx = None;
+                    if output.generation == self.folder_generation.load(Ordering::Relaxed) {
+                        self.folder_data = Some(Arc::new(output.data));
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.folder_rx = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if let Some(rx) = &self.permission_rx {
             match rx.try_recv() {
                 Ok(access) => {
@@ -657,8 +838,10 @@ impl App {
                             };
                             // Resize work can finish after a deletion. Apply the
                             // current holes before displaying its replacement.
-                            for &id in self.hidden.iter() {
-                                cache.hide(id);
+                            if self.mode == ViewMode::Files {
+                                for &id in self.hidden.iter() {
+                                    cache.hide(id);
+                                }
                             }
                             if let Some(old) = self.map_cache.replace(cache) {
                                 defer_drop(old);
@@ -681,12 +864,85 @@ impl App {
         {
             return;
         }
-        if self.selected == Some(id) {
+        if self.mode == ViewMode::Files && self.selected == Some(id) {
             self.selected = None;
         }
-        if let Some(cache) = &mut self.map_cache {
+        self.invalidate_folders();
+        if self.mode == ViewMode::Files {
+            if let Some(cache) = &mut self.map_cache {
+                cache.hide(id);
+            }
+        } else if let Some(cache) = &mut self.inactive_map_cache {
             cache.hide(id);
         }
+    }
+    fn invalidate_folders(&mut self) {
+        self.folder_generation.fetch_add(1, Ordering::Relaxed);
+        if let Some(rx) = self.folder_rx.take() {
+            defer_drop(rx);
+        }
+        if let Some(data) = self.folder_data.take() {
+            defer_drop(data);
+        }
+        if self.mode == ViewMode::Folders {
+            self.reset_layout();
+        } else if let Some(cache) = self.inactive_map_cache.take() {
+            defer_drop(cache);
+        }
+    }
+    fn reset_layout(&mut self) {
+        self.layout_generation.fetch_add(1, Ordering::Relaxed);
+        self.layout_key = None;
+        if let Some(rx) = self.layout_rx.take() {
+            defer_drop(rx);
+        }
+        if let Some(cache) = self.map_cache.take() {
+            defer_drop(cache);
+        }
+        self.selected = None;
+    }
+    fn set_mode(&mut self, mode: ViewMode) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.layout_generation.fetch_add(1, Ordering::Relaxed);
+            if let Some(rx) = self.layout_rx.take() {
+                defer_drop(rx);
+            }
+            self.selected = None;
+            std::mem::swap(&mut self.map_cache, &mut self.inactive_map_cache);
+            let generation = self.layout_generation.load(Ordering::Relaxed);
+            self.layout_key = self.map_cache.as_mut().map(|cache| {
+                cache.generation = generation;
+                cache.key
+            });
+        }
+    }
+    fn view_data(&self) -> Option<&Arc<scan::ScanResult>> {
+        match self.mode {
+            ViewMode::Files => self.data.as_ref(),
+            ViewMode::Folders => self.folder_data.as_ref(),
+        }
+    }
+    fn prepare_folders(&mut self, ctx: &egui::Context) {
+        if self.mode != ViewMode::Folders || self.folder_data.is_some() || self.folder_rx.is_some()
+        {
+            return;
+        }
+        let Some(data) = self.data.clone() else {
+            return;
+        };
+        let hidden = self.hidden.clone();
+        let token = self.folder_generation.clone();
+        let generation = token.load(Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        self.folder_rx = Some(rx);
+        let ctx = ctx.clone();
+        rayon::spawn(move || {
+            if let Some(data) = folder_snapshot(&data, &hidden, &token, generation) {
+                let _ = tx.send(FolderOutput { generation, data });
+            }
+            ctx.request_repaint();
+        });
     }
     fn totals(&mut self, ctx: &egui::Context) {
         let generation = self.totals_generation.load(Ordering::Relaxed);
@@ -723,7 +979,7 @@ impl App {
         {
             return;
         }
-        let Some(data) = self.data.clone() else {
+        let Some(data) = self.view_data().cloned() else {
             return;
         };
         let token = self.layout_generation.clone();
@@ -746,10 +1002,13 @@ impl App {
         if self.reveal_rx.is_some() {
             return;
         }
-        let Some(data) = &self.data else {
+        let Some(data) = self.view_data() else {
             return;
         };
-        let path = data.files[i].path.clone();
+        let Some(file) = data.files.get(i) else {
+            return;
+        };
+        let path = file.path.clone();
         let (tx, rx) = mpsc::channel();
         self.reveal_rx = Some(rx);
         std::thread::spawn(move || {
@@ -844,6 +1103,7 @@ impl App {
             || self.permission_rx.is_some()
             || self.totals_rx.is_some()
             || self.layout_rx.is_some()
+            || self.folder_rx.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -930,9 +1190,21 @@ impl App {
                             job.cancel.store(true, Ordering::Relaxed);
                         }
                     }
+                    if ui
+                        .selectable_label(self.mode == ViewMode::Files, "文件")
+                        .clicked()
+                    {
+                        self.set_mode(ViewMode::Files);
+                    }
+                    if ui
+                        .selectable_label(self.mode == ViewMode::Folders, "文件夹")
+                        .on_hover_text("按文件夹中的直接文件汇总")
+                        .clicked()
+                    {
+                        self.set_mode(ViewMode::Folders);
+                    }
                     let selected = self.selected.and_then(|i| {
-                        self.data
-                            .as_ref()
+                        self.view_data()
                             .and_then(|data| data.files.get(i))
                             .map(|f| (i, f))
                     });
@@ -945,14 +1217,16 @@ impl App {
                     {
                         reveal = selected.map(|(i, _)| i);
                     }
-                    if selected.is_none_or(|(_, f)| {
-                        f.can_trash && file_actions::can_move_to_trash(&f.path)
-                    }) && ui
-                        .add_enabled(
-                            selected.is_some() && self.trash_rx.is_none(),
-                            egui::Button::new(format!("移到{}", platform::TRASH_NAME)),
-                        )
-                        .clicked()
+                    if self.mode == ViewMode::Files
+                        && selected.is_none_or(|(_, f)| {
+                            f.can_trash && file_actions::can_move_to_trash(&f.path)
+                        })
+                        && ui
+                            .add_enabled(
+                                selected.is_some() && self.trash_rx.is_none(),
+                                egui::Button::new(format!("移到{}", platform::TRASH_NAME)),
+                            )
+                            .clicked()
                     {
                         trash = selected.map(|(i, _)| i);
                     }
@@ -971,6 +1245,7 @@ impl App {
                 });
             });
         self.totals(ctx);
+        self.prepare_folders(ctx);
         if self.data.is_none() {
             self.status_bar(ctx);
             egui::CentralPanel::default()
@@ -995,10 +1270,21 @@ impl App {
             return;
         }
         self.status_bar(ctx);
+        if self.view_data().is_none() {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(BG))
+                .show(ctx, |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("正在生成文件夹视图…");
+                    });
+                });
+            self.overlays(ctx);
+            return;
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(12.0))
             .show(ctx, |ui| {
-                if self.data.as_ref().unwrap().files.is_empty() {
+                if self.view_data().unwrap().files.is_empty() {
                     ui.centered_and_justified(|ui| {
                         ui.label("没有可显示的文件");
                     });
@@ -1009,9 +1295,9 @@ impl App {
                 let (canvas, response) = ui.allocate_exact_size(viewport, Sense::click());
                 self.canvas_rect = Some(canvas);
                 let painter = ui.painter_at(canvas);
-                let pointer = response.hover_pos();
+                let pointer = tooltip_pointer(&response);
                 let mut hovered = None;
-                let data = self.data.as_ref().unwrap();
+                let data = self.view_data().unwrap().clone();
                 if let Some(cache) = &self.map_cache {
                     let map = &cache.map;
                     painter.image(
@@ -1074,7 +1360,11 @@ impl App {
                     if response.clicked() {
                         self.selected = Some(i);
                     }
-                    show_file_tooltip(&response, f);
+                    if self.mode == ViewMode::Folders {
+                        show_entry_tooltip(&response, f, true);
+                    } else {
+                        show_file_tooltip(&response, f);
+                    }
                 }
             });
         if let Some(i) = reveal {
@@ -1098,10 +1388,14 @@ impl Drop for App {
         }
         self.totals_generation.fetch_add(1, Ordering::Relaxed);
         self.layout_generation.fetch_add(1, Ordering::Relaxed);
+        self.folder_generation.fetch_add(1, Ordering::Relaxed);
         if let Some(data) = self.data.take() {
             defer_drop(data);
         }
         if let Some(map) = self.map_cache.take() {
+            defer_drop(map);
+        }
+        if let Some(map) = self.inactive_map_cache.take() {
             defer_drop(map);
         }
     }
@@ -1262,6 +1556,102 @@ mod tests {
         }
     }
 
+    #[test]
+    fn folder_mode_groups_direct_files_once_and_excludes_hidden() {
+        let mut data = snapshot();
+        data.files.push(scan::FileEntry {
+            path: "/a/nested/file".into(),
+            parent: Path::new("/a/nested").into(),
+            size: 7,
+            identity: scan::FileIdentity::default(),
+            can_trash: true,
+        });
+        let token = AtomicU64::new(1);
+        let folders = folder_snapshot(&data, &BTreeSet::from([1]), &token, 1).unwrap();
+        let actual: Vec<_> = folders
+            .files
+            .iter()
+            .map(|f| (f.path.as_path(), f.size))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                (Path::new("/a"), 0),
+                (Path::new("/a/nested"), 7),
+                (Path::new("/b"), 42)
+            ]
+        );
+        assert!(folders.files.iter().all(|f| !f.can_trash));
+        assert!(folder_snapshot(&data, &BTreeSet::new(), &token, 0).is_none());
+    }
+    #[test]
+    fn mode_switch_isolates_selection_and_rebuilds_after_deletion() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.data = Some(Arc::new(snapshot()));
+        settle(&mut app, &ctx);
+        let file_texture = app.map_cache.as_ref().unwrap().texture.id();
+        app.selected = Some(1);
+        app.hide_file(1);
+        app.set_mode(ViewMode::Folders);
+        assert_eq!(app.selected, None);
+        settle(&mut app, &ctx);
+        let folder_texture = app.map_cache.as_ref().unwrap().texture.id();
+        assert_eq!(app.folder_data.as_ref().unwrap().files[0].size, 0);
+        app.selected = Some(0);
+        app.trash(0);
+        assert!(app.trash_rx.is_none());
+        app.set_mode(ViewMode::Files);
+        assert_eq!(app.selected, None);
+        settle(&mut app, &ctx);
+        assert!(app.hidden.contains(&1));
+        assert!(!app.map_cache.as_ref().unwrap().holes.is_empty());
+        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), file_texture);
+        app.set_mode(ViewMode::Folders);
+        settle(&mut app, &ctx);
+        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), folder_texture);
+        // A file deletion can complete after switching to folder mode.
+        app.hide_file(2);
+        settle(&mut app, &ctx);
+        assert_eq!(app.folder_data.as_ref().unwrap().files.len(), 1);
+        assert_ne!(app.map_cache.as_ref().unwrap().texture.id(), folder_texture);
+        app.set_mode(ViewMode::Files);
+        settle(&mut app, &ctx);
+        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), file_texture);
+        assert!(app.hidden.contains(&2));
+    }
+    #[test]
+    fn folder_mode_delete_shortcut_does_not_delete() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        app.data = Some(Arc::new(snapshot()));
+        app.set_mode(ViewMode::Folders);
+        settle(&mut app, &ctx);
+        app.selected = Some(0);
+        let modifiers = egui::Modifiers::COMMAND;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(1180.0, 780.0),
+            )),
+            modifiers,
+            events: vec![egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| app.ui(ctx));
+        assert!(app.trash_rx.is_none());
+        assert_eq!(app.selected, Some(0));
+    }
     #[test]
     fn bytes_are_binary_and_zero_is_exact() {
         assert_eq!(bytes(0), "0 B");
@@ -2020,7 +2410,7 @@ mod tests {
             if let Some(index) = hovered {
                 for path in tooltip_paths {
                     assert_eq!(
-                        path,
+                        path.replace('\n', ""),
                         app.data.as_ref().unwrap().files[index]
                             .path
                             .to_str()
@@ -2083,9 +2473,141 @@ mod tests {
             "tooltip escaped screen: {rect:?}"
         );
         let path = file.path.to_string_lossy();
-        let (shape, _) = text_shape(last.as_ref().unwrap(), &path);
+        let wrapped = wrap_path(&ctx, &path, 360.0);
+        let (shape, _) = text_shape(last.as_ref().unwrap(), &wrapped);
         assert!(!shape.galley.elided);
         assert!(shape.galley.rows.len() > 1);
+    }
+
+    #[test]
+    fn tooltip_wraps_at_path_separators_without_losing_unicode() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let path = "/Users/用户/Library/Application Support/示例/file.txt";
+        let mut wrapped = String::new();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            wrapped = wrap_path(ctx, path, 130.0);
+        });
+        assert_eq!(wrapped.replace('\n', ""), path);
+        assert!(wrapped.contains('\n'));
+        assert!(wrapped.split('\n').all(|line| !line.is_empty()));
+        assert!(
+            wrapped
+                .split('\n')
+                .skip(1)
+                .all(|line| !line.starts_with('/'))
+        );
+        assert!(
+            wrapped
+                .split('\n')
+                .take_while(|line| !line.ends_with("file.txt"))
+                .all(|line| line.ends_with('/'))
+        );
+    }
+
+    #[test]
+    fn tooltip_wraps_long_components_on_a_narrow_screen() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut file = snapshot().files.remove(0);
+        file.path = format!("/用户/{}", "longfilename".repeat(10)).into();
+        let mut output = None;
+        let mut tooltip_rect = None;
+        for pass in 0..3 {
+            output = Some(ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(240.0, 560.0),
+                    )),
+                    time: Some(pass as f64),
+                    events: vec![egui::Event::PointerMoved(egui::pos2(220.0, 30.0))],
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let response = ui.allocate_rect(ui.max_rect(), Sense::hover());
+                        tooltip_rect = show_file_tooltip(&response, &file)
+                            .map(|response| response.response.rect);
+                    });
+                },
+            ));
+        }
+        let rect = tooltip_rect.unwrap();
+        assert!(rect.left() >= 0.0 && rect.right() <= 240.0, "{rect:?}");
+        let path = file.path.to_string_lossy();
+        let wrapped = wrap_path(&ctx, &path, 208.0);
+        let (shape, _) = text_shape(output.as_ref().unwrap(), &wrapped);
+        assert!(!shape.galley.elided);
+        assert!(shape.galley.rows.len() > 1);
+        assert!(shape.galley.rows.iter().all(|row| row.size.x <= 208.0));
+    }
+
+    #[test]
+    fn deep_path_tooltip_fits_screen_and_scrolls_from_the_hovered_tile() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut file = snapshot().files.remove(0);
+        file.path = format!("/{}/last.txt", "folder/".repeat(60)).into();
+        let mut tooltip_rect = None;
+        let mut last_output = None;
+        for pass in 0..5 {
+            let mut events = vec![egui::Event::PointerMoved(egui::pos2(200.0, 60.0))];
+            if pass == 3 {
+                events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, -100_000.0),
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            last_output = Some(ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        Vec2::new(240.0, 160.0),
+                    )),
+                    time: Some(pass as f64),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let response = ui.allocate_rect(ui.max_rect(), Sense::hover());
+                        tooltip_rect = show_file_tooltip(&response, &file)
+                            .map(|response| response.response.rect);
+                    });
+                },
+            ));
+        }
+        let rect = tooltip_rect.expect("tooltip remains open while scrolling");
+        assert!(rect.top() >= 0.0 && rect.bottom() <= 160.0, "{rect:?}");
+        let scroll_id = egui::Id::new(("file-tooltip-scroll", &file.path));
+        let offset = ctx.data(|data| data.get_temp::<f32>(scroll_id)).unwrap();
+        assert!(
+            offset > 0.0,
+            "scroll input must reveal the rest of the path"
+        );
+        let output = last_output.unwrap();
+        let path = file.path.to_string_lossy();
+        let (shape, clip) = output
+            .shapes
+            .iter()
+            .find_map(|item| {
+                if let egui::Shape::Text(shape) = &item.shape
+                    && shape.galley.job.text.replace('\n', "") == path
+                {
+                    Some((shape, item.clip_rect))
+                } else {
+                    None
+                }
+            })
+            .expect("full path is laid out");
+        let last_row = shape.galley.rows.last().unwrap();
+        let bottom = shape.pos.y + last_row.pos.y + last_row.size.y;
+        assert!(
+            bottom <= clip.bottom() + 1.0,
+            "last path segment must be visible after scrolling: {bottom} / {clip:?}"
+        );
     }
 
     #[test]

@@ -18,6 +18,45 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Ask Foundation about each directory, not just its volume: a volume can
+/// contain several distinct trash directories. Called on scan workers only.
+pub(super) fn trash_relationship(path: &Path) -> Result<bool, ()> {
+    use objc2::rc::autoreleasepool;
+    use objc2_foundation::{
+        NSFileManager, NSSearchPathDirectory, NSSearchPathDomainMask, NSURL, NSURLRelationship,
+    };
+    use std::ffi::CString;
+    use std::ptr::NonNull;
+
+    autoreleasepool(|_| {
+        let bytes = CString::new(path.as_os_str().as_bytes()).map_err(|_| ())?;
+        // SAFETY: bytes is a live, NUL-terminated filesystem path.
+        let url = unsafe {
+            NSURL::fileURLWithFileSystemRepresentation_isDirectory_relativeToURL(
+                NonNull::new(bytes.as_ptr().cast_mut()).ok_or(())?,
+                true,
+                None,
+            )
+        };
+        let mut relationship = NSURLRelationship::Other;
+        // SAFETY: relationship lives through the call and is writable. Domain
+        // zero asks Foundation to select the domain appropriate for this URL.
+        unsafe {
+            NSFileManager::defaultManager().getRelationship_ofDirectory_inDomain_toItemAtURL_error(
+                NonNull::from(&mut relationship),
+                NSSearchPathDirectory::TrashDirectory,
+                NSSearchPathDomainMask::empty(),
+                &url,
+            )
+        }
+        .map_err(|_| ())?;
+        Ok(matches!(
+            relationship,
+            NSURLRelationship::Contains | NSURLRelationship::Same
+        ))
+    })
+}
+
 // Darwin's <sys/attr.h>, <sys/stat.h>, and <sys/vnode.h>, respectively.
 const ATTR_CMN_ERROR: u32 = 0x2000_0000;
 const SF_FIRMLINK: u32 = 0x0080_0000;

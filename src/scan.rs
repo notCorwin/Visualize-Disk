@@ -103,6 +103,20 @@ pub fn scan(
             elapsed: started.elapsed(),
         });
     }
+    #[cfg(target_os = "macos")]
+    match macos::trash_relationship(&real_root) {
+        Ok(true) => {
+            return Ok(ScanResult {
+                root,
+                files: Vec::new(),
+                skipped: 0,
+                errors: Vec::new(),
+                elapsed: started.elapsed(),
+            });
+        }
+        Ok(false) => {}
+        Err(()) => return Err("无法确认扫描位置是否位于废纸篓，请检查磁盘和访问权限。".into()),
+    }
     let root_identity = FileIdentity::from_path(&root, &metadata).map_err(|e| root_error(&e))?;
     let traversal = Traversal {
         root: &root,
@@ -234,6 +248,19 @@ impl Traversal<'_> {
             if self.cancel.load(Ordering::Relaxed) {
                 return;
             }
+            #[cfg(target_os = "macos")]
+            if directory.path != self.root {
+                let real_path = if self.root == self.real_root {
+                    directory.path.clone()
+                } else {
+                    self.real_path(&directory.path)
+                };
+                if self
+                    .skip_trash_or_unknown(&directory.path, macos::trash_relationship(&real_path))
+                {
+                    return;
+                }
+            }
             let mut report = scan_directory(&directory, self.cancel, self.progress);
             for file in &mut report.files {
                 file.can_trash = crate::file_actions::can_move_to_trash(&file.path)
@@ -284,6 +311,30 @@ impl Traversal<'_> {
 
     fn real_path(&self, path: &Path) -> PathBuf {
         mapped_real_path(path, self.root, self.real_root)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn skip_trash_or_unknown(&self, path: &Path, outcome: Result<bool, ()>) -> bool {
+        if outcome == Ok(false) {
+            return false;
+        }
+        if outcome.is_err() {
+            let mut state = self.state.lock().unwrap();
+            if state.errors.len() < 24 {
+                state.errors.push(format!(
+                    "{}：无法确认是否位于废纸篓，已跳过；请检查磁盘和访问权限。",
+                    path.display()
+                ));
+            }
+        }
+        publish(
+            self.progress,
+            ScanProgress {
+                skipped: 1,
+                ..Default::default()
+            },
+        );
+        true
     }
 
     fn queue_child(
@@ -801,6 +852,66 @@ mod tests {
         for path in ["/Users/me/.Trash-other/file", "/Users/other/.Trash/file"] {
             assert!(!is_excluded_trash(Path::new(path), trash), "{path}");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn foundation_trash_check_excludes_real_trash_but_not_same_named_directory() {
+        let home = crate::file_actions::home_directory().unwrap();
+        let trash = home.join(".Trash");
+        if trash.is_dir() {
+            assert_eq!(macos::trash_relationship(&trash), Ok(true));
+            let result = scan(
+                trash,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(Mutex::new(ScanProgress::default())),
+            )
+            .unwrap();
+            assert!(result.files.is_empty());
+        }
+
+        let temp = Temp::new();
+        let ordinary = temp.0.join(".Trash");
+        fs::create_dir(&ordinary).unwrap();
+        fs::write(ordinary.join("file"), b"data").unwrap();
+        assert_eq!(macos::trash_relationship(&ordinary), Ok(false));
+        let result = scan(
+            temp.0.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(ScanProgress::default())),
+        )
+        .unwrap();
+        assert!(
+            result
+                .files
+                .iter()
+                .any(|entry| entry.path == ordinary.join("file"))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unknown_trash_relationship_skips_directory_and_reports_reason() {
+        let cancel = AtomicBool::new(false);
+        let progress = Mutex::new(ScanProgress::default());
+        let traversal = Traversal {
+            root: Path::new("/"),
+            real_root: Path::new("/"),
+            root_device: 1,
+            startup_disk: true,
+            excluded_trash: None,
+            cancel: &cancel,
+            progress: &progress,
+            state: Mutex::new(TraversalState::default()),
+        };
+        assert!(!traversal.skip_trash_or_unknown(Path::new("/ordinary"), Ok(false)));
+        assert!(traversal.skip_trash_or_unknown(Path::new("/trash"), Ok(true)));
+        assert!(traversal.skip_trash_or_unknown(Path::new("/unavailable"), Err(())));
+        assert_eq!(progress.lock().unwrap().skipped, 2);
+        let state = traversal.state.lock().unwrap();
+        assert_eq!(state.errors.len(), 1);
+        assert!(state.errors[0].contains("/unavailable"));
+        assert!(state.errors[0].contains("已跳过"));
     }
 
     #[cfg(target_os = "macos")]
