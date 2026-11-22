@@ -1285,33 +1285,6 @@ impl App {
                         });
                     }
                 });
-                ui.horizontal(|ui| {
-                    ui.set_min_height(control_height);
-                    if let Some(f) = self.selected.and_then(|i| self.data.as_ref()?.files.get(i)) {
-                        let path = f.path.to_string_lossy();
-                        let label = ui.add(
-                            egui::Label::new(format!("{}  {}", bytes(f.size), path)).truncate(),
-                        );
-                        let response = ui
-                            .interact(
-                                label.rect,
-                                egui::Id::new("copy-selected-path"),
-                                Sense::click(),
-                            )
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .on_hover_text("点击复制完整路径");
-                        if response.clicked() {
-                            if let Some(exact) = f.path.to_str() {
-                                ctx.copy_text(exact.to_owned());
-                                self.action_notice = Some("路径已复制。".into());
-                            } else {
-                                self.message = Some(
-                                    "路径包含无法复制为文本的字符，请在文件管理器中查看。".into(),
-                                );
-                            }
-                        }
-                    }
-                });
             });
         self.totals(ctx);
         if self.data.is_none() {
@@ -2116,64 +2089,18 @@ mod tests {
         assert!(app.selected.is_none());
     }
     #[test]
-    fn clicking_top_path_copies_full_unicode_path_without_layout_change() {
-        let ctx = egui::Context::default();
-        configure(&ctx);
-        let mut data = snapshot();
-        data.files[0].path = "/用户/文档/报告.txt".into();
-        data.files[0].parent = Path::new("/用户/文档").into();
-        let mut app = App::default();
-        app.access = permission::Access::Granted;
-        app.recoveries_loaded = true;
-        app.data = Some(Arc::new(data));
-        settle(&mut app, &ctx);
-        app.selected = Some(0);
-        frame(&mut app, &ctx);
-        frame(&mut app, &ctx);
-        let canvas = app.canvas_rect;
-        {
-            let response = ctx
-                .read_response(egui::Id::new("copy-selected-path"))
-                .expect("complete path visible");
-            let pos = response.rect.center();
-            for pressed in [true, false] {
-                let input = egui::RawInput {
-                    screen_rect: Some(Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        Vec2::new(1180.0, 780.0),
-                    )),
-                    events: vec![
-                        egui::Event::PointerMoved(pos),
-                        egui::Event::PointerButton {
-                            pos,
-                            button: egui::PointerButton::Primary,
-                            pressed,
-                            modifiers: Default::default(),
-                        },
-                    ],
-                    ..Default::default()
-                };
-                let output = ctx.run(input, |ctx| app.ui(ctx));
-                if !pressed {
-                    assert!(output.platform_output.commands.iter().any(|command| matches!(command,egui::OutputCommand::CopyText(text) if text=="/用户/文档/报告.txt")));
-                }
-                assert_eq!(app.canvas_rect, canvas);
-            }
-        }
-    }
-    #[test]
-    fn errors_take_priority_over_copy_feedback_until_dismissed() {
+    fn errors_take_priority_over_success_feedback_until_dismissed() {
         let mut app = App::default();
         app.message = Some("文件无法恢复，请检查原目录权限。".into());
-        app.action_notice = Some("已复制完整路径。".into());
+        app.action_notice = Some("已放回原处。".into());
         app.collect_notices();
         assert_eq!(app.notice.as_ref().unwrap().kind, NoticeKind::Error);
         assert!(app.notice.as_ref().unwrap().text.contains("恢复"));
-        app.action_notice = Some("已复制完整路径。".into());
+        app.action_notice = Some("已放回原处。".into());
         app.collect_notices();
         assert_eq!(app.notice.as_ref().unwrap().kind, NoticeKind::Error);
         app.notice = None;
-        app.action_notice = Some("已复制完整路径。".into());
+        app.action_notice = Some("已放回原处。".into());
         app.collect_notices();
         assert_eq!(app.notice.as_ref().unwrap().kind, NoticeKind::Success);
     }
@@ -2227,7 +2154,7 @@ mod tests {
                 assert_eq!(app.layout_generation.load(Ordering::Relaxed), generation);
             }
         };
-        app.action_notice = Some("已复制完整路径。".into());
+        app.action_notice = Some("已放回原处。".into());
         check(&mut app);
         assert_eq!(app.notice.as_ref().unwrap().kind, NoticeKind::Success);
         app.message = Some("macOS 拒绝移动文件，请检查权限。".repeat(30));
@@ -2302,7 +2229,7 @@ mod tests {
             assert_eq!(app.canvas_rect, rect);
             assert_eq!(app.layout_key, key);
         }
-        app.action_notice = Some("已复制完整路径。".into());
+        app.action_notice = Some("已放回原处。".into());
         frame(&mut app, &ctx);
         assert_eq!(app.canvas_rect, rect);
     }
@@ -2322,51 +2249,6 @@ mod tests {
             .iter()
             .find_map(|clipped| find(&clipped.shape, text).map(|shape| (shape, clipped.clip_rect)))
             .expect("complete text must be painted")
-    }
-
-    #[test]
-    fn selected_paths_are_truncated_within_the_toolbar() {
-        let ctx = egui::Context::default();
-        configure(&ctx);
-        let paths = [
-            "/Users/Corwin/Library/Application Support/Google/Chrome/Default/Service Worker/CacheStorage/https_www.example.com_0/8b92f63e36ca904bce67a92cdb6ac9ea/8b3bb59860c2cf7266ab9f7b0e4fd756ad86ef8f6fc59e3640b57849fb103c7a".to_owned(),
-            format!("/Users/Corwin/Downloads/{}", "a".repeat(255)),
-        ];
-        for size in [Vec2::new(1180.0, 780.0), Vec2::new(860.0, 560.0)] {
-            for path in &paths {
-                let mut data = snapshot();
-                data.files[0].path = path.into();
-                data.files[0].parent = data.files[0].path.parent().unwrap().into();
-                let mut app = App::default();
-                app.access = permission::Access::Granted;
-                app.recoveries_loaded = true;
-                app.data = Some(Arc::new(data));
-                app.selected = Some(0);
-                let mut last = None;
-                for _ in 0..5 {
-                    last = Some(ctx.run(
-                        egui::RawInput {
-                            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)),
-                            ..Default::default()
-                        },
-                        |ctx| app.ui(ctx),
-                    ));
-                }
-                let (shape, clip) =
-                    text_shape(last.as_ref().unwrap(), &format!("{}  {}", bytes(0), path));
-                assert!(shape.galley.elided);
-                assert_eq!(shape.galley.rows.len(), 1);
-                let rect = shape.galley.rect.translate(shape.pos.to_vec2());
-                assert!(
-                    rect.left() >= clip.left() - 1.0 && rect.right() <= clip.right() + 1.0,
-                    "path escaped horizontal bounds: {rect:?} / {clip:?}"
-                );
-                assert!(
-                    rect.bottom() <= clip.bottom() + 1.0,
-                    "realistic path should be fully visible: {rect:?} / {clip:?}"
-                );
-            }
-        }
     }
 
     #[test]
