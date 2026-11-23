@@ -23,18 +23,6 @@ pub fn move_target_to_trash(
     expected: FileIdentity,
     kind: TargetKind,
 ) -> Result<Option<FileEntry>, String> {
-    move_target_to_trash_guarded(path, expected, kind, || Ok(()))
-}
-
-/// Run the caller's boundary check again immediately before dispatching the
-/// system operation, including after any interactive authorization prompt.
-pub fn move_target_to_trash_guarded(
-    path: &Path,
-    expected: FileIdentity,
-    kind: TargetKind,
-    guard: impl Fn() -> Result<(), String>,
-) -> Result<Option<FileEntry>, String> {
-    guard()?;
     if already_in_trash(path) {
         return Err(if cfg!(windows) {
             "文件已在回收站中，请在系统回收站中还原；不会再次删除。"
@@ -56,7 +44,7 @@ pub fn move_target_to_trash_guarded(
         _ => {}
     }
     verify_target(path, expected, kind)?;
-    native_trash(path, expected, kind, &guard)
+    native_trash(path, expected, kind)
 }
 
 /// Whether a scanned file may be offered as a trash action.
@@ -155,7 +143,6 @@ fn native_trash(
     path: &Path,
     expected: FileIdentity,
     kind: TargetKind,
-    guard: &dyn Fn() -> Result<(), String>,
 ) -> Result<Option<FileEntry>, String> {
     let home = home_directory()?;
     let home_meta =
@@ -166,19 +153,6 @@ fn native_trash(
     // Only request consent for an explicit user action and recheck identity
     // immediately before asking Finder to perform its recoverable delete.
     finder::permission(true)?;
-    verify_before_dispatch(path, expected, kind, guard)?;
-    finder::trash(path)
-        .map(|()| None)
-        .map_err(|error| error.message)
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn verify_before_dispatch(
-    path: &Path,
-    expected: FileIdentity,
-    kind: TargetKind,
-    guard: &dyn Fn() -> Result<(), String>,
-) -> Result<(), String> {
     verify_target(path, expected, kind)?;
     if !can_move_target(
         &fs::canonicalize(path).map_err(|_| "无法确认文件位置，请重新扫描后重试。")?,
@@ -186,7 +160,9 @@ pub(crate) fn verify_before_dispatch(
     ) {
         return Err("系统文件夹中的内容不能移到废纸篓。".into());
     }
-    guard()
+    finder::trash(path)
+        .map(|()| None)
+        .map_err(|error| error.message)
 }
 
 #[cfg(windows)]
@@ -194,9 +170,7 @@ fn native_trash(
     path: &Path,
     expected: FileIdentity,
     kind: TargetKind,
-    guard: &dyn Fn() -> Result<(), String>,
 ) -> Result<Option<FileEntry>, String> {
-    guard()?;
     windows::move_to_trash(path, expected, kind)
 }
 
@@ -205,7 +179,6 @@ fn native_trash(
     _path: &Path,
     _expected: FileIdentity,
     _kind: TargetKind,
-    _guard: &dyn Fn() -> Result<(), String>,
 ) -> Result<Option<FileEntry>, String> {
     Err("当前系统不支持安全的回收站操作。".into())
 }

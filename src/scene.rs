@@ -163,7 +163,11 @@ impl SceneTree {
     }
 
     pub fn from_scan(result: ScanResult) -> Self {
-        let real_root = std::fs::canonicalize(&result.root).unwrap_or_else(|_| result.root.clone());
+        let real_root = if result.root == Path::new(crate::demo::VIRTUAL_ROOT) {
+            result.root.clone()
+        } else {
+            std::fs::canonicalize(&result.root).unwrap_or_else(|_| result.root.clone())
+        };
         let root_fact = result
             .directories
             .iter()
@@ -171,10 +175,14 @@ impl SceneTree {
             .cloned();
         let root_identity = root_fact.as_ref().map_or_else(
             || {
-                std::fs::symlink_metadata(&result.root)
-                    .ok()
-                    .and_then(|m| FileIdentity::from_path(&result.root, &m).ok())
-                    .unwrap_or_default()
+                if result.root == Path::new(crate::demo::VIRTUAL_ROOT) {
+                    FileIdentity::default()
+                } else {
+                    std::fs::symlink_metadata(&result.root)
+                        .ok()
+                        .and_then(|m| FileIdentity::from_path(&result.root, &m).ok())
+                        .unwrap_or_default()
+                }
             },
             |f| f.identity,
         );
@@ -700,6 +708,116 @@ impl SceneTree {
         }
 
         Some(dirty)
+    }
+
+    /// Apply an in-memory virtual mutation for Demo animation testing.
+    pub fn apply_demo_action(
+        &mut self,
+        action: crate::demo::DemoAction,
+        seed: u64,
+        mode: ViewMode,
+    ) -> Vec<usize> {
+        let live_dirs: Vec<usize> = self
+            .dirs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| d.as_ref().map(|_| i))
+            .collect();
+        if live_dirs.is_empty() {
+            return Vec::new();
+        }
+        match action {
+            crate::demo::DemoAction::AddFile => {
+                // Pick a non-root directory if available so local subtree motion is visible.
+                let candidates: Vec<usize> =
+                    live_dirs.iter().copied().filter(|&i| i != 0).collect();
+                let pool = if candidates.is_empty() {
+                    &live_dirs
+                } else {
+                    &candidates
+                };
+                let dir_idx = pool[(seed as usize) % pool.len()];
+                let id = self.alloc_id(dir_idx);
+                let size = (8 + (seed.wrapping_mul(37) % 160)) * 1024 * 1024;
+                let name =
+                    std::ffi::OsString::from(format!("新增文件-{seed:04}.dat")).into_boxed_os_str();
+                if let Some(dir) = self.dirs[dir_idx].as_mut() {
+                    dir.files.push(FileNode {
+                        id,
+                        name,
+                        size,
+                        identity: FileIdentity {
+                            device: 0xDE00_0001,
+                            inode: (1_000_000 + seed).into(),
+                        },
+                        can_trash: true,
+                    });
+                }
+                self.recompute_upwards(dir_idx);
+                vec![dir_idx]
+            }
+            crate::demo::DemoAction::ResizeRandom => {
+                let with_files: Vec<usize> = live_dirs
+                    .iter()
+                    .copied()
+                    .filter(|&i| self.dirs[i].as_ref().is_some_and(|d| !d.files.is_empty()))
+                    .collect();
+                if with_files.is_empty() {
+                    return Vec::new();
+                }
+                let dir_idx = with_files[(seed as usize) % with_files.len()];
+                if let Some(dir) = self.dirs[dir_idx].as_mut() {
+                    let f_idx = (seed.wrapping_mul(17) as usize) % dir.files.len();
+                    let file = &mut dir.files[f_idx];
+                    if seed % 2 == 0 {
+                        file.size = file.size.saturating_mul(5).min(512 * 1024 * 1024);
+                    } else {
+                        file.size = (file.size / 5).max(256 * 1024);
+                    }
+                }
+                self.recompute_upwards(dir_idx);
+                vec![dir_idx]
+            }
+            crate::demo::DemoAction::DeleteRandom => {
+                // In Hybrid/Folders mode, alternate deleting leaf folders and files.
+                if mode != ViewMode::Files && seed % 2 == 0 {
+                    let folders: Vec<PathBuf> = live_dirs
+                        .iter()
+                        .filter_map(|&i| {
+                            if i == 0 {
+                                return None;
+                            }
+                            let d = self.dirs[i].as_ref()?;
+                            (d.total_files > 0 && d.is_leaf).then(|| d.path.clone())
+                        })
+                        .collect();
+                    if !folders.is_empty() {
+                        let target = &folders[(seed as usize) % folders.len()];
+                        return self.remove_directory(target, FileIdentity::default());
+                    }
+                }
+                let with_files: Vec<usize> = live_dirs
+                    .iter()
+                    .copied()
+                    .filter(|&i| self.dirs[i].as_ref().is_some_and(|d| !d.files.is_empty()))
+                    .collect();
+                if with_files.is_empty() {
+                    return Vec::new();
+                }
+                let dir_idx = with_files[(seed as usize) % with_files.len()];
+                let target = self.dirs[dir_idx].as_ref().and_then(|d| {
+                    let f = d
+                        .files
+                        .get((seed.wrapping_mul(13) as usize) % d.files.len())?;
+                    Some((d.file_path(f), f.identity))
+                });
+                if let Some((path, id)) = target {
+                    self.remove_file(&path, id)
+                } else {
+                    Vec::new()
+                }
+            }
+        }
     }
 
     pub fn tile_info(&self, id: NodeId, mode: ViewMode, rect: Rect) -> Option<TileInfo> {

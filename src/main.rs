@@ -324,6 +324,7 @@ enum WorkerCmd {
         mode: ViewMode,
         bounds: treemap::Rect,
         physical_size: [usize; 2],
+        reconcile: bool,
     },
     SwitchMode {
         generation: u64,
@@ -344,6 +345,11 @@ enum WorkerCmd {
         generation: u64,
         path: PathBuf,
         identity: scan::FileIdentity,
+    },
+    DemoAction {
+        generation: u64,
+        action: demo::DemoAction,
+        seed: u64,
     },
     WatchEvents {
         generation: u64,
@@ -376,6 +382,9 @@ enum WorkerEvent {
         stats: SceneStats,
     },
     RootChanged {
+        generation: u64,
+    },
+    Idle {
         generation: u64,
     },
 }
@@ -411,6 +420,11 @@ impl SceneWorker {
                 elapsed: s.elapsed,
             };
 
+            let emit_idle = |generation: u64, evt_tx: &mpsc::Sender<WorkerEvent>| {
+                let _ = evt_tx.send(WorkerEvent::Idle { generation });
+                wake();
+            };
+
             let emit_dirty = |s: &scene::SceneTree,
                               l: &mut scene::LayoutTree,
                               dirty: &[usize],
@@ -418,6 +432,7 @@ impl SceneWorker {
                               phys: [usize; 2],
                               evt_tx: &mpsc::Sender<WorkerEvent>| {
                 if dirty.is_empty() {
+                    emit_idle(generation, evt_tx);
                     return;
                 }
                 let px = render::logical_pixel_size(l.bounds, phys);
@@ -425,6 +440,7 @@ impl SceneWorker {
                     return;
                 };
                 if diff.dirty_rects.is_empty() {
+                    emit_idle(generation, evt_tx);
                     return;
                 }
                 let Some(patches) =
@@ -452,12 +468,14 @@ impl SceneWorker {
                         mode,
                         bounds,
                         physical_size: phys,
+                        reconcile,
                     } => {
                         if worker_token.load(Ordering::Relaxed) != generation {
                             continue;
                         }
                         physical_size = render::capped_size(phys);
-                        let same_root = scene_tree.as_ref().is_some_and(|s| s.root == scan.root)
+                        let same_root = reconcile
+                            && scene_tree.as_ref().is_some_and(|s| s.root == scan.root)
                             && layout_tree
                                 .as_ref()
                                 .is_some_and(|l| l.mode == mode && l.bounds == bounds);
@@ -466,7 +484,8 @@ impl SceneWorker {
                                 && let Some(dirty) = s.reconcile_scan(scan)
                             {
                                 emit_dirty(s, l, &dirty, generation, physical_size, &evt_tx);
-                                continue;
+                            } else {
+                                emit_idle(generation, &evt_tx);
                             }
                             continue;
                         }
@@ -558,6 +577,7 @@ impl SceneWorker {
                         };
                         let next_size = render::capped_size(phys);
                         if next_size == physical_size {
+                            emit_idle(generation, &evt_tx);
                             continue;
                         }
                         physical_size = next_size;
@@ -600,6 +620,20 @@ impl SceneWorker {
                             continue;
                         };
                         let dirty = s.remove_directory(&path, identity);
+                        emit_dirty(s, l, &dirty, generation, physical_size, &evt_tx);
+                    }
+                    WorkerCmd::DemoAction {
+                        generation,
+                        action,
+                        seed,
+                    } => {
+                        if worker_token.load(Ordering::Relaxed) != generation {
+                            continue;
+                        }
+                        let (Some(s), Some(l)) = (scene_tree.as_mut(), layout_tree.as_mut()) else {
+                            continue;
+                        };
+                        let dirty = s.apply_demo_action(action, seed, l.mode);
                         emit_dirty(s, l, &dirty, generation, physical_size, &evt_tx);
                     }
                     WorkerCmd::WatchEvents { generation, events } => {
@@ -684,9 +718,7 @@ impl SceneWorker {
                             }
                         }
 
-                        if !all_dirty.is_empty()
-                            && worker_token.load(Ordering::Relaxed) == generation
-                        {
+                        if worker_token.load(Ordering::Relaxed) == generation {
                             emit_dirty(s, l, &all_dirty, generation, physical_size, &evt_tx);
                         }
                     }
@@ -767,10 +799,13 @@ struct TrashResult {
     result: Result<(), String>,
 }
 
+const DEMO_AUTO_INTERVAL: Duration = Duration::from_millis(650);
+
 struct App {
     demo: bool,
-    demo_root: Option<demo::DemoRoot>,
-    demo_rx: Option<mpsc::Receiver<Result<demo::DemoRoot, String>>>,
+    demo_seed: u64,
+    demo_auto: bool,
+    demo_next_tick: Option<Instant>,
     access: permission::Access,
     permission_rx: Option<mpsc::Receiver<permission::Access>>,
     pending_scan: bool,
@@ -800,8 +835,9 @@ impl Default for App {
     fn default() -> Self {
         Self {
             demo: false,
-            demo_root: None,
-            demo_rx: None,
+            demo_seed: 1,
+            demo_auto: false,
+            demo_next_tick: None,
             access: permission::Access::Unverified,
             permission_rx: None,
             pending_scan: false,
@@ -840,12 +876,7 @@ impl App {
 
     fn start(&mut self) {
         if self.demo {
-            self.access = permission::Access::Granted;
-            if self.demo_root.is_some() {
-                self.launch_scan();
-            } else {
-                self.prepare_demo();
-            }
+            self.reset_demo();
             return;
         }
         let (tx, rx) = mpsc::channel();
@@ -855,23 +886,55 @@ impl App {
         });
     }
 
-    fn prepare_demo(&mut self) {
-        if self.demo_rx.is_some() || self.trash_rx.is_some() {
-            return;
-        }
-        if let Some(job) = self.job.take() {
-            job.cancel.store(true, Ordering::Relaxed);
-            defer_drop(job);
-        }
+    fn reset_demo(&mut self) {
+        self.access = permission::Access::Granted;
         self.watcher = None;
         self.watch_rx = None;
         self.pending_watch_events.clear();
-        let (tx, rx) = mpsc::channel();
-        self.demo_rx = Some(rx);
+        self.selected = None;
+        self.demo_seed = 1;
+        self.demo_auto = false;
+        self.demo_next_tick = None;
         self.message = None;
-        std::thread::spawn(move || {
-            let _ = tx.send(demo::DemoRoot::create());
-        });
+        self.pending_scan_result = Some(demo::virtual_scan());
+    }
+
+    fn toggle_demo_auto(&mut self) {
+        self.demo_auto = !self.demo_auto;
+        self.demo_next_tick = self.demo_auto.then(Instant::now);
+    }
+
+    fn next_demo_auto_action(&self) -> demo::DemoAction {
+        let count = self.stats.as_ref().map_or(0, |s| s.total_files);
+        if count < 200 {
+            demo::DemoAction::AddFile
+        } else if count > 1400 {
+            demo::DemoAction::DeleteRandom
+        } else {
+            match self.demo_seed % 3 {
+                0 => demo::DemoAction::AddFile,
+                1 => demo::DemoAction::ResizeRandom,
+                _ => demo::DemoAction::DeleteRandom,
+            }
+        }
+    }
+
+    fn trigger_demo_action(&mut self, action: demo::DemoAction) {
+        let Some(generation) = self.ui_scene.as_ref().map(|s| s.generation) else {
+            return;
+        };
+        let seed = self.demo_seed;
+        self.demo_seed = self.demo_seed.wrapping_add(1);
+        if let Some(worker) = &self.worker
+            && worker.current_generation() == generation
+        {
+            let _ = worker.tx.send(WorkerCmd::DemoAction {
+                generation,
+                action,
+                seed,
+            });
+            self.worker_busy = true;
+        }
     }
 
     fn queue_permission_check(&mut self, rx: mpsc::Receiver<permission::Access>) {
@@ -892,6 +955,10 @@ impl App {
     }
 
     fn launch_scan(&mut self) {
+        if self.demo {
+            self.reset_demo();
+            return;
+        }
         if self.access != permission::Access::Granted {
             return;
         }
@@ -903,16 +970,8 @@ impl App {
         let progress = Arc::new(Mutex::new(scan::ScanProgress::default()));
         let (tx, rx) = mpsc::channel();
         let (c, stats) = (cancel.clone(), progress.clone());
-        let demo_root = self.demo_root.clone();
-        let is_demo = self.demo;
         std::thread::spawn(move || {
-            let result = if is_demo {
-                demo_root
-                    .ok_or_else(|| "演示目录尚未准备好。".to_owned())
-                    .and_then(|demo| demo.scan(c, stats))
-            } else {
-                platform::scan_root().and_then(|root| scan::scan(root, c, stats))
-            };
+            let result = platform::scan_root().and_then(|root| scan::scan(root, c, stats));
             let _ = tx.send(result);
         });
         self.job = Some(ScanJob {
@@ -928,6 +987,9 @@ impl App {
         self.watch_rx = None;
         self.pending_watch_events.clear();
         self.watch_flush_at = None;
+        if self.demo || root == Path::new(demo::VIRTUAL_ROOT) {
+            return;
+        }
         let (tx, rx) = mpsc::channel();
         let wake_ctx = ctx.clone();
         if let Some(w) = watcher::FsWatcher::start(
@@ -977,6 +1039,7 @@ impl App {
             mode,
             bounds,
             physical_size,
+            reconcile: same_root,
         });
         self.worker_busy = true;
     }
@@ -1011,10 +1074,7 @@ impl App {
     }
 
     fn trash_selected(&mut self, id: NodeId) {
-        if self.access != permission::Access::Granted
-            || self.trash_rx.is_some()
-            || (self.demo && self.demo_root.is_none())
-        {
+        if self.access != permission::Access::Granted || self.trash_rx.is_some() {
             return;
         }
         let Some((generation, tile)) = self
@@ -1024,6 +1084,29 @@ impl App {
         else {
             return;
         };
+        if self.demo {
+            // Pure in-memory removal for animation testing: zero disk or Trash I/O.
+            if let Some(worker) = &self.worker
+                && worker.current_generation() == generation
+            {
+                let cmd = if tile.is_folder {
+                    WorkerCmd::RemoveDirectory {
+                        generation,
+                        path: tile.path,
+                        identity: tile.identity,
+                    }
+                } else {
+                    WorkerCmd::RemoveFile {
+                        generation,
+                        path: tile.path,
+                        identity: tile.identity,
+                    }
+                };
+                let _ = worker.tx.send(cmd);
+                self.worker_busy = true;
+            }
+            return;
+        }
         let target_kind = if tile.is_folder {
             file_actions::TargetKind::Directory
         } else {
@@ -1035,7 +1118,6 @@ impl App {
         let path = tile.path.clone();
         let identity = tile.identity;
         let is_folder = tile.is_folder;
-        let demo_root = self.demo_root.clone();
         let (tx, rx) = mpsc::channel();
         self.trash_rx = Some(rx);
         self.action_notice = None;
@@ -1045,14 +1127,8 @@ impl App {
             expires: None,
         });
         rayon::spawn(move || {
-            let result = if let Some(root) = demo_root.as_ref() {
-                file_actions::move_target_to_trash_guarded(&path, identity, target_kind, || {
-                    root.allow_target(&path)
-                })
-            } else {
-                file_actions::move_target_to_trash(&path, identity, target_kind)
-            }
-            .map(|_| ());
+            let result =
+                file_actions::move_target_to_trash(&path, identity, target_kind).map(|_| ());
             let _ = tx.send(TrashResult {
                 generation,
                 path,
@@ -1064,7 +1140,7 @@ impl App {
     }
 
     fn reveal(&mut self, id: NodeId) {
-        if self.reveal_rx.is_some() || (self.demo && self.demo_root.is_none()) {
+        if self.demo || self.reveal_rx.is_some() {
             return;
         }
         let Some(path) = self
@@ -1075,16 +1151,10 @@ impl App {
         else {
             return;
         };
-        let demo_root = self.demo_root.clone();
         let (tx, rx) = mpsc::channel();
         self.reveal_rx = Some(rx);
         std::thread::spawn(move || {
-            let result = if let Some(root) = demo_root.as_ref() {
-                root.allow_target(&path)
-                    .and_then(|()| platform::reveal(&path))
-            } else {
-                platform::reveal(&path)
-            };
+            let result = platform::reveal(&path);
             let _ = tx.send(result);
         });
     }
@@ -1132,24 +1202,6 @@ impl App {
     }
 
     fn poll(&mut self, ctx: &egui::Context) {
-        if let Some(rx) = &self.demo_rx {
-            match rx.try_recv() {
-                Ok(Ok(root)) => {
-                    self.demo_rx = None;
-                    self.demo_root = Some(root);
-                    self.launch_scan();
-                }
-                Ok(Err(error)) => {
-                    self.demo_rx = None;
-                    self.message = Some(error);
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.demo_rx = None;
-                    self.message = Some("无法创建演示数据，请重试。".into());
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
         if let Some(rx) = &self.permission_rx {
             match rx.try_recv() {
                 Ok(access) => {
@@ -1382,7 +1434,13 @@ impl App {
                     }
                     WorkerEvent::RootChanged { generation } => {
                         if generation == worker.current_generation() {
+                            self.worker_busy = false;
                             need_rescan = true;
+                        }
+                    }
+                    WorkerEvent::Idle { generation } => {
+                        if generation == worker.current_generation() {
+                            self.worker_busy = false;
                         }
                     }
                 }
@@ -1393,6 +1451,18 @@ impl App {
         }
         if need_rescan && self.job.is_none() {
             self.launch_scan();
+        }
+        if self.demo
+            && self.demo_auto
+            && self.ui_scene.is_some()
+            && !self.worker_busy
+            && self
+                .demo_next_tick
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            let action = self.next_demo_auto_action();
+            self.trigger_demo_action(action);
+            self.demo_next_tick = Some(Instant::now() + DEMO_AUTO_INTERVAL);
         }
         if let Some(scene) = self.ui_scene.as_mut() {
             scene
@@ -1502,12 +1572,9 @@ impl App {
             .frame(egui::Frame::new().fill(PANEL).inner_margin(8.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let source_label = if self.demo {
-                        "演示目录"
-                    } else {
-                        "启动磁盘"
-                    };
-                    let status = if let Some(job) = &self.job {
+                    let status = if self.demo {
+                        "虚拟演示 · 零磁盘文件 · 可用顶部按钮或删除选中项测试动画".to_owned()
+                    } else if let Some(job) = &self.job {
                         let p = *job.progress.lock().unwrap_or_else(|e| e.into_inner());
                         format!(
                             "扫描中 · {} 个文件 · {} · 跳过 {} 项{}",
@@ -1527,12 +1594,12 @@ impl App {
                             ""
                         };
                         format!(
-                            "{source_label} · {:.1} 秒 · 跳过 {} 项{watch_tag}",
+                            "启动磁盘 · {:.1} 秒 · 跳过 {} 项{watch_tag}",
                             stats.elapsed.as_secs_f64(),
                             stats.skipped
                         )
                     } else {
-                        format!("{source_label} · 扫描已停止")
+                        "启动磁盘 · 扫描已停止".into()
                     };
                     ui.add(egui::Label::new(RichText::new(status).small().color(MUTED)).truncate());
                     if self.worker_busy {
@@ -1579,7 +1646,6 @@ impl App {
         if animating {
             ctx.request_repaint();
         } else if self.job.is_some()
-            || self.demo_rx.is_some()
             || self.reveal_rx.is_some()
             || self.trash_rx.is_some()
             || self.permission_rx.is_some()
@@ -1587,6 +1653,11 @@ impl App {
             || self.watch_flush_at.is_some()
         {
             ctx.request_repaint_after(Duration::from_millis(80));
+        } else if self.demo
+            && self.demo_auto
+            && let Some(deadline) = self.demo_next_tick
+        {
+            ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
         }
     }
 
@@ -1652,6 +1723,7 @@ impl App {
         let mut reveal = None;
         let mut trash = None;
         let mut next_mode = None;
+        let mut demo_action = None;
         egui::TopBottomPanel::top("toolbar")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(16.0))
             .show(ctx, |ui| {
@@ -1661,31 +1733,53 @@ impl App {
                 ui.spacing_mut().interact_size.y = control_height;
                 ui.horizontal(|ui| {
                     if self.demo {
-                        ui.label(RichText::new("演示模式").strong().color(ACCENT))
-                            .on_hover_text("演示文件使用稀疏空间，显示的是逻辑大小。");
+                        ui.label(RichText::new("虚拟演示").strong().color(ACCENT))
+                            .on_hover_text("纯内存模拟数据，不读写任何真实文件或废纸篓。");
+                        if ui.button("重置演示").clicked() {
+                            self.reset_demo();
+                        }
                         if ui
-                            .add_enabled(
-                                self.demo_rx.is_none() && self.trash_rx.is_none(),
-                                egui::Button::new("重置演示"),
-                            )
-                            .on_hover_text("创建新的演示数据；原有数据和废纸篓内容不会自动删除。")
+                            .add_enabled(self.ui_scene.is_some(), egui::Button::new("随机新增"))
                             .clicked()
                         {
-                            self.prepare_demo();
+                            demo_action = Some(demo::DemoAction::AddFile);
                         }
-                    }
-                    if ui
-                        .add_enabled(self.job.is_none(), egui::Button::new("重新扫描"))
-                        .clicked()
-                    {
-                        self.start();
-                    }
-                    if ui
-                        .add_enabled(self.job.is_some(), egui::Button::new("取消扫描"))
-                        .clicked()
-                    {
-                        if let Some(job) = &self.job {
-                            job.cancel.store(true, Ordering::Relaxed);
+                        if ui
+                            .add_enabled(self.ui_scene.is_some(), egui::Button::new("随机改大小"))
+                            .clicked()
+                        {
+                            demo_action = Some(demo::DemoAction::ResizeRandom);
+                        }
+                        if ui
+                            .add_enabled(self.ui_scene.is_some(), egui::Button::new("随机删除"))
+                            .clicked()
+                        {
+                            demo_action = Some(demo::DemoAction::DeleteRandom);
+                        }
+                        if ui
+                            .add_enabled(
+                                self.ui_scene.is_some(),
+                                egui::Button::selectable(self.demo_auto, "自动演示"),
+                            )
+                            .on_hover_text("定时自动触发新增、改大小与删除以持续观察动画")
+                            .clicked()
+                        {
+                            self.toggle_demo_auto();
+                        }
+                    } else {
+                        if ui
+                            .add_enabled(self.job.is_none(), egui::Button::new("重新扫描"))
+                            .clicked()
+                        {
+                            self.start();
+                        }
+                        if ui
+                            .add_enabled(self.job.is_some(), egui::Button::new("取消扫描"))
+                            .clicked()
+                        {
+                            if let Some(job) = &self.job {
+                                job.cancel.store(true, Ordering::Relaxed);
+                            }
                         }
                     }
                     if ui
@@ -1709,31 +1803,38 @@ impl App {
                     }
 
                     let selected = self.selected_tile().cloned();
-                    if ui
-                        .add_enabled(
-                            selected.is_some() && self.reveal_rx.is_none(),
-                            egui::Button::new(platform::REVEAL_LABEL),
-                        )
-                        .clicked()
+                    if !self.demo
+                        && ui
+                            .add_enabled(
+                                selected.is_some() && self.reveal_rx.is_none(),
+                                egui::Button::new(platform::REVEAL_LABEL),
+                            )
+                            .clicked()
                     {
                         reveal = selected.as_ref().map(|t| t.id);
                     }
-                    let can_show_trash = selected.as_ref().is_none_or(|t| {
-                        t.can_trash
-                            && file_actions::can_move_target(
-                                &t.path,
-                                if t.is_folder {
-                                    file_actions::TargetKind::Directory
-                                } else {
-                                    file_actions::TargetKind::File
-                                },
-                            )
-                    });
+                    let can_show_trash = self.demo
+                        || selected.as_ref().is_none_or(|t| {
+                            t.can_trash
+                                && file_actions::can_move_target(
+                                    &t.path,
+                                    if t.is_folder {
+                                        file_actions::TargetKind::Directory
+                                    } else {
+                                        file_actions::TargetKind::File
+                                    },
+                                )
+                        });
+                    let delete_label = if self.demo {
+                        "删除选中项".to_owned()
+                    } else {
+                        format!("移到{}", platform::TRASH_NAME)
+                    };
                     if can_show_trash
                         && ui
                             .add_enabled(
                                 selected.is_some() && self.trash_rx.is_none(),
-                                egui::Button::new(format!("移到{}", platform::TRASH_NAME)),
+                                egui::Button::new(delete_label),
                             )
                             .clicked()
                     {
@@ -1761,19 +1862,14 @@ impl App {
                     self.canvas_rect = Some(ui.max_rect());
                     ui.vertical_centered(|ui| {
                         ui.add_space((ui.available_height() * 0.32).max(32.0));
-                        let heading = if self.demo_rx.is_some() {
-                            "正在准备演示…"
-                        } else if self.job.is_some() {
+                        let heading = if self.job.is_some() {
                             "扫描中…"
                         } else {
                             "扫描已停止"
                         };
                         ui.label(RichText::new(heading).size(30.0).strong());
                         ui.add_space(20.0);
-                        if self.job.is_none()
-                            && self.demo_rx.is_none()
-                            && ui.button("重新扫描").clicked()
-                        {
+                        if self.job.is_none() && ui.button("重新扫描").clicked() {
                             self.start();
                         }
                     });
@@ -1890,6 +1986,9 @@ impl App {
                 }
             });
 
+        if let Some(action) = demo_action {
+            self.trigger_demo_action(action);
+        }
         if let Some(id) = reveal {
             self.reveal(id);
         }
@@ -2368,5 +2467,54 @@ mod tests {
 
         assert_eq!(total_files, 2, "expected live FSEvents update to add file");
         assert_eq!(tex_after, tex_before, "expected incremental texture patch");
+    }
+
+    #[test]
+    fn virtual_demo_animates_in_memory_without_disk_or_trash() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        app.demo = true;
+        app.start();
+        settle(&mut app, &ctx);
+
+        assert!(app.watcher.is_none());
+        let initial_files = app.stats.as_ref().unwrap().total_files;
+        let tex_id = app.ui_scene.as_ref().unwrap().texture.id();
+        assert!(initial_files > 800);
+
+        // Delete a selected tile in Demo -> instant in-memory update, zero trash_rx!
+        let tile_id = *app.ui_scene.as_ref().unwrap().tiles.keys().next().unwrap();
+        app.trash_selected(tile_id);
+        assert!(app.trash_rx.is_none());
+        settle(&mut app, &ctx);
+        assert!(app.stats.as_ref().unwrap().total_files < initial_files);
+        assert_eq!(app.ui_scene.as_ref().unwrap().texture.id(), tex_id);
+        assert!(!app.ui_scene.as_ref().unwrap().transitions.is_empty());
+
+        // AddFile and ResizeRandom work in-memory on the same texture.
+        let count_after_del = app.stats.as_ref().unwrap().total_files;
+        app.trigger_demo_action(demo::DemoAction::AddFile);
+        settle(&mut app, &ctx);
+        assert_eq!(app.stats.as_ref().unwrap().total_files, count_after_del + 1);
+        assert_eq!(app.ui_scene.as_ref().unwrap().texture.id(), tex_id);
+
+        app.trigger_demo_action(demo::DemoAction::ResizeRandom);
+        settle(&mut app, &ctx);
+        assert_eq!(app.ui_scene.as_ref().unwrap().texture.id(), tex_id);
+
+        app.trigger_demo_action(demo::DemoAction::DeleteRandom);
+        settle(&mut app, &ctx);
+        assert!(app.stats.as_ref().unwrap().total_files <= count_after_del);
+        assert_eq!(app.ui_scene.as_ref().unwrap().texture.id(), tex_id);
+
+        // Reset animates back to initial count on the same texture, and a no-op reset settles cleanly.
+        app.reset_demo();
+        settle(&mut app, &ctx);
+        assert_eq!(app.stats.as_ref().unwrap().total_files, initial_files);
+        assert_eq!(app.ui_scene.as_ref().unwrap().texture.id(), tex_id);
+        app.reset_demo();
+        settle(&mut app, &ctx);
+        assert_eq!(app.stats.as_ref().unwrap().total_files, initial_files);
     }
 }
