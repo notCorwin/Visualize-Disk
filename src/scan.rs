@@ -82,6 +82,7 @@ pub struct DirectoryFact {
     pub path: PathBuf,
     pub identity: FileIdentity,
     pub enumeration_complete: bool,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub has_subdirectories: bool,
     /// The directory was positively excluded (for example by Trash policy),
     /// rather than merely unavailable or incompletely enumerated.
@@ -193,12 +194,16 @@ fn scan_impl(
         Ok(false) => {}
         Err(()) => return Err("无法确认扫描位置是否位于废纸篓，请检查磁盘和访问权限。".into()),
     }
+    #[cfg(target_os = "macos")]
+    let known_trash_ids = macos::volume_trash_identities(&real_root);
     let traversal = Traversal {
         root: &root,
         real_root: &real_root,
         root_device: root_identity.device,
         startup_disk: cfg!(target_os = "macos") && root == Path::new("/"),
         excluded_trash,
+        #[cfg(target_os = "macos")]
+        known_trash_ids,
         cancel: &cancel,
         progress: &progress,
         state: Mutex::new(TraversalState::default()),
@@ -315,6 +320,8 @@ struct Traversal<'a> {
     root_device: u64,
     startup_disk: bool,
     excluded_trash: Option<PathBuf>,
+    #[cfg(target_os = "macos")]
+    known_trash_ids: HashSet<FileIdentity>,
     cancel: &'a AtomicBool,
     progress: &'a Mutex<ScanProgress>,
     state: Mutex<TraversalState>,
@@ -328,13 +335,21 @@ impl Traversal<'_> {
             }
             #[cfg(target_os = "macos")]
             if directory.path != self.root {
-                let real_path = if self.root == self.real_root {
-                    directory.path.clone()
+                let relationship = if self.known_trash_ids.contains(&directory.identity) {
+                    Some(Ok(true))
+                } else if macos::is_trash_candidate(&directory.path) {
+                    let real_path = if self.root == self.real_root {
+                        directory.path.clone()
+                    } else {
+                        self.real_path(&directory.path)
+                    };
+                    Some(macos::trash_relationship(&real_path))
                 } else {
-                    self.real_path(&directory.path)
+                    None
                 };
-                let relationship = macos::trash_relationship(&real_path);
-                if self.skip_trash_or_unknown(&directory.path, relationship) {
+                if let Some(relationship) = relationship
+                    && self.skip_trash_or_unknown(&directory.path, relationship)
+                {
                     self.state
                         .lock()
                         .unwrap()
@@ -521,8 +536,141 @@ fn scan_directory(
     scan_directory_batches(directory, cancel, progress, || {})
 }
 
+/// Shallow snapshot of one directory returned by incremental rescanning.
+#[derive(Clone, Debug)]
+pub(crate) struct DirectorySnapshot {
+    pub identity: FileIdentity,
+    pub enumeration_complete: bool,
+    pub excluded: bool,
+    pub files: Vec<FileEntry>,
+    pub subdirs: Vec<(PathBuf, FileIdentity)>,
+}
+
+/// Rescan a single directory without recursing into children. Returns `Ok(None)`
+/// if the directory no longer exists or was replaced by a non-directory/symlink.
+pub(crate) fn scan_single_directory(
+    root: &Path,
+    real_root: &Path,
+    dir_path: &Path,
+    cancel: &AtomicBool,
+) -> Result<Option<DirectorySnapshot>, String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("扫描已取消。".into());
+    }
+    let metadata = match fs::symlink_metadata(dir_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Ok(None),
+    };
+    if !metadata.is_dir() || is_link_or_reparse(&metadata) {
+        return Ok(None);
+    }
+    let identity = match FileIdentity::from_path(dir_path, &metadata) {
+        Ok(id) => id,
+        Err(_) => return Ok(None),
+    };
+    let startup_disk = cfg!(target_os = "macos") && root == Path::new("/");
+    let real_path = if root == real_root {
+        dir_path.to_path_buf()
+    } else {
+        mapped_real_path(dir_path, root, real_root)
+    };
+    let excluded_trash = excluded_trash_path();
+    let is_excluded = excluded_trash.as_ref().is_some_and(|trash| {
+        is_excluded_trash(dir_path, trash)
+            || (root != real_root && is_excluded_trash(&real_path, trash))
+    }) || (startup_disk && excluded_from_startup_disk(dir_path))
+        || {
+            #[cfg(target_os = "macos")]
+            {
+                if dir_path != root && macos::is_trash_candidate(dir_path) {
+                    macos::trash_relationship(&real_path) != Ok(false)
+                } else {
+                    false
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                false
+            }
+        };
+    if is_excluded {
+        return Ok(Some(DirectorySnapshot {
+            identity,
+            enumeration_complete: false,
+            excluded: true,
+            files: Vec::new(),
+            subdirs: Vec::new(),
+        }));
+    }
+    let pending = PendingDirectory {
+        path: dir_path.to_path_buf(),
+        identity,
+    };
+    let progress = Mutex::new(ScanProgress::default());
+    let mut report = scan_directory(&pending, cancel, &progress);
+    if cancel.load(Ordering::Relaxed) {
+        return Err("扫描已取消。".into());
+    }
+    if report.unreadable.is_some() {
+        return Ok(Some(DirectorySnapshot {
+            identity,
+            enumeration_complete: false,
+            excluded: false,
+            files: Vec::new(),
+            subdirs: Vec::new(),
+        }));
+    }
+    let enumeration_complete = report.errors.is_empty() && !report.uncertain_entries;
+    let has_subdirectories = !report.directories.is_empty();
+    let parent_is_leaf = enumeration_complete && !has_subdirectories;
+    #[cfg(target_os = "macos")]
+    let parent_can_trash = crate::file_actions::can_move_to_trash(dir_path)
+        && (root == real_root || crate::file_actions::can_move_to_trash(&real_path));
+    for file in &mut report.files {
+        file.parent_identity = identity;
+        file.parent_is_leaf = parent_is_leaf;
+        #[cfg(target_os = "macos")]
+        let ordinary_child = ordinary_trash_child(&file.path, parent_can_trash);
+        #[cfg(not(target_os = "macos"))]
+        let ordinary_child = false;
+        file.can_trash = ordinary_child
+            || (crate::file_actions::can_move_to_trash(&file.path)
+                && (root == real_root
+                    || crate::file_actions::can_move_to_trash(&mapped_real_path(
+                        &file.path, root, real_root,
+                    ))));
+    }
+    let subdirs = report
+        .directories
+        .into_iter()
+        .filter(|child| {
+            let child_excluded = excluded_trash.as_ref().is_some_and(|trash| {
+                is_excluded_trash(&child.path, trash)
+                    || (root != real_root
+                        && is_excluded_trash(
+                            &mapped_real_path(&child.path, root, real_root),
+                            trash,
+                        ))
+            }) || (startup_disk
+                && (excluded_from_startup_disk(&child.path)
+                    || child.path == Path::new("/System/Volumes/Data")));
+            !child_excluded
+        })
+        .map(|child| (child.path, child.identity))
+        .collect();
+    Ok(Some(DirectorySnapshot {
+        identity,
+        enumeration_complete,
+        excluded: false,
+        files: report.files,
+        subdirs,
+    }))
+}
+
 /// Refresh just one directory after a child was removed. Identity is checked
 /// on both sides of enumeration so a replacement cannot supply new facts.
+#[cfg(test)]
 pub(crate) fn directory_fact_after_change(
     path: &Path,
     expected: FileIdentity,
@@ -894,7 +1042,7 @@ fn excluded_trash_path() -> Option<PathBuf> {
     }
 }
 
-fn excluded_from_startup_disk(path: &std::path::Path) -> bool {
+pub(crate) fn excluded_from_startup_disk(path: &std::path::Path) -> bool {
     // These are device or other-disk/network mount namespaces, not files on the
     // startup disk. Do not apply this policy when explicitly scanning a folder.
     let path = path.strip_prefix("/System/Volumes/Data").unwrap_or(path);
@@ -1071,6 +1219,8 @@ mod tests {
             root_device: 1,
             startup_disk: true,
             excluded_trash: None,
+            #[cfg(target_os = "macos")]
+            known_trash_ids: HashSet::new(),
             cancel: &cancel,
             progress: &progress,
             state: Mutex::default(),
@@ -1219,6 +1369,8 @@ mod tests {
             root_device: 1,
             startup_disk: true,
             excluded_trash: None,
+            #[cfg(target_os = "macos")]
+            known_trash_ids: HashSet::new(),
             cancel: &cancel,
             progress: &progress,
             state: Mutex::new(TraversalState::default()),
@@ -1244,6 +1396,8 @@ mod tests {
             root_device: 1,
             startup_disk: true,
             excluded_trash: None,
+            #[cfg(target_os = "macos")]
+            known_trash_ids: HashSet::new(),
             cancel: &cancel,
             progress: &progress,
             state: Mutex::default(),

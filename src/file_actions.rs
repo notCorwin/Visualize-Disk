@@ -13,6 +13,7 @@ const REPLACED: &str = "文件已被替换，请重新扫描后重试。";
 mod windows;
 
 /// Use the native recoverable trash operation; never fall back to permanent deletion.
+#[cfg(test)]
 pub fn move_to_trash(path: &Path, expected: FileIdentity) -> Result<Option<FileEntry>, String> {
     move_target_to_trash(path, expected, TargetKind::File)
 }

@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Ask Foundation about each directory, not just its volume: a volume can
-/// contain several distinct trash directories. Called on scan workers only.
+/// Ask Foundation about a directory's relationship to Trash. Called once for
+/// the scan root and on candidate directories (never on every ordinary folder).
 pub(super) fn trash_relationship(path: &Path) -> Result<bool, ()> {
     use objc2::rc::autoreleasepool;
     use objc2_foundation::{
@@ -55,6 +55,65 @@ pub(super) fn trash_relationship(path: &Path) -> Result<bool, ()> {
             NSURLRelationship::Contains | NSURLRelationship::Same
         ))
     })
+}
+
+/// Resolve the active Trash directory identity for `root`'s volume once at scan
+/// start so known trash directories can be skipped without per-directory FFI.
+pub(super) fn volume_trash_identities(root: &Path) -> std::collections::HashSet<FileIdentity> {
+    use objc2::rc::autoreleasepool;
+    use objc2_foundation::{NSFileManager, NSSearchPathDirectory, NSSearchPathDomainMask, NSURL};
+    use std::ffi::CString;
+    use std::ptr::NonNull;
+
+    let mut ids = std::collections::HashSet::new();
+    let mut record = |path: &Path| {
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            ids.insert(FileIdentity::from_metadata(&meta));
+        }
+    };
+    if let Ok(home) = crate::file_actions::home_directory() {
+        record(&home.join(".Trash"));
+    }
+    autoreleasepool(|_| {
+        let Ok(bytes) = CString::new(root.as_os_str().as_bytes()) else {
+            return;
+        };
+        // SAFETY: bytes is a live, NUL-terminated filesystem path.
+        let url = unsafe {
+            NSURL::fileURLWithFileSystemRepresentation_isDirectory_relativeToURL(
+                NonNull::new(bytes.as_ptr().cast_mut()).unwrap(),
+                true,
+                None,
+            )
+        };
+        let trash_url = NSFileManager::defaultManager()
+            .URLForDirectory_inDomain_appropriateForURL_create_error(
+                NSSearchPathDirectory::TrashDirectory,
+                NSSearchPathDomainMask::UserDomainMask,
+                Some(&url),
+                false,
+            );
+        if let Ok(trash_url) = trash_url {
+            if let Some(ns_path) = trash_url.path() {
+                record(Path::new(&ns_path.to_string()));
+            }
+        }
+    });
+    ids
+}
+
+/// Fast name gate before invoking Foundation's `getRelationship`. All macOS
+/// local, volume, iCloud and FileProvider trash directories use these names,
+/// while ordinary folders with the same name are still verified via Foundation.
+pub(super) fn is_trash_candidate(path: &Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let bytes = name.as_bytes();
+    bytes.eq_ignore_ascii_case(b".trash")
+        || bytes.eq_ignore_ascii_case(b".trashes")
+        || bytes.eq_ignore_ascii_case(b"trash")
+        || bytes.eq_ignore_ascii_case(b"trashes")
 }
 
 // Darwin's <sys/attr.h>, <sys/stat.h>, and <sys/vnode.h>, respectively.
