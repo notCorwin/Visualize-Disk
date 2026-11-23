@@ -458,12 +458,20 @@ struct LayoutOutput {
     map: render::RenderMap,
     holes: Vec<treemap::Rect>,
     partitions: Option<Vec<directory_map::DirectoryPartition>>,
+    previous: Option<PreparedFrame>,
+}
+struct PreparedFrame {
+    texture: egui::TextureId,
+    revision: u64,
+    holes: Arc<Vec<treemap::Rect>>,
+    image: egui::ColorImage,
 }
 // One generation owns geometry, pixels and hit testing together. A resize may
 // stretch this entire cache while its replacement is prepared off-thread.
 struct MapCache {
     generation: u64,
     revision: u64,
+    frame_revision: u64,
     needs_rebuild: bool,
     key: LayoutKey,
     map: render::RenderMap,
@@ -475,18 +483,132 @@ struct MapCache {
     geometry: Option<Arc<incremental_geometry::IncrementalGeometry>>,
     recovery_projection: Option<Arc<sparse_projection::SparseProjection>>,
     transition: Option<MapTransition>,
+    full_transition: Option<FullFrameTransition>,
 }
 
+#[derive(Clone)]
 struct MapTransition {
     atlas: egui::TextureHandle,
     background: egui::TextureHandle,
+    previous: egui::TextureHandle,
     origin: [usize; 2],
     size: [usize; 2],
     started: f64,
     tiles: Vec<incremental_update::TransitionTile>,
 }
 
+// A retained frame contains no lookup table: it is displayed only, never hit
+// tested, after the authoritative snapshot or layout has been replaced.
+struct RetainedFrame {
+    texture: egui::TextureHandle,
+    revision: u64,
+    holes: Arc<Vec<treemap::Rect>>,
+    bounds: treemap::Rect,
+    map: render::RenderMap,
+    mode: ViewMode,
+}
+
+struct FullFrameTransition {
+    previous: RetainedFrame,
+    started: f64,
+}
+
 const TRANSITION_SECONDS: f64 = 0.24;
+
+// Bake old deletion masks off-thread before cross-fading a rebuilt frame.
+// The source geometry and ownership are immutable snapshots of the displayed
+// version; deleted entries are excluded before rasterization.
+fn prepare_previous_frame(
+    texture: egui::TextureId,
+    revision: u64,
+    holes: Arc<Vec<treemap::Rect>>,
+    map: render::RenderMap,
+    token: &AtomicU64,
+    generation: u64,
+) -> Option<PreparedFrame> {
+    if holes.is_empty() {
+        return None;
+    }
+    let mut entries = Vec::new();
+    for chunk in map.entries().chunks(4096) {
+        if token.load(Ordering::Relaxed) != generation {
+            return None;
+        }
+        entries.extend(
+            chunk
+                .iter()
+                .copied()
+                .filter(|entry| map.rect(entry.id).is_some()),
+        );
+    }
+    let size = map.physical_size();
+    let bounds = map.bounds;
+    let mut patch = render::raster_patch(
+        &entries,
+        map.platforms(),
+        bounds,
+        size,
+        [0, 0, size[0], size[1]],
+        token,
+        generation,
+    )?;
+    let sx = size[0] as f32 / bounds.w;
+    let sy = size[1] as f32 / bounds.h;
+    for (i, rect) in holes.iter().enumerate() {
+        if i % 1024 == 0 && token.load(Ordering::Relaxed) != generation {
+            return None;
+        }
+        let x0 = (((rect.x - bounds.x) * sx - 0.5).ceil().max(0.0) as usize).min(size[0]);
+        let y0 = (((rect.y - bounds.y) * sy - 0.5).ceil().max(0.0) as usize).min(size[1]);
+        let x1 =
+            ((((rect.x + rect.w) - bounds.x) * sx - 0.5).ceil().max(0.0) as usize).min(size[0]);
+        let y1 =
+            ((((rect.y + rect.h) - bounds.y) * sy - 0.5).ceil().max(0.0) as usize).min(size[1]);
+        patch.mask_background([x0, y0, x1, y1], BG);
+    }
+    Some(PreparedFrame {
+        texture,
+        revision,
+        holes,
+        image: patch.image,
+    })
+}
+
+fn paint_retained_frame(
+    painter: &egui::Painter,
+    canvas: Rect,
+    frame: &RetainedFrame,
+    opacity: f32,
+) {
+    let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    let tint = Color32::from_white_alpha((opacity.clamp(0.0, 1.0) * 255.0).round() as u8);
+    painter.image(frame.texture.id(), canvas, uv, tint);
+    let scale = Vec2::new(
+        canvas.width() / frame.bounds.w.max(f32::EPSILON),
+        canvas.height() / frame.bounds.h.max(f32::EPSILON),
+    );
+    let mut old_background = egui::Mesh::default();
+    for hole in frame.holes.iter() {
+        let area = Rect::from_min_size(
+            canvas.min
+                + Vec2::new(
+                    (hole.x - frame.bounds.x) * scale.x,
+                    (hole.y - frame.bounds.y) * scale.y,
+                ),
+            Vec2::new(hole.w * scale.x, hole.h * scale.y),
+        )
+        .intersect(canvas);
+        if !area.is_positive() {
+            continue;
+        }
+        // While waiting for the background bake, retain exactly the current
+        // displayed holes. Full-frame fades use the baked texture (no holes).
+        old_background.add_colored_rect(area, BG);
+    }
+    if !old_background.is_empty() {
+        painter.add(old_background);
+    }
+}
 
 fn totals_snapshot(
     data: &scan::ScanResult,
@@ -626,6 +748,8 @@ struct App {
     layout_key: Option<LayoutKey>,
     map_cache: Option<MapCache>,
     mode_caches: [Option<MapCache>; 3],
+    retained_frame: Option<RetainedFrame>,
+    retained_empty_since: Option<f64>,
 }
 impl Default for App {
     fn default() -> Self {
@@ -675,6 +799,8 @@ impl Default for App {
             layout_key: None,
             map_cache: None,
             mode_caches: [None, None, None],
+            retained_frame: None,
+            retained_empty_since: None,
         }
     }
 }
@@ -761,6 +887,7 @@ impl App {
         self.message = None;
     }
     fn replace_snapshot(&mut self, data: scan::ScanResult) {
+        self.retain_visible_frame();
         if let Some(old) = self.coordinator.take() {
             defer_drop(old);
         }
@@ -1093,7 +1220,23 @@ impl App {
             }
         }
         self.poll_coordinator(ctx);
-        if let Some(rx) = &self.projection_rx {
+        // Coordinator may publish a new animation during this poll. Evaluate
+        // after it runs so no later worker replaces that just-published frame.
+        let animation_active = self.map_cache.as_ref().is_some_and(|cache| {
+            let now = ctx.input(|input| input.time);
+            cache
+                .transition
+                .as_ref()
+                .is_some_and(|t| now - t.started < TRANSITION_SECONDS)
+                || cache
+                    .full_transition
+                    .as_ref()
+                    .is_some_and(|t| now - t.started < TRANSITION_SECONDS)
+        });
+        if animation_active {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+        if !animation_active && let Some(rx) = &self.projection_rx {
             match rx.try_recv() {
                 Ok(output) => {
                     self.projection_rx = None;
@@ -1134,6 +1277,7 @@ impl App {
                                 if let Some(cache) = cache {
                                     defer_drop(std::mem::replace(&mut cache.map, map));
                                     defer_drop(std::mem::replace(&mut cache.holes, holes));
+                                    cache.frame_revision = cache.frame_revision.wrapping_add(1);
                                     cache.recovery_projection = cache.projection.take();
                                     cache.needs_rebuild =
                                         cache.partitions.is_none() && cache.geometry.is_none();
@@ -1218,7 +1362,7 @@ impl App {
                 _ => {}
             }
         }
-        if let Some(job) = &self.job {
+        if !animation_active && let Some(job) = &self.job {
             match job.rx.try_recv() {
                 Ok(result) => {
                     let cancelled = job.cancel.load(Ordering::Relaxed);
@@ -1311,7 +1455,7 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        if let Some(rx) = &self.layout_rx {
+        if !animation_active && let Some(rx) = &self.layout_rx {
             match rx.try_recv() {
                 Ok(mut output) => {
                     self.layout_rx = None;
@@ -1319,9 +1463,43 @@ impl App {
                         && self.layout_key == Some(output.key)
                     {
                         if let Some(image) = output.map.image.take() {
+                            // The old displayed raster stays alive until the new
+                            // authoritative geometry, ownership and pixels arrive.
+                            self.retain_visible_frame();
+                            let mut previous =
+                                self.retained_frame.take().filter(|f| f.mode == self.mode);
+                            if let Some(frame) = &mut previous
+                                && !frame.holes.is_empty()
+                            {
+                                if let Some(baked) = output.previous.take().filter(|b| {
+                                    b.texture == frame.texture.id()
+                                        && b.revision == frame.revision
+                                        && Arc::ptr_eq(&b.holes, &frame.holes)
+                                }) {
+                                    frame.texture = ctx.load_texture(
+                                        "transition-full-previous",
+                                        baked.image,
+                                        egui::TextureOptions::NEAREST,
+                                    );
+                                    frame.holes = Arc::default();
+                                } else {
+                                    // Rebuild from the latest displayed frame rather
+                                    // than publishing a stale bake or dropping motion.
+                                    self.retained_frame = previous;
+                                    self.layout_generation.fetch_add(1, Ordering::Relaxed);
+                                    defer_drop(image);
+                                    defer_drop(output);
+                                    ctx.request_repaint();
+                                    return;
+                                }
+                            }
+                            if previous.is_some() {
+                                self.selected = None;
+                            }
                             let cache = MapCache {
                                 generation: output.generation,
                                 revision: output.generation,
+                                frame_revision: 0,
                                 needs_rebuild: false,
                                 key: output.key,
                                 map: output.map,
@@ -1336,6 +1514,10 @@ impl App {
                                 geometry: None,
                                 recovery_projection: None,
                                 transition: None,
+                                full_transition: previous.map(|previous| FullFrameTransition {
+                                    previous,
+                                    started: ctx.input(|input| input.time),
+                                }),
                             };
                             if let Some(old) = self.map_cache.replace(cache) {
                                 defer_drop(old);
@@ -1357,13 +1539,17 @@ impl App {
         // Let the previous animation reach that geometry before publishing it,
         // so a rapid second deletion cannot jump back to a later rectangle.
         if self.coordinator_update_pending
-            && self
-                .map_cache
-                .as_ref()
-                .and_then(|cache| cache.transition.as_ref())
-                .is_some_and(|transition| {
-                    ctx.input(|input| input.time) - transition.started < TRANSITION_SECONDS
-                })
+            && self.map_cache.as_ref().is_some_and(|cache| {
+                let now = ctx.input(|input| input.time);
+                cache
+                    .transition
+                    .as_ref()
+                    .is_some_and(|t| now - t.started < TRANSITION_SECONDS)
+                    || cache
+                        .full_transition
+                        .as_ref()
+                        .is_some_and(|t| now - t.started < TRANSITION_SECONDS)
+            })
         {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
             return;
@@ -1484,6 +1670,11 @@ impl App {
                                             transition.background,
                                             egui::TextureOptions::NEAREST,
                                         ),
+                                        previous: ctx.load_texture(
+                                            "transition-previous",
+                                            transition.previous,
+                                            egui::TextureOptions::NEAREST,
+                                        ),
                                         origin: transition.origin,
                                         size,
                                         started: ctx.input(|input| input.time),
@@ -1502,6 +1693,7 @@ impl App {
                             }
                             defer_drop(std::mem::replace(&mut cache.map, view.map));
                             defer_drop(std::mem::replace(&mut cache.holes, view.holes));
+                            cache.frame_revision = cache.frame_revision.wrapping_add(1);
                             cache.projection = Some(view.projection);
                             cache.geometry = Some(view.geometry);
                         }
@@ -1782,6 +1974,7 @@ impl App {
         }
     }
     fn reset_layout(&mut self) {
+        self.retain_visible_frame();
         self.layout_generation.fetch_add(1, Ordering::Relaxed);
         self.layout_key = None;
         if let Some(rx) = self.layout_rx.take() {
@@ -1794,6 +1987,8 @@ impl App {
     }
     fn set_mode(&mut self, mode: ViewMode) {
         if self.mode != mode {
+            self.retained_frame = None;
+            self.retained_empty_since = None;
             let stale_target = self.scene_source_dirty
                 && self.mode_caches[mode.index()]
                     .as_ref()
@@ -1815,6 +2010,19 @@ impl App {
                 self.abandon_coordinator();
                 self.launch_scan();
             }
+        }
+    }
+    fn retain_visible_frame(&mut self) {
+        if let Some(cache) = self.map_cache.as_ref() {
+            self.retained_frame = Some(RetainedFrame {
+                texture: cache.texture.clone(),
+                revision: cache.frame_revision,
+                holes: cache.holes.clone(),
+                bounds: cache.map.bounds,
+                map: cache.map.snapshot_for_update(),
+                mode: self.mode,
+            });
+            self.retained_empty_since = None;
         }
     }
     fn view_data(&self) -> Option<&Arc<scan::ScanResult>> {
@@ -2065,6 +2273,31 @@ impl App {
         } else {
             None
         };
+        let old_frame = self
+            .map_cache
+            .as_ref()
+            .map(|cache| {
+                (
+                    cache.texture.id(),
+                    cache.frame_revision,
+                    cache.holes.clone(),
+                    cache.map.snapshot_for_update(),
+                )
+            })
+            .or_else(|| {
+                self.retained_frame
+                    .as_ref()
+                    .filter(|f| f.mode == self.mode)
+                    .map(|f| {
+                        (
+                            f.texture.id(),
+                            f.revision,
+                            f.holes.clone(),
+                            f.map.snapshot_for_update(),
+                        )
+                    })
+            })
+            .filter(|(_, _, holes, _)| !holes.is_empty());
         let (tx, rx) = mpsc::channel();
         self.layout_rx = Some(rx);
         let ctx = ctx.clone();
@@ -2083,12 +2316,21 @@ impl App {
                     }
                     _ => Vec::new(),
                 };
+                let previous = old_frame.and_then(|(texture, revision, holes, map)| {
+                    prepare_previous_frame(texture, revision, holes, map, &token, generation)
+                });
+                if token.load(Ordering::Relaxed) != generation {
+                    drop(tx);
+                    ctx.request_repaint();
+                    return;
+                }
                 let _ = tx.send(LayoutOutput {
                     generation,
                     key,
                     map,
                     holes,
                     partitions,
+                    previous,
                 });
             }
             drop(tx);
@@ -2453,8 +2695,16 @@ impl App {
         self.status_bar(ctx);
         if self.view_data().is_none() {
             egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(BG))
+                .frame(egui::Frame::new().fill(BG).inner_margin(12.0))
                 .show(ctx, |ui| {
+                    if let Some(frame) =
+                        self.retained_frame.as_ref().filter(|f| f.mode == self.mode)
+                    {
+                        let canvas = ui.max_rect();
+                        self.canvas_rect = Some(canvas);
+                        paint_retained_frame(ui.painter(), canvas, frame, 1.0);
+                        return;
+                    }
                     ui.centered_and_justified(|ui| {
                         ui.label(
                             if self.scene_source_dirty
@@ -2482,7 +2732,34 @@ impl App {
                         || self.view_data().unwrap().files.is_empty(),
                         |p| p.is_empty(),
                     );
-                if empty {
+                let now = ctx.input(|input| input.time);
+                let animating = self.map_cache.as_ref().is_some_and(|cache| {
+                    cache
+                        .transition
+                        .as_ref()
+                        .is_some_and(|t| now - t.started < TRANSITION_SECONDS)
+                        || cache
+                            .full_transition
+                            .as_ref()
+                            .is_some_and(|t| now - t.started < TRANSITION_SECONDS)
+                });
+                if empty && !animating {
+                    if let Some(frame) =
+                        self.retained_frame.as_ref().filter(|f| f.mode == self.mode)
+                    {
+                        let started = *self.retained_empty_since.get_or_insert(now);
+                        let t = ((now - started) / TRANSITION_SECONDS).clamp(0.0, 1.0) as f32;
+                        if t < 1.0 {
+                            let canvas = ui.max_rect();
+                            self.canvas_rect = Some(canvas);
+                            let eased = t * t * (3.0 - 2.0 * t);
+                            paint_retained_frame(ui.painter(), canvas, frame, 1.0 - eased);
+                            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                            return;
+                        }
+                        self.retained_frame = None;
+                        self.retained_empty_since = None;
+                    }
                     ui.centered_and_justified(|ui| {
                         ui.label(if self.scene_source_dirty && self.job.is_none() {
                             "视图尚未更新，请重新扫描。"
@@ -2554,6 +2831,12 @@ impl App {
                         let raw = ((now - transition.started) / TRANSITION_SECONDS).clamp(0.0, 1.0)
                             as f32;
                         let t = raw * raw * (3.0 - 2.0 * raw);
+                        painter.image(
+                            transition.previous.id(),
+                            area,
+                            Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            Color32::from_white_alpha(((1.0 - t) * 255.0).round() as u8),
+                        );
                         for tile in &transition.tiles {
                             let lerp = |a: f32, b: f32| a + (b - a) * t;
                             let from = tile.from;
@@ -2575,6 +2858,22 @@ impl App {
                             painter.image(transition.atlas.id(), dst, tile.uv, Color32::WHITE);
                         }
                         transition_area = Some(area);
+                        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                    }
+                    if cache
+                        .full_transition
+                        .as_ref()
+                        .is_some_and(|f| now - f.started >= TRANSITION_SECONDS)
+                    {
+                        cache.full_transition = None;
+                    }
+                    if let Some(fade) = &cache.full_transition {
+                        let t = ((now - fade.started) / TRANSITION_SECONDS).clamp(0.0, 1.0) as f32;
+                        let eased = t * t * (3.0 - 2.0 * t);
+                        paint_retained_frame(&painter, canvas, &fade.previous, 1.0 - eased);
+                        // The displayed old pixels no longer have a current
+                        // identity mapping. Disable hit testing until complete.
+                        transition_area = Some(canvas);
                         ctx.request_repaint_after(std::time::Duration::from_millis(16));
                     }
                     if let Some(p) = pointer {
@@ -2604,6 +2903,10 @@ impl App {
                             }
                         }
                     }
+                } else if let Some(frame) =
+                    self.retained_frame.as_ref().filter(|f| f.mode == self.mode)
+                {
+                    paint_retained_frame(&painter, canvas, frame, 1.0);
                 } else {
                     painter.text(
                         canvas.center(),
@@ -3089,6 +3392,16 @@ mod tests {
         assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), texture);
         assert!(app.view_file(0).is_none());
         assert!(app.view_file(1).is_some());
+        let second_base = app.coordinator_version.unwrap();
+        app.hide_file(2);
+        settle(&mut app, &ctx);
+        assert!(
+            !app.coordinator_disabled,
+            "second deletion must remain incremental"
+        );
+        assert!(app.coordinator_version.unwrap().scene_version > second_base.scene_version);
+        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), texture);
+        assert!(app.view_file(2).is_none());
     }
 
     #[test]
@@ -3615,6 +3928,7 @@ mod tests {
             map,
             holes: Vec::new(),
             partitions: None,
+            previous: None,
         })
         .unwrap();
         app.poll(&ctx);
@@ -3648,10 +3962,165 @@ mod tests {
             map,
             holes: Vec::new(),
             partitions: None,
+            previous: None,
         })
         .unwrap();
         app.poll(ctx);
     }
+    #[test]
+    fn fallback_bakes_holes_and_retries_if_displayed_revision_changed() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.mode = ViewMode::Files;
+        app.data = Some(Arc::new(snapshot()));
+        let key = LayoutKey::new(Vec2::new(300.0, 180.0), 1.0);
+        apply_test_map(&mut app, &ctx, key, 1);
+        let cache = app.map_cache.as_mut().unwrap();
+        let holes = cache.map.erase(1);
+        assert!(!holes.is_empty());
+        cache.holes = Arc::new(holes);
+        let old_texture = cache.texture.id();
+        let bake = prepare_previous_frame(
+            old_texture,
+            cache.frame_revision,
+            cache.holes.clone(),
+            cache.map.snapshot_for_update(),
+            &app.layout_generation,
+            1,
+        )
+        .unwrap();
+        assert!(bake.image.pixels.iter().any(|pixel| *pixel == BG));
+        // A patch can keep the same GPU texture and holes while changing its
+        // pixels. A bake of the preceding frame must be discarded and retried.
+        cache.frame_revision += 1;
+        app.layout_generation.store(2, Ordering::Relaxed);
+        app.layout_key = Some(key);
+        let map =
+            layout_snapshot(app.data.as_ref().unwrap(), key, &app.layout_generation, 2).unwrap();
+        let (tx, rx) = mpsc::channel();
+        app.layout_rx = Some(rx);
+        tx.send(LayoutOutput {
+            generation: 2,
+            key,
+            map,
+            holes: Vec::new(),
+            partitions: None,
+            previous: Some(bake),
+        })
+        .unwrap();
+        app.poll(&ctx);
+        assert_eq!(app.map_cache.as_ref().unwrap().texture.id(), old_texture);
+        assert_eq!(app.layout_generation.load(Ordering::Relaxed), 3);
+        assert!(app.retained_frame.is_some());
+        app.layout(key.logical_size, 1.0, &ctx);
+        let start = Instant::now();
+        while app.map_cache.as_ref().unwrap().texture.id() == old_texture {
+            app.poll(&ctx);
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::yield_now();
+        }
+        let fade = app
+            .map_cache
+            .as_ref()
+            .unwrap()
+            .full_transition
+            .as_ref()
+            .unwrap();
+        assert!(
+            fade.previous.holes.is_empty(),
+            "old holes must be baked before GPU fade"
+        );
+    }
+
+    #[test]
+    fn full_frame_fade_suppresses_stale_clicks_until_new_scene_is_visible() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        app.mode = ViewMode::Files;
+        app.access = permission::Access::Granted;
+        app.data = Some(Arc::new(snapshot()));
+        let key = LayoutKey::new(Vec2::new(300.0, 180.0), 1.0);
+        apply_test_map(&mut app, &ctx, key, 1);
+        apply_test_map(&mut app, &ctx, key, 2);
+        assert!(app.map_cache.as_ref().unwrap().full_transition.is_some());
+        let input = |time, events| egui::RawInput {
+            time: Some(time),
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(1180.0, 780.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input(0.01, vec![]), |ctx| app.ui(ctx));
+        let canvas = app.canvas_rect.unwrap();
+        let map = &app.map_cache.as_ref().unwrap().map;
+        let rect = map.rect(1).unwrap();
+        let pos = canvas.min
+            + Vec2::new(
+                (rect.x + rect.w * 0.5) * canvas.width() / map.bounds.w,
+                (rect.y + rect.h * 0.5) * canvas.height() / map.bounds.h,
+            );
+        for (time, pressed) in [(0.05, true), (0.08, false)] {
+            let events = vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ];
+            let _ = ctx.run(input(time, events), |ctx| app.ui(ctx));
+        }
+        assert!(
+            app.selected.is_none(),
+            "old visible pixels must not select a new scene entry"
+        );
+        let _ = ctx.run(input(0.35, vec![]), |ctx| app.ui(ctx));
+        assert!(app.map_cache.as_ref().unwrap().full_transition.is_none());
+    }
+
+    #[test]
+    fn projection_result_waits_for_visible_full_frame_transition() {
+        let ctx = egui::Context::default();
+        let mut app = App::default();
+        app.mode = ViewMode::Files;
+        app.data = Some(Arc::new(snapshot()));
+        let key = LayoutKey::new(Vec2::new(300.0, 180.0), 1.0);
+        apply_test_map(&mut app, &ctx, key, 1);
+        apply_test_map(&mut app, &ctx, key, 2);
+        let cache = app.map_cache.as_ref().unwrap();
+        assert!(cache.full_transition.is_some());
+        let mut map = cache.map.snapshot_for_update();
+        let holes = map.erase_many(&[1], &app.layout_generation, 2).unwrap();
+        let texture = cache.texture.id();
+        let (tx, rx) = mpsc::channel();
+        app.projection_rx = Some(rx);
+        app.projection_dirty = true;
+        tx.send(ProjectionDelta {
+            generation: app.folder_generation.load(Ordering::Relaxed),
+            folder: None,
+            hybrid: None,
+            maps: [Some((texture, map, Arc::new(holes))), None, None],
+        })
+        .unwrap();
+        let run = |time: f64, app: &mut App| {
+            let input = egui::RawInput {
+                time: Some(time),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| app.poll(ctx));
+        };
+        run(0.05, &mut app);
+        assert!(app.projection_rx.is_some());
+        assert!(app.map_cache.as_ref().unwrap().map.rect(1).is_some());
+        run(0.35, &mut app);
+        assert!(app.projection_rx.is_none());
+        assert!(app.map_cache.as_ref().unwrap().map.rect(1).is_none());
+    }
+
     #[test]
     fn resize_keeps_one_coherent_cache_and_discards_obsolete_completion() {
         let ctx = egui::Context::default();
@@ -3678,6 +4147,7 @@ mod tests {
             map: old_map,
             holes: Vec::new(),
             partitions: None,
+            previous: None,
         })
         .unwrap();
         app.poll(&ctx);
@@ -3808,8 +4278,20 @@ mod tests {
         settle(&mut app, &ctx);
         app.hide_file(1);
         settle(&mut app, &ctx);
+        // The worker publishes a baked copy of the displayed deletion holes.
+        // Finish the preceding transition before exercising the next resize.
+        app.map_cache.as_mut().unwrap().transition = None;
         let key = LayoutKey::new(Vec2::new(700.0, 400.0), 2.0);
         let generation = app.layout_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let cache = app.map_cache.as_ref().unwrap();
+        let previous = prepare_previous_frame(
+            cache.texture.id(),
+            cache.frame_revision,
+            cache.holes.clone(),
+            cache.map.snapshot_for_update(),
+            &app.layout_generation,
+            generation,
+        );
         let mut map = layout_snapshot(
             app.data.as_ref().unwrap(),
             key,
@@ -3829,6 +4311,7 @@ mod tests {
             map,
             holes,
             partitions: None,
+            previous,
         })
         .unwrap();
         app.poll(&ctx);

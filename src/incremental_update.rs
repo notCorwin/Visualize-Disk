@@ -26,10 +26,16 @@ pub struct Transition {
     pub origin: [usize; 2],
     pub atlas: eframe::egui::ColorImage,
     pub background: eframe::egui::ColorImage,
+    /// Previous scene without the independently moving tiles. During the
+    /// transition it fades over the new background, so tiles outside the
+    /// bounded sprite budget still get a smooth, deterministic transition.
+    pub previous: eframe::egui::ColorImage,
     pub tiles: Vec<TransitionTile>,
 }
 
+#[derive(Clone)]
 pub struct TransitionTile {
+    pub id: usize,
     pub from: crate::treemap::Rect,
     pub to: crate::treemap::Rect,
     pub uv: eframe::egui::Rect,
@@ -48,7 +54,6 @@ fn transition_atlas(
     let sx = full[0] as f32 / bounds.w;
     let sy = full[1] as f32 / bounds.h;
     let mut sources = Vec::new();
-    let mut area = 0usize;
     for &(id, from, to) in moves {
         let ax = (((from.x - bounds.x) * sx - 0.5).ceil().max(0.0) as usize).min(full[0]);
         let bx =
@@ -66,7 +71,7 @@ fn transition_atlas(
             if tx0 >= tx1 || ty0 >= ty1 {
                 continue;
             }
-            return None;
+            continue;
         }
         if ax < source.origin[0]
             || ay < source.origin[1]
@@ -75,42 +80,78 @@ fn transition_atlas(
         {
             // Subpixel tiles cannot provide an independent sprite. Publish the
             // correct final patch without animation instead.
-            return None;
-        }
-        area = area.checked_add((bx - ax + 2).checked_mul(by - ay + 2)?)?;
-        if area > 2_097_152 || sources.len() >= 512 {
-            return None;
+            continue;
         }
         sources.push((id, from, to, ax, ay, bx, by));
     }
-    let max_w = sources.iter().map(|s| s.5 - s.3 + 2).max()?;
-    let atlas_w = ((area as f64).sqrt().ceil() as usize).max(max_w).min(2048);
-    if max_w > atlas_w {
-        return None;
-    }
+    // Prefer the largest visible motion when the image contains more tiles
+    // than can be rendered cheaply. All remaining changes fade rather than
+    // disabling the entire transition. Sorting by area also makes selection
+    // independent of the source slot order.
+    sources.sort_unstable_by_key(|s| std::cmp::Reverse((s.5 - s.3).saturating_mul(s.6 - s.4)));
+    let (estimated_area, widest) =
+        sources
+            .iter()
+            .take(512)
+            .fold((0usize, 1usize), |(area, widest), item| {
+                let w = item.5 - item.3 + 2;
+                let h = item.6 - item.4 + 2;
+                if w > 2048 || h > 2048 || w.saturating_mul(h) > 2_097_152 {
+                    (area, widest)
+                } else {
+                    (
+                        area.saturating_add(w.saturating_mul(h)).min(2_097_152),
+                        widest.max(w),
+                    )
+                }
+            });
+    let atlas_w = ((estimated_area as f64).sqrt().ceil() as usize)
+        .max(widest)
+        .min(2048);
     let mut packed = Vec::new();
+    let mut selected = Vec::new();
     let (mut x, mut y, mut row) = (0usize, 0usize, 0usize);
-    for source in &sources {
-        let (w, h) = (source.5 - source.3 + 2, source.6 - source.4 + 2);
-        if x + w > atlas_w {
-            y = y.checked_add(row)?;
-            x = 0;
-            row = 0;
+    let mut area = 0usize;
+    for item in sources {
+        let (w, h) = (item.5 - item.3 + 2, item.6 - item.4 + 2);
+        let Some(next_area) = area.checked_add(w.checked_mul(h)?) else {
+            continue;
+        };
+        if w > atlas_w || h > 2048 || next_area > 2_097_152 || selected.len() >= 512 {
+            continue;
         }
-        if y.checked_add(h)? > 2048 {
-            return None;
+        let owned = (item.4..item.6).any(|py| {
+            (item.3..item.5).any(|px| {
+                source.owner_at(px - source.origin[0], py - source.origin[1]) == Some(item.0)
+            })
+        });
+        if !owned {
+            continue;
         }
-        packed.push((x + 1, y + 1));
-        x += w;
-        row = row.max(h);
+        let (mut next_x, mut next_y, mut next_row) = (x, y, row);
+        if next_x + w > atlas_w {
+            next_y = next_y.checked_add(next_row)?;
+            next_x = 0;
+            next_row = 0;
+        }
+        if next_y.checked_add(h)? > 2048 {
+            continue;
+        }
+        packed.push((next_x + 1, next_y + 1));
+        selected.push(item);
+        area = next_area;
+        x = next_x + w;
+        y = next_y;
+        row = next_row.max(h);
     }
-    let atlas_h = y.checked_add(row)?;
+    let atlas_h = y.checked_add(row)?.max(1);
+    let atlas_w = if selected.is_empty() { 1 } else { atlas_w };
     let mut atlas = ColorImage::new(
         [atlas_w, atlas_h],
         vec![Color32::TRANSPARENT; atlas_w.checked_mul(atlas_h)?],
     );
-    let mut tiles = Vec::with_capacity(sources.len());
-    for ((id, from, to, ax, ay, bx, by), (dx, dy)) in sources.into_iter().zip(packed) {
+    let mut tiles = Vec::with_capacity(selected.len());
+    for ((id, from, to, ax, ay, bx, by), (dx, dy)) in selected.into_iter().zip(packed) {
         for py in ay..by {
             for px in ax..bx {
                 let lx = px - source.origin[0];
@@ -142,12 +183,118 @@ fn transition_atlas(
             ),
         );
         tiles.push(TransitionTile {
+            id,
             from: aligned,
             to: target,
             uv,
         });
     }
     Some((atlas, tiles))
+}
+
+/// Build a bounded hybrid transition: important visible tiles move as
+/// independent sprites; the remaining scene fades to the new layout. Both
+/// layers use the same raster grid and the old/new scenes remain immutable.
+fn build_transition(
+    map: &RenderMap,
+    target: &RasterPatch,
+    old_holes: &[crate::treemap::Rect],
+    entries: &[RenderEntry],
+    platforms: &[render::Platform],
+    moves: &[(usize, crate::treemap::Rect, crate::treemap::Rect)],
+    region: [usize; 4],
+    token: &AtomicU64,
+    generation: u64,
+) -> Result<Transition, Error> {
+    let bounds = map.bounds;
+    let size = map.physical_size();
+    let old_entries: Vec<_> = map
+        .entries()
+        .iter()
+        .copied()
+        .filter(|entry| map.rect(entry.id).is_some())
+        .collect();
+    let mut source = render::raster_patch(
+        &old_entries,
+        map.platforms(),
+        bounds,
+        size,
+        region,
+        token,
+        generation,
+    )
+    .ok_or(Error::Cancelled)?;
+    mask_old_holes(&mut source, old_holes, bounds, size);
+    let (atlas, tiles) = transition_atlas(&source, moves, bounds, size).ok_or(Error::Rebuild)?;
+    let selected: std::collections::HashSet<_> = tiles.iter().map(|tile| tile.id).collect();
+    if selected.is_empty() {
+        return Ok(Transition {
+            origin: target.origin,
+            atlas,
+            background: target.image.clone(),
+            previous: source.image,
+            tiles,
+        });
+    }
+    drop(source);
+    let previous_entries: Vec<_> = old_entries
+        .into_iter()
+        .filter(|entry| !selected.contains(&entry.id))
+        .collect();
+    let background_entries: Vec<_> = entries
+        .iter()
+        .copied()
+        .filter(|entry| !selected.contains(&entry.id))
+        .collect();
+    let mut previous = render::raster_patch(
+        &previous_entries,
+        map.platforms(),
+        bounds,
+        size,
+        region,
+        token,
+        generation,
+    )
+    .ok_or(Error::Cancelled)?;
+    mask_old_holes(&mut previous, old_holes, bounds, size);
+    let background = render::raster_patch(
+        &background_entries,
+        platforms,
+        bounds,
+        size,
+        region,
+        token,
+        generation,
+    )
+    .ok_or(Error::Cancelled)?;
+    Ok(Transition {
+        origin: background.origin,
+        atlas,
+        background: background.image,
+        previous: previous.image,
+        tiles,
+    })
+}
+
+fn mask_old_holes(
+    patch: &mut RasterPatch,
+    holes: &[crate::treemap::Rect],
+    bounds: crate::treemap::Rect,
+    full: [usize; 2],
+) {
+    let [px, py] = patch.origin;
+    let [w, h] = patch.image.size;
+    for hole in holes {
+        let x0 = (((hole.x - bounds.x) / bounds.w * full[0] as f32).round() as isize)
+            .clamp(px as isize, (px + w) as isize) as usize;
+        let y0 = (((hole.y - bounds.y) / bounds.h * full[1] as f32).round() as isize)
+            .clamp(py as isize, (py + h) as isize) as usize;
+        let x1 = ((((hole.x + hole.w) - bounds.x) / bounds.w * full[0] as f32).round() as isize)
+            .clamp(px as isize, (px + w) as isize) as usize;
+        let y1 = ((((hole.y + hole.h) - bounds.y) / bounds.h * full[1] as f32).round() as isize)
+            .clamp(py as isize, (py + h) as isize) as usize;
+        patch.mask_background([x0 - px, y0 - py, x1 - px, y1 - py], crate::BG);
+    }
 }
 
 #[derive(Debug)]
@@ -383,60 +530,17 @@ pub fn prepare(
         generation,
     )
     .ok_or(Error::Cancelled)?;
-    // Rasterize the old tile pixels once in the worker, then mask by owner so
-    // an interpolated quad never carries its neighbours along with it. The
-    // target background excludes moving tiles and is also rendered only once.
-    let transition = if deltas.iter().all(|d| match (&d.before, &d.after) {
-        (Some(_), None) => true,
-        (Some(old), Some(new)) => {
-            old.id == new.id && old.parent == new.parent && new.size <= old.size
-        }
-        _ => false,
-    }) && !moves.is_empty()
-    {
-        let ids: std::collections::HashSet<_> = moves.iter().map(|m| m.0).collect();
-        let old_entries: Vec<_> = map
-            .entries()
-            .iter()
-            .copied()
-            .filter(|entry| map.rect(entry.id).is_some())
-            .collect();
-        let background_entries: Vec<_> = entries
-            .iter()
-            .copied()
-            .filter(|entry| !ids.contains(&entry.id))
-            .collect();
-        let source = render::raster_patch(
-            &old_entries,
-            map.platforms(),
-            bounds,
-            [width, height],
-            region,
-            token,
-            generation,
-        )
-        .ok_or(Error::Cancelled)?;
-        let background = render::raster_patch(
-            &background_entries,
-            map.platforms(),
-            bounds,
-            [width, height],
-            region,
-            token,
-            generation,
-        )
-        .ok_or(Error::Cancelled)?;
-        transition_atlas(&source, &moves, bounds, [width, height]).map(|(atlas, tiles)| {
-            Transition {
-                origin: background.origin,
-                atlas,
-                background: background.image,
-                tiles,
-            }
-        })
-    } else {
-        None
-    };
+    let transition = Some(build_transition(
+        &map,
+        &patch,
+        old_holes,
+        &entries,
+        map.platforms(),
+        &moves,
+        region,
+        token,
+        generation,
+    )?);
     let holes = clip_holes(
         old_holes,
         bounds,
@@ -736,49 +840,17 @@ pub fn prepare_structural(
             (from != to).then_some((*slot, from, to))
         })
         .collect();
-    let transition = if moves.is_empty() {
-        None
-    } else {
-        let moving: std::collections::HashSet<_> = moves.iter().map(|m| m.0).collect();
-        let old_entries: Vec<_> = map
-            .entries()
-            .iter()
-            .copied()
-            .filter(|e| map.rect(e.id).is_some())
-            .collect();
-        let background: Vec<_> = layout
-            .entries
-            .iter()
-            .copied()
-            .filter(|e| !moving.contains(&e.id))
-            .collect();
-        let source = render::raster_patch(
-            &old_entries,
-            map.platforms(),
-            bounds,
-            size,
-            region,
-            token,
-            generation,
-        )
-        .ok_or(Error::Cancelled)?;
-        let bg = render::raster_patch(
-            &background,
-            &layout.platforms,
-            bounds,
-            size,
-            region,
-            token,
-            generation,
-        )
-        .ok_or(Error::Cancelled)?;
-        transition_atlas(&source, &moves, bounds, size).map(|(atlas, tiles)| Transition {
-            origin: bg.origin,
-            atlas,
-            background: bg.image,
-            tiles,
-        })
-    };
+    let transition = Some(build_transition(
+        &map,
+        &patch,
+        old_holes,
+        &layout.entries,
+        &layout.platforms,
+        &moves,
+        region,
+        token,
+        generation,
+    )?);
     let holes = clip_holes(old_holes, bounds, size, patch.origin, patch.image.size)
         .ok_or(Error::Rebuild)?;
     if !map.apply_scene_patch(&patch, &changed, Some(layout.platforms)) {
@@ -1175,7 +1247,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(tiles.len(), 2);
-        for (id, tile) in tiles.iter().enumerate() {
+        for tile in &tiles {
             let x0 = (tile.uv.min.x * atlas.size[0] as f32).round() as usize;
             let x1 = (tile.uv.max.x * atlas.size[0] as f32).round() as usize;
             let y0 = (tile.uv.min.y * atlas.size[1] as f32).round() as usize;
@@ -1184,7 +1256,7 @@ mod tests {
                 for x in x0..x1 {
                     let p = atlas.pixels[y * atlas.size[0] + x];
                     if p != eframe::egui::Color32::TRANSPARENT {
-                        if id == 0 {
+                        if tile.id == 0 {
                             assert_eq!(p.g(), 0);
                         } else {
                             assert_eq!(p.r(), 0);
@@ -1197,6 +1269,109 @@ mod tests {
                 eframe::egui::Color32::TRANSPARENT
             );
         }
+    }
+
+    #[test]
+    fn large_motion_uses_bounded_sprites_and_fades_remaining_changes() {
+        use crate::treemap::Rect;
+        use eframe::egui::Color32;
+        let token = AtomicU64::new(1);
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1200.0,
+            h: 2.0,
+        };
+        let entries: Vec<_> = (0..600)
+            .map(|id| RenderEntry {
+                id,
+                rect: Rect {
+                    x: (id * 2) as f32,
+                    y: 0.0,
+                    w: 2.0,
+                    h: 2.0,
+                },
+                color: Color32::RED,
+            })
+            .collect();
+        let map =
+            RenderMap::build_with_size(entries.clone(), bounds, [1200, 2], &token, 1).unwrap();
+        let moves: Vec<_> = entries.iter().map(|e| (e.id, e.rect, e.rect)).collect();
+        let target =
+            render::raster_patch(&[], &[], bounds, [1200, 2], [0, 0, 1200, 2], &token, 1).unwrap();
+        let transition = build_transition(
+            &map,
+            &target,
+            &[],
+            &[],
+            &[],
+            &moves,
+            [0, 0, 1200, 2],
+            &token,
+            1,
+        )
+        .unwrap();
+        assert_eq!(transition.tiles.len(), 512);
+        assert!(transition.atlas.size[0] <= 2048 && transition.atlas.size[1] <= 2048);
+        let selected: std::collections::HashSet<_> =
+            transition.tiles.iter().map(|t| t.id).collect();
+        let fading = (0..600).find(|id| !selected.contains(id)).unwrap();
+        let pixel = fading * 2;
+        assert_ne!(
+            transition.previous.pixels[pixel],
+            transition.background.pixels[pixel]
+        );
+        // The old non-sprite remains visible in the fading layer rather than
+        // making the entire 600-item transition silently disappear.
+        assert_eq!(transition.previous.size, [1200, 2]);
+        assert_eq!(transition.background.size, [1200, 2]);
+    }
+
+    #[test]
+    fn fading_previous_frame_keeps_existing_holes_and_never_sprites_them() {
+        use crate::treemap::Rect;
+        use eframe::egui::Color32;
+        let token = AtomicU64::new(1);
+        let bounds = Rect {
+            x: 10.0,
+            y: 20.0,
+            w: 4.0,
+            h: 2.0,
+        };
+        let entry = RenderEntry {
+            id: 0,
+            rect: bounds,
+            color: Color32::RED,
+        };
+        let map = RenderMap::build_with_size(vec![entry], bounds, [8, 4], &token, 1).unwrap();
+        let target =
+            render::raster_patch(&[], &[], bounds, [8, 4], [0, 0, 8, 4], &token, 1).unwrap();
+        let hole = Rect {
+            x: 10.0,
+            y: 20.0,
+            w: 2.0,
+            h: 2.0,
+        };
+        let transition = build_transition(
+            &map,
+            &target,
+            &[hole],
+            &[],
+            &[],
+            &[],
+            [0, 0, 8, 4],
+            &token,
+            1,
+        )
+        .unwrap();
+        assert_eq!(transition.previous.pixels[0], crate::BG);
+        assert_ne!(transition.previous.pixels[7], crate::BG);
+
+        let mut source =
+            render::raster_patch(&[entry], &[], bounds, [8, 4], [0, 0, 8, 4], &token, 1).unwrap();
+        mask_old_holes(&mut source, &[hole], bounds, [8, 4]);
+        assert_eq!(source.owner_at(0, 0), None);
+        assert_eq!(source.owner_at(7, 0), Some(0));
     }
 
     #[test]

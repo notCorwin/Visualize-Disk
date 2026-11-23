@@ -726,6 +726,22 @@ pub struct RasterPatch {
 }
 
 impl RasterPatch {
+    /// Reproduce an already displayed deletion mask in an old-frame patch.
+    /// This must clear ownership as well as color before extracting sprites.
+    pub fn mask_background(&mut self, rect: [usize; 4], color: Color32) {
+        let [width, height] = self.image.size;
+        let [x0, y0, x1, y1] = rect;
+        let (x0, x1) = (x0.min(width), x1.min(width));
+        let (y0, y1) = (y0.min(height), y1.min(height));
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        for y in y0..y1 {
+            self.image.pixels[y * width + x0..y * width + x1].fill(color);
+            self.owners[y * width + x0..y * width + x1].fill(NONE);
+        }
+    }
+
     /// Make a texture atlas containing only pixels owned by the requested
     /// tiles. This prevents cropped tile quads from copying adjacent files or
     /// the directory platform during a transition.
