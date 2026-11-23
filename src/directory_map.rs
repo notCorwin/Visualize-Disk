@@ -31,7 +31,9 @@ pub struct DirectoryLayout {
 /// indices in the input snapshot; callers must translate them to stable IDs.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PartitionItemId {
-    Directory(PathBuf),
+    // File entries dominate large scans. Boxing the comparatively rare path
+    // keeps the enum small for every file allocation in a partition export.
+    Directory(Box<PathBuf>),
     File(usize),
 }
 
@@ -48,6 +50,8 @@ pub struct DirectoryPartition {
     pub path: Option<PathBuf>,
     pub bounds: Rect,
     pub platform: Option<Platform>,
+    /// Unoccupied allocations retained by the incremental layout.
+    pub vacancies: Vec<Rect>,
     pub items: Vec<PartitionItem>,
 }
 
@@ -258,12 +262,12 @@ fn layout_internal<'a>(
                         let child = directory.children[slot];
                         if let Some(allocation) = allocation.as_mut() {
                             allocation.push(PartitionItem {
-                                id: PartitionItemId::Directory(
+                                id: PartitionItemId::Directory(Box::new(
                                     directories[child]
                                         .path
                                         .expect("child directory has a path")
                                         .to_path_buf(),
-                                ),
+                                )),
                                 rect,
                                 weight: directories[child].weight,
                             });
@@ -289,6 +293,7 @@ fn layout_internal<'a>(
                     path: directory.path.map(Path::to_path_buf),
                     bounds: content,
                     platform,
+                    vacancies: Vec::new(),
                     items,
                 });
                 Some((files, children, platform, partition))
@@ -366,7 +371,7 @@ mod tests {
         let nested = a
             .items
             .iter()
-            .find(|i| i.id == PartitionItemId::Directory("/a/nested".into()))
+            .find(|i| i.id == PartitionItemId::Directory(Box::new("/a/nested".into())))
             .unwrap();
         assert_eq!(nested.weight, 50);
         let nested_partition = exported

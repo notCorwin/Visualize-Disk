@@ -111,8 +111,31 @@ pub fn projection_slots(
 #[derive(Clone)]
 pub struct IncrementalGeometry {
     partitions: BTreeMap<Option<PathBuf>, Arc<Partition<Item>>>,
+    /// Published platform ownership is keyed by directory, not inferred from
+    /// equal rectangles: unary ancestors can share an identical content frame.
+    surfaces: Arc<BTreeMap<Option<PathBuf>, Surface>>,
     /// Directory child -> actual exported parent, including synthetic root.
     parents: Arc<BTreeMap<PathBuf, (Option<PathBuf>, u32)>>,
+    /// Rare tiles whose allocation is inside their own directory rather than
+    /// their logical parent. The scene projection retains the real path.
+    tile_parent_overrides: Arc<BTreeMap<TileId, PathBuf>>,
+}
+
+#[derive(Clone, Copy)]
+struct Surface {
+    outer: Rect,
+    platform: Option<crate::render::Platform>,
+}
+
+impl Surface {
+    fn from_partition(part: &DirectoryPartition) -> Self {
+        Self {
+            outer: part
+                .platform
+                .map_or(part.bounds, |platform| platform.bounds),
+            platform: part.platform,
+        }
+    }
 }
 
 pub struct GeometryUpdate {
@@ -121,7 +144,790 @@ pub struct GeometryUpdate {
     pub tiles: BTreeMap<TileId, Option<Rect>>,
 }
 
+pub enum RootDonor {
+    Tile(TileId, Rect, Rect),
+    Directory(PathBuf, Rect, Rect),
+}
+
 impl IncrementalGeometry {
+    /// The published allocation and inherited platform depth for a subtree.
+    /// Check the parent's allocation as well: stale platform metadata must not
+    /// be used to redraw a different branch after an interrupted update.
+    pub(crate) fn subtree_surface(
+        &self,
+        path: &std::path::Path,
+        root: &std::path::Path,
+    ) -> Option<(Rect, u8)> {
+        if path == root || !path.starts_with(root) {
+            return None;
+        }
+        let (parent, id) = self.parents.get(path)?;
+        let outer = self
+            .partitions
+            .get(parent)?
+            .get(&Item::Directory(*id))?
+            .rect;
+        let surface = self.surfaces.get(&Some(path.to_path_buf()))?;
+        if surface.outer != outer {
+            return None;
+        }
+        let mut depth = 0u8;
+        let mut ancestor = path.parent();
+        while let Some(current) = ancestor {
+            if current == root || !current.starts_with(root) {
+                break;
+            }
+            if self
+                .surfaces
+                .get(&Some(current.to_path_buf()))?
+                .platform
+                .is_some()
+            {
+                depth = depth.saturating_add(1);
+            }
+            ancestor = current.parent();
+        }
+        Some((outer, depth))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_partition(&self, path: &std::path::Path) -> bool {
+        self.partitions.contains_key(&Some(path.to_path_buf()))
+    }
+
+    /// Missing descendant materializations must also be restored before a
+    /// parent is laid out; otherwise their unchanged files would be omitted.
+    pub(crate) fn subtree_has_missing_partition(&self, path: &std::path::Path) -> bool {
+        self.surfaces
+            .range(Some(path.to_path_buf())..)
+            .take_while(|(key, _)| key.as_ref().is_some_and(|key| key.starts_with(path)))
+            .any(|(key, _)| !self.partitions.contains_key(key))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forget_partition_for_test(&mut self, path: &std::path::Path) {
+        self.partitions.remove(&Some(path.to_path_buf()));
+    }
+    /// Return the allocation's persisted layout parent, falling back to the
+    /// filesystem parent used by the scene projection.
+    pub(crate) fn tile_layout_parent<'a>(
+        &'a self,
+        id: TileId,
+        logical: &'a std::path::Path,
+    ) -> &'a std::path::Path {
+        self.tile_parent_overrides
+            .get(&id)
+            .map_or(logical, PathBuf::as_path)
+    }
+    /// Recover the rare layout-parent overrides when restoring exported
+    /// partitions. Only a directory tile allocated inside itself is supported;
+    /// other inconsistencies must not silently retarget operations.
+    pub(crate) fn restore_tile_layout_parents(
+        &mut self,
+        parts: &[DirectoryPartition],
+        projection: &crate::sparse_projection::SparseProjection,
+    ) -> Result<(), Error> {
+        let mut overrides = BTreeMap::new();
+        for part in parts {
+            for item in &part.items {
+                let PartitionItemId::File(slot) = &item.id else {
+                    continue;
+                };
+                let Some(id) = projection.id(*slot) else {
+                    continue;
+                };
+                let entry = projection.get(*slot).ok_or(Error::InvalidInitialLayout)?;
+                if part.path.as_deref() == Some(entry.parent.as_ref()) {
+                    continue;
+                }
+                let Some(actual) = part.path.as_deref() else {
+                    return Err(Error::InvalidInitialLayout);
+                };
+                if !matches!(id, TileId::Directory(_)) || entry.path != actual {
+                    return Err(Error::InvalidInitialLayout);
+                }
+                if overrides.insert(id, actual.to_path_buf()).is_some() {
+                    return Err(Error::InvalidInitialLayout);
+                }
+            }
+        }
+        self.tile_parent_overrides = Arc::new(overrides);
+        Ok(())
+    }
+    /// Count direct file/folder tiles without traversing descendant partitions.
+    /// None means that the directory has no existing layout allocation.
+    pub fn direct_tile_count_up_to(&self, path: &std::path::Path, limit: usize) -> Option<usize> {
+        Some(
+            self.partitions
+                .get(&Some(path.to_path_buf()))?
+                .entries()
+                .filter(|(item, _)| matches!(item, Item::Tile(_)))
+                .take(limit.saturating_add(1))
+                .count(),
+        )
+    }
+    pub fn replace_root_tile(
+        &self,
+        root: &std::path::Path,
+        old: TileId,
+        new: TileId,
+        value: u64,
+    ) -> Result<(Self, Rect), Error> {
+        let mut result = self.clone();
+        let partition = result
+            .partitions
+            .get_mut(&Some(root.to_path_buf()))
+            .ok_or(Error::MissingPartition)?;
+        let partition = Arc::make_mut(partition);
+        let frame = partition
+            .get(&Item::Tile(old))
+            .ok_or(Error::InvalidDelta)?
+            .rect;
+        partition
+            .replace_key(&Item::Tile(old), Item::Tile(new), value)
+            .map_err(|_| Error::InvalidDelta)?;
+        if old != new {
+            if let Some(parent) = Arc::make_mut(&mut result.tile_parent_overrides).remove(&old) {
+                Arc::make_mut(&mut result.tile_parent_overrides).insert(new, parent);
+            }
+        }
+        let mut path = root.to_path_buf();
+        while let Some((parent, id)) = result.parents.get(&path).cloned() {
+            let total = result
+                .partitions
+                .get(&Some(path.clone()))
+                .ok_or(Error::MissingPartition)?
+                .entries()
+                .fold(0u64, |sum, (_, entry)| {
+                    sum.saturating_add(entry.weight.max(1))
+                });
+            let partition = result
+                .partitions
+                .get_mut(&parent)
+                .ok_or(Error::MissingPartition)?;
+            Arc::make_mut(partition)
+                .set_weight(&Item::Directory(id), total)
+                .map_err(|_| Error::InvalidDelta)?;
+            match parent {
+                Some(parent) => path = parent,
+                None => break,
+            }
+        }
+        Ok((result, frame))
+    }
+    /// Remove a direct root tile without reallocating siblings. Its frame is
+    /// retained as a vacancy for another tile or child in the same batch.
+    pub(crate) fn remove_root_tile(
+        &self,
+        root: &std::path::Path,
+        tile: TileId,
+    ) -> Result<(Self, Rect), Error> {
+        let mut result = self.clone();
+        let partition = result
+            .partitions
+            .get_mut(&Some(root.to_path_buf()))
+            .ok_or(Error::MissingPartition)?;
+        let frame = Arc::make_mut(partition)
+            .remove(&Item::Tile(tile))
+            .map_err(|_| Error::InvalidDelta)?
+            .dirty;
+        Arc::make_mut(&mut result.tile_parent_overrides).remove(&tile);
+        Ok((result.refresh_ancestor_weights(root)?, frame))
+    }
+    /// Allocate a root aggregate in its actual parent without moving the scan
+    /// root's child allocation. Returning None leaves the snapshot unchanged;
+    /// a missing vacancy cannot safely be solved by re-laying out the root.
+    pub(crate) fn allocate_scan_root_aggregate_in_vacancy(
+        &self,
+        root: &std::path::Path,
+        tile: TileId,
+        value: u64,
+    ) -> Result<Option<(Self, Rect)>, Error> {
+        let parent = root.parent().unwrap_or(root);
+        let Some(partition) = self.partitions.get(&Some(parent.to_path_buf())) else {
+            return Ok(None);
+        };
+        if partition.vacancies().is_empty() {
+            return Ok(None);
+        }
+        let mut result = self.clone();
+        let partition = result
+            .partitions
+            .get_mut(&Some(parent.to_path_buf()))
+            .ok_or(Error::MissingPartition)?;
+        let (frame, donor) = Arc::make_mut(partition)
+            .allocate_local(Item::Tile(tile), value)
+            .map_err(|_| Error::InvalidDelta)?;
+        if donor.is_some() {
+            return Err(Error::InvalidDelta);
+        }
+        Ok(Some((result.refresh_ancestor_weights(parent)?, frame)))
+    }
+    /// Create the first root content partition beside an existing aggregate
+    /// in its synthetic parent. Only the aggregate can be used as donor; all
+    /// changes remain private until the caller publishes the resulting scene.
+    pub(crate) fn lone_root_parent_tile(&self, root: &std::path::Path) -> Option<TileId> {
+        if self.partitions.contains_key(&Some(root.to_path_buf())) {
+            return None;
+        }
+        let parent = root.parent()?;
+        let mut entries = self.partitions.get(&Some(parent.to_path_buf()))?.entries();
+        match (entries.next(), entries.next()) {
+            (Some((Item::Tile(id @ TileId::Directory(_)), _)), None) => Some(*id),
+            _ => None,
+        }
+    }
+    pub(crate) fn bootstrap_root_beside_aggregate(
+        &self,
+        root: &std::path::Path,
+        aggregate: TileId,
+        value: u64,
+    ) -> Result<Option<(Self, Rect, Option<(Rect, Rect)>)>, Error> {
+        if self.partitions.contains_key(&Some(root.to_path_buf())) {
+            return Ok(None);
+        }
+        let Some(parent) = root.parent() else {
+            return Ok(None);
+        };
+        let Some(partition) = self.partitions.get(&Some(parent.to_path_buf())) else {
+            return Ok(None);
+        };
+        let mut live = partition.entries();
+        if !matches!(live.next(), Some((Item::Tile(id), _)) if *id == aggregate)
+            || live.next().is_some()
+        {
+            return Ok(None);
+        }
+        let (mut staged, frame, donor) = self.allocate_root_child(parent, root, None, value)?;
+        let donor = match donor {
+            None => None,
+            Some(RootDonor::Tile(id, old, new)) if id == aggregate => Some((old, new)),
+            _ => return Err(Error::InvalidDelta),
+        };
+        let mut empty = Partition::from_layout(frame, std::iter::empty::<(Item, Placement)>())
+            .map_err(|_| Error::InvalidInitialLayout)?;
+        empty
+            .restore_vacancy(frame)
+            .map_err(|_| Error::InvalidInitialLayout)?;
+        if staged
+            .partitions
+            .insert(Some(root.to_path_buf()), Arc::new(empty))
+            .is_some()
+        {
+            return Err(Error::InvalidDelta);
+        }
+        Arc::make_mut(&mut staged.surfaces).insert(
+            Some(root.to_path_buf()),
+            Surface {
+                outer: frame,
+                platform: None,
+            },
+        );
+        Ok(Some((staged, frame, donor)))
+    }
+    /// Reserve one root child inside an existing hole or by splitting only one
+    /// donor frame. The caller re-lays out any donor/new subtree within those
+    /// frames before publishing the returned COW scene.
+    pub fn allocate_root_child(
+        &self,
+        root: &std::path::Path,
+        pivot: &std::path::Path,
+        tile: Option<TileId>,
+        value: u64,
+    ) -> Result<(Self, Rect, Option<RootDonor>), Error> {
+        let root_aggregate = pivot == root && matches!(tile, Some(TileId::Directory(_)));
+        if !root_aggregate && pivot.parent() != Some(root) {
+            return Err(Error::InvalidDelta);
+        }
+        let mut result = self.clone();
+        let key = if let Some(tile) = tile {
+            Item::Tile(tile)
+        } else {
+            if result.parents.contains_key(pivot) {
+                return Err(Error::InvalidDelta);
+            }
+            let id = result
+                .parents
+                .values()
+                .map(|(_, id)| *id)
+                .max()
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or(Error::InvalidInitialLayout)?;
+            Arc::make_mut(&mut result.parents)
+                .insert(pivot.to_path_buf(), (Some(root.to_path_buf()), id));
+            Item::Directory(id)
+        };
+        let partition = result
+            .partitions
+            .get_mut(&Some(root.to_path_buf()))
+            .ok_or(Error::MissingPartition)?;
+        let (frame, donor) = Arc::make_mut(partition)
+            .allocate_local(key, value)
+            .map_err(|_| Error::InvalidDelta)?;
+        if root_aggregate {
+            Arc::make_mut(&mut result.tile_parent_overrides)
+                .insert(tile.ok_or(Error::InvalidDelta)?, root.to_path_buf());
+        }
+        let donor = match donor {
+            None => None,
+            Some((Item::Tile(tile), old, new)) => Some(RootDonor::Tile(tile, old, new)),
+            Some((Item::Directory(id), old, new)) => Some(
+                self.parents
+                    .iter()
+                    .find_map(|(path, (_, candidate))| {
+                        (*candidate == id).then(|| RootDonor::Directory(path.clone(), old, new))
+                    })
+                    .ok_or(Error::InvalidDelta)?,
+            ),
+        };
+        // A root weight may be referenced by its synthetic ancestor.
+        let mut path = root.to_path_buf();
+        while let Some((parent, id)) = result.parents.get(&path).cloned() {
+            let total = result
+                .partitions
+                .get(&Some(path.clone()))
+                .ok_or(Error::MissingPartition)?
+                .entries()
+                .fold(0u64, |sum, (_, entry)| {
+                    sum.saturating_add(entry.weight.max(1))
+                });
+            let partition = result
+                .partitions
+                .get_mut(&parent)
+                .ok_or(Error::MissingPartition)?;
+            Arc::make_mut(partition)
+                .set_weight(&Item::Directory(id), total)
+                .map_err(|_| Error::InvalidDelta)?;
+            match parent {
+                Some(parent) => path = parent,
+                None => break,
+            }
+        }
+        Ok((result, frame, donor))
+    }
+
+    /// Replace only a single allocated subtree after its frame changes. The
+    /// parent's allocation and all unrelated partition pages remain shared.
+    pub fn install_subtree(
+        &self,
+        pivot: &std::path::Path,
+        subparts: &[DirectoryPartition],
+        projection: &crate::sparse_projection::SparseProjection,
+    ) -> Result<Self, Error> {
+        if !self.parents.contains_key(pivot) {
+            return Err(Error::MissingPartition);
+        }
+        let mut local = Self::from_layout_mapped(
+            subparts,
+            |slot| (slot < projection.len()).then(|| projection.id(slot).map(|id| (id, None))),
+            true,
+        )?;
+        local.restore_tile_layout_parents(subparts, projection)?;
+        let mut result = self.clone();
+        let mut next_id = self
+            .parents
+            .values()
+            .map(|(_, id)| *id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(Error::InvalidInitialLayout)?;
+        result
+            .partitions
+            .retain(|key, _| key.as_ref().is_none_or(|path| !path.starts_with(pivot)));
+        Arc::make_mut(&mut result.surfaces)
+            .retain(|key, _| key.as_ref().is_none_or(|path| !path.starts_with(pivot)));
+        Arc::make_mut(&mut result.surfaces).extend(
+            local
+                .surfaces
+                .iter()
+                .map(|(path, surface)| (path.clone(), *surface)),
+        );
+        Arc::make_mut(&mut result.parents)
+            .retain(|path, _| path == pivot || !path.starts_with(pivot));
+        let overrides = Arc::make_mut(&mut result.tile_parent_overrides);
+        overrides.retain(|_, parent| !parent.starts_with(pivot));
+        overrides.extend(
+            local
+                .tile_parent_overrides
+                .iter()
+                .map(|(id, path)| (*id, path.clone())),
+        );
+        let mut translated = BTreeMap::new();
+        for (path, (parent, local_id)) in local.parents.iter() {
+            let id = next_id;
+            next_id = next_id.checked_add(1).ok_or(Error::InvalidInitialLayout)?;
+            translated.insert(*local_id, id);
+            if Arc::make_mut(&mut result.parents)
+                .insert(path.clone(), (parent.clone(), id))
+                .is_some()
+            {
+                return Err(Error::InvalidInitialLayout);
+            }
+        }
+        for (path, partition) in local.partitions {
+            if path.as_ref().is_none_or(|path| !path.starts_with(pivot)) {
+                return Err(Error::InvalidInitialLayout);
+            }
+            let mapped = partition
+                .map_keys(|item| match item {
+                    Item::Tile(id) => Some(Item::Tile(*id)),
+                    Item::Directory(id) => translated.get(id).copied().map(Item::Directory),
+                })
+                .ok_or(Error::InvalidInitialLayout)?;
+            if result.partitions.insert(path, Arc::new(mapped)).is_some() {
+                return Err(Error::InvalidInitialLayout);
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn subtree_tiles(&self, root: &std::path::Path) -> Vec<TileId> {
+        // Paths sort by components, so a subtree is a contiguous range. Avoid
+        // scanning every unrelated directory for a local update.
+        self.partitions
+            .range(Some(root.to_path_buf())..)
+            .take_while(|(path, _)| path.as_ref().is_some_and(|path| path.starts_with(root)))
+            .flat_map(|(_, part)| {
+                part.entries().filter_map(|(id, _)| match id {
+                    Item::Tile(id) => Some(*id),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+    /// The existing allocation of the scan root in its persisted parent,
+    /// including the synthetic `None` parent used for `/`.
+    pub(crate) fn scan_root_frame(&self, root: &std::path::Path) -> Option<Rect> {
+        let (parent, id) = self.parents.get(root)?;
+        self.partitions
+            .get(parent)?
+            .get(&Item::Directory(*id))
+            .map(|entry| entry.rect)
+    }
+    /// Install the first nonempty root under the existing synthetic canvas.
+    /// Empty directory scaffolding is discarded only after verifying that no
+    /// live tile exists anywhere; a previous snapshot remains untouched.
+    pub(crate) fn bootstrap_empty_root(
+        &self,
+        root: &std::path::Path,
+        subparts: &[DirectoryPartition],
+        projection: &crate::sparse_projection::SparseProjection,
+        total_weight: u64,
+    ) -> Result<Self, Error> {
+        if self
+            .partitions
+            .values()
+            .any(|part| part.entries().any(|(key, _)| matches!(key, Item::Tile(_))))
+        {
+            return Err(Error::InvalidDelta);
+        }
+        let frame = self
+            .partitions
+            .get(&None)
+            .ok_or(Error::MissingPartition)?
+            .bounds();
+        let mut ancestors: Vec<PathBuf> =
+            root.ancestors().map(std::path::Path::to_path_buf).collect();
+        ancestors.reverse();
+        if ancestors.is_empty() {
+            return Err(Error::InvalidDelta);
+        }
+        let mut partitions = BTreeMap::new();
+        let mut parents = BTreeMap::new();
+        let mut parent = None;
+        for (index, path) in ancestors.into_iter().enumerate() {
+            let id = u32::try_from(index).map_err(|_| Error::InvalidInitialLayout)?;
+            let partition = Partition::from_layout(
+                frame,
+                [(
+                    Item::Directory(id),
+                    Placement {
+                        rect: frame,
+                        weight: total_weight.max(1),
+                    },
+                )],
+            )
+            .map_err(|_| Error::InvalidInitialLayout)?;
+            partitions.insert(parent.clone(), Arc::new(partition));
+            parents.insert(path.clone(), (parent, id));
+            parent = Some(path);
+        }
+        let surfaces = partitions
+            .iter()
+            .map(|(path, partition)| {
+                (
+                    path.clone(),
+                    Surface {
+                        outer: partition.bounds(),
+                        platform: None,
+                    },
+                )
+            })
+            .collect();
+        let shell = Self {
+            partitions,
+            surfaces: Arc::new(surfaces),
+            parents: Arc::new(parents),
+            tile_parent_overrides: Arc::new(BTreeMap::new()),
+        };
+        shell.install_subtree(root, subparts, projection)
+    }
+    /// Recompute weights along one existing subtree's ancestor chain without
+    /// changing any allocated frames.
+    pub fn refresh_ancestor_weights(&self, subtree: &std::path::Path) -> Result<Self, Error> {
+        let mut result = self.clone();
+        let mut path = subtree.to_path_buf();
+        while let Some((parent, id)) = result.parents.get(&path).cloned() {
+            let total = result
+                .partitions
+                .get(&Some(path.clone()))
+                .ok_or(Error::MissingPartition)?
+                .entries()
+                .fold(0u64, |sum, (_, entry)| {
+                    sum.saturating_add(entry.weight.max(1))
+                });
+            let partition = result
+                .partitions
+                .get_mut(&parent)
+                .ok_or(Error::MissingPartition)?;
+            Arc::make_mut(partition)
+                .set_weight(&Item::Directory(id), total)
+                .map_err(|_| Error::InvalidDelta)?;
+            match parent {
+                Some(parent) => path = parent,
+                None => break,
+            }
+        }
+        Ok(result)
+    }
+    /// Remove an entire root child while preserving its allocations as holes.
+    /// Folder mode can have both a direct aggregate tile and a descendant
+    /// partition for the same directory, so the two are removed independently.
+    pub fn remove_root_child(
+        &self,
+        root: &std::path::Path,
+        pivot: &std::path::Path,
+        tile: Option<TileId>,
+    ) -> Result<(Self, Option<Rect>, Option<Rect>), Error> {
+        if pivot.parent() != Some(root) {
+            return Err(Error::InvalidDelta);
+        }
+        let directory = self
+            .parents
+            .get(pivot)
+            .map(|(parent, id)| (parent.clone(), *id));
+        if directory
+            .as_ref()
+            .is_some_and(|(parent, _)| parent.as_deref() != Some(root))
+        {
+            return Err(Error::InvalidDelta);
+        }
+        if tile.is_none() && directory.is_none() {
+            return Err(Error::MissingPartition);
+        }
+        let mut result = self.clone();
+        let partition = result
+            .partitions
+            .get_mut(&Some(root.to_path_buf()))
+            .ok_or(Error::MissingPartition)?;
+        let partition = Arc::make_mut(partition);
+        let tile_frame = tile
+            .map(|id| {
+                partition
+                    .remove(&Item::Tile(id))
+                    .map(|update| update.dirty)
+                    .map_err(|_| Error::InvalidDelta)
+            })
+            .transpose()?;
+        let directory_frame = directory
+            .map(|(_, id)| {
+                partition
+                    .remove(&Item::Directory(id))
+                    .map(|update| update.dirty)
+                    .map_err(|_| Error::InvalidDelta)
+            })
+            .transpose()?;
+        if directory_frame.is_some() {
+            result
+                .partitions
+                .retain(|key, _| key.as_ref().is_none_or(|path| !path.starts_with(pivot)));
+            Arc::make_mut(&mut result.surfaces)
+                .retain(|key, _| key.as_ref().is_none_or(|path| !path.starts_with(pivot)));
+            Arc::make_mut(&mut result.parents).retain(|path, _| !path.starts_with(pivot));
+        }
+        Arc::make_mut(&mut result.tile_parent_overrides).retain(|id, parent| {
+            Some(*id) != tile && (directory_frame.is_none() || !parent.starts_with(pivot))
+        });
+        let mut path = root.to_path_buf();
+        while let Some((parent, id)) = result.parents.get(&path).cloned() {
+            let total = result
+                .partitions
+                .get(&Some(path.clone()))
+                .ok_or(Error::MissingPartition)?
+                .entries()
+                .fold(0u64, |sum, (_, entry)| {
+                    sum.saturating_add(entry.weight.max(1))
+                });
+            let partition = result
+                .partitions
+                .get_mut(&parent)
+                .ok_or(Error::MissingPartition)?;
+            Arc::make_mut(partition)
+                .set_weight(&Item::Directory(id), total)
+                .map_err(|_| Error::InvalidDelta)?;
+            match parent {
+                Some(parent) => path = parent,
+                None => break,
+            }
+        }
+        Ok((result, tile_frame, directory_frame))
+    }
+    pub fn root_fold_frame(
+        &self,
+        root: &std::path::Path,
+        pivot: &std::path::Path,
+        old_tile: Option<TileId>,
+    ) -> Option<Rect> {
+        let key = match old_tile {
+            Some(id) => Item::Tile(id),
+            None => Item::Directory(self.parents.get(pivot)?.1),
+        };
+        self.partitions
+            .get(&Some(root.to_path_buf()))?
+            .get(&key)
+            .map(|p| p.rect)
+    }
+    /// Replace a root child tile with its locally laid-out directory subtree,
+    /// or fold that subtree back into one tile. Unrelated partition pages and
+    /// all parent vacancies are retained; only the root's touched page and the
+    /// affected subtree are copied.
+    pub fn replace_root_fold(
+        &self,
+        root: &std::path::Path,
+        pivot: &std::path::Path,
+        old_tile: Option<TileId>,
+        new_tile: Option<(TileId, u64)>,
+        subparts: &[DirectoryPartition],
+        projection: &crate::sparse_projection::SparseProjection,
+        weight: u64,
+    ) -> Result<Self, Error> {
+        if old_tile.is_some() == new_tile.is_some() || pivot.parent() != Some(root) {
+            return Err(Error::InvalidDelta);
+        }
+        let expanding = old_tile.is_some();
+        let mut result = self.clone();
+        let old_directory = self.parents.get(pivot).map(|(_, id)| *id);
+        if expanding && old_directory.is_some() || !expanding && old_directory.is_none() {
+            return Err(Error::InvalidDelta);
+        }
+        let mut next_id = self
+            .parents
+            .values()
+            .map(|(_, id)| *id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(Error::InvalidInitialLayout)?;
+        let new_directory = if expanding {
+            let id = next_id;
+            next_id = next_id.checked_add(1).ok_or(Error::InvalidInitialLayout)?;
+            Arc::make_mut(&mut result.parents)
+                .insert(pivot.to_path_buf(), (Some(root.to_path_buf()), id));
+            Some(id)
+        } else {
+            None
+        };
+        let old_key = old_tile
+            .map(Item::Tile)
+            .or_else(|| old_directory.map(Item::Directory))
+            .ok_or(Error::InvalidDelta)?;
+        let new_key = new_tile
+            .map(|(id, _)| Item::Tile(id))
+            .or_else(|| new_directory.map(Item::Directory))
+            .ok_or(Error::InvalidDelta)?;
+        let root_part = result
+            .partitions
+            .get_mut(&Some(root.to_path_buf()))
+            .ok_or(Error::MissingPartition)?;
+        Arc::make_mut(root_part)
+            .replace_key(&old_key, new_key, weight)
+            .map_err(|_| Error::InvalidDelta)?;
+        if let Some(id) = old_tile {
+            Arc::make_mut(&mut result.tile_parent_overrides).remove(&id);
+        }
+        if expanding {
+            let local = Self::from_layout_mapped(
+                subparts,
+                |slot| (slot < projection.len()).then(|| projection.id(slot).map(|id| (id, None))),
+                true,
+            )?;
+            Arc::make_mut(&mut result.surfaces).extend(
+                local
+                    .surfaces
+                    .iter()
+                    .map(|(path, surface)| (path.clone(), *surface)),
+            );
+            let mut translated = BTreeMap::new();
+            for (path, (parent, local_id)) in local.parents.iter() {
+                let id = next_id;
+                next_id = next_id.checked_add(1).ok_or(Error::InvalidInitialLayout)?;
+                translated.insert(*local_id, id);
+                if Arc::make_mut(&mut result.parents)
+                    .insert(path.clone(), (parent.clone(), id))
+                    .is_some()
+                {
+                    return Err(Error::InvalidInitialLayout);
+                }
+            }
+            for (path, partition) in local.partitions {
+                let mapped = partition
+                    .map_keys(|item| match item {
+                        Item::Tile(id) => Some(Item::Tile(*id)),
+                        Item::Directory(id) => translated.get(id).copied().map(Item::Directory),
+                    })
+                    .ok_or(Error::InvalidInitialLayout)?;
+                if result.partitions.insert(path, Arc::new(mapped)).is_some() {
+                    return Err(Error::InvalidInitialLayout);
+                }
+            }
+        } else {
+            result
+                .partitions
+                .retain(|key, _| key.as_ref().is_none_or(|path| !path.starts_with(pivot)));
+            Arc::make_mut(&mut result.surfaces)
+                .retain(|key, _| key.as_ref().is_none_or(|path| !path.starts_with(pivot)));
+            Arc::make_mut(&mut result.parents).retain(|path, _| !path.starts_with(pivot));
+            Arc::make_mut(&mut result.tile_parent_overrides)
+                .retain(|_, parent| !parent.starts_with(pivot));
+        }
+        // Propagate actual weights without changing any ancestor allocation.
+        let mut path = root.to_path_buf();
+        while let Some((parent, id)) = result.parents.get(&path).cloned() {
+            let total = result
+                .partitions
+                .get(&Some(path.clone()))
+                .ok_or(Error::MissingPartition)?
+                .entries()
+                .fold(0u64, |sum, (_, value)| {
+                    sum.saturating_add(value.weight.max(1))
+                });
+            let partition = result
+                .partitions
+                .get_mut(&parent)
+                .ok_or(Error::MissingPartition)?;
+            Arc::make_mut(partition)
+                .set_weight(&Item::Directory(id), total)
+                .map_err(|_| Error::InvalidDelta)?;
+            match parent {
+                Some(parent) => path = parent,
+                None => break,
+            }
+        }
+        Ok(result)
+    }
+
     /// Export the currently published allocations, rather than the original
     /// scan's allocations, so a structural update can keep unrelated regions.
     pub fn export_partitions(
@@ -134,37 +940,46 @@ impl IncrementalGeometry {
             .iter()
             .map(|(path, (_, id))| (*id, path))
             .collect();
-        let rect_key = |r: Rect| [r.x.to_bits(), r.y.to_bits(), r.w.to_bits(), r.h.to_bits()];
-        let mut surfaces = BTreeMap::<[u32; 4], Option<PathBuf>>::new();
-        for (path, partition) in &self.partitions {
-            let key = rect_key(partition.bounds());
-            let depth = |p: &Option<PathBuf>| p.as_ref().map_or(0, |p| p.components().count());
-            match surfaces.get_mut(&key) {
-                Some(existing) if depth(path) < depth(existing) => *existing = path.clone(),
-                None => {
-                    surfaces.insert(key, path.clone());
-                }
-                _ => {}
+        // Platform ownership is part of the published geometry. Verify that it
+        // still describes the rendered scene instead of guessing by matching
+        // content rectangles, which can coincide along unary directory paths.
+        let key = |p: &crate::render::Platform| {
+            let b = p.bounds;
+            let t = p.top;
+            [
+                b.x.to_bits(),
+                b.y.to_bits(),
+                b.w.to_bits(),
+                b.h.to_bits(),
+                t.x.to_bits(),
+                t.y.to_bits(),
+                t.w.to_bits(),
+                t.h.to_bits(),
+                u32::from_le_bytes(p.color.to_array()),
+            ]
+        };
+        let mut counts = BTreeMap::<[u32; 9], usize>::new();
+        for platform in platforms {
+            *counts.entry(key(platform)).or_default() += 1;
+        }
+        for surface in self.surfaces.values() {
+            if let Some(platform) = surface.platform {
+                let count = counts.get_mut(&key(&platform)).ok_or(Error::Rebuild)?;
+                *count = count.checked_sub(1).ok_or(Error::Rebuild)?;
             }
         }
-        let mut owner = BTreeMap::<Option<PathBuf>, crate::render::Platform>::new();
-        for platform in platforms {
-            let matched = surfaces
-                .get(&rect_key(platform.top))
-                .ok_or(Error::Rebuild)?;
-            if owner.insert(matched.clone(), *platform).is_some() {
-                return Err(Error::Rebuild);
-            }
+        if counts.values().any(|count| *count != 0) {
+            return Err(Error::Rebuild);
         }
         let mut out = Vec::with_capacity(self.partitions.len());
         for (path, partition) in &self.partitions {
-            let platform = owner.get(path).copied();
+            let platform = self.surfaces.get(path).ok_or(Error::Rebuild)?.platform;
             let mut items = Vec::new();
             for (id, placement) in partition.entries() {
                 let id = match id {
-                    Item::Directory(id) => {
-                        PartitionItemId::Directory((*by_id.get(id).ok_or(Error::Rebuild)?).clone())
-                    }
+                    Item::Directory(id) => PartitionItemId::Directory(Box::new(
+                        (*by_id.get(id).ok_or(Error::Rebuild)?).clone(),
+                    )),
                     Item::Tile(id) => {
                         PartitionItemId::File(projection.slot(*id).ok_or(Error::Rebuild)?)
                     }
@@ -179,6 +994,7 @@ impl IncrementalGeometry {
                 path: path.clone(),
                 bounds: partition.bounds(),
                 platform,
+                vacancies: partition.vacancies().to_vec(),
                 items,
             });
         }
@@ -263,16 +1079,23 @@ impl IncrementalGeometry {
     ) -> Result<Self, Error> {
         let mut partitions = BTreeMap::new();
         let mut parents = BTreeMap::new();
+        let mut surfaces = BTreeMap::new();
         for part in parts {
+            if surfaces
+                .insert(part.path.clone(), Surface::from_partition(part))
+                .is_some()
+            {
+                return Err(Error::InvalidInitialLayout);
+            }
             let mut items = Vec::with_capacity(part.items.len());
-            let mut vacant = Vec::new();
+            let mut vacant = part.vacancies.clone();
             for entry in &part.items {
                 let (id, value) = match &entry.id {
                     PartitionItemId::Directory(path) => {
                         let index = u32::try_from(parents.len())
                             .map_err(|_| Error::InvalidInitialLayout)?;
                         if parents
-                            .insert(path.clone(), (part.path.clone(), index))
+                            .insert(path.as_ref().clone(), (part.path.clone(), index))
                             .is_some()
                         {
                             return Err(Error::InvalidInitialLayout);
@@ -333,7 +1156,9 @@ impl IncrementalGeometry {
                 .into_iter()
                 .map(|(k, v)| (k, Arc::new(v)))
                 .collect(),
+            surfaces: Arc::new(surfaces),
             parents: Arc::new(parents),
+            tile_parent_overrides: Arc::new(BTreeMap::new()),
         })
     }
 
@@ -374,7 +1199,8 @@ impl IncrementalGeometry {
                     } else if next_id.is_some() {
                         return Err(Error::Rebuild);
                     }
-                    let key = Some(previous.parent.to_path_buf());
+                    let layout_parent = self.tile_layout_parent(id, &previous.parent).to_path_buf();
+                    let key = Some(layout_parent.clone());
                     let base = self.partitions.get(&key).ok_or(Error::Rebuild)?;
                     let partition = staged
                         .entry(key.clone())
@@ -394,7 +1220,7 @@ impl IncrementalGeometry {
                             .remove(&Item::Tile(id))
                             .map_err(|_| Error::Rebuild)?;
                     }
-                    pending.insert(previous.parent.to_path_buf());
+                    pending.insert(layout_parent);
                 }
                 (None, Some(_)) => return Err(Error::Rebuild),
             }
@@ -428,6 +1254,7 @@ impl IncrementalGeometry {
         }
         self.partitions
             .extend(staged.into_iter().map(|(k, p)| (k, Arc::new(p))));
+        Arc::make_mut(&mut self.tile_parent_overrides).retain(|id, _| new.slot(*id).is_some());
         Ok(())
     }
 
@@ -497,6 +1324,7 @@ impl IncrementalGeometry {
         }
         let mut staged: BTreeMap<Option<PathBuf>, Partition<Item>> = BTreeMap::new();
         let mut touched = BTreeSet::new();
+        let mut overrides = self.tile_parent_overrides.as_ref().clone();
         let mut result = GeometryUpdate {
             dirty: Vec::new(),
             tiles: BTreeMap::new(),
@@ -520,7 +1348,12 @@ impl IncrementalGeometry {
                 // Updating a folder aggregate during a deletion must not
                 // temporarily insert it into its own vacated slot.
                 if deletion_batch && old.parent == new.parent {
-                    let key = Some(old.parent.clone());
+                    let key = Some(
+                        overrides
+                            .get(&old.id)
+                            .cloned()
+                            .unwrap_or_else(|| old.parent.clone()),
+                    );
                     if !self.partitions.contains_key(&key) {
                         return Err(Error::MissingPartition);
                     }
@@ -541,7 +1374,12 @@ impl IncrementalGeometry {
             // Removing and re-adding ensures a size change can use its old slot
             // only when it fits the supplied area error budget.
             if let Some(old) = &change.before {
-                let key = Some(old.parent.clone());
+                let key = Some(
+                    overrides
+                        .get(&old.id)
+                        .cloned()
+                        .unwrap_or_else(|| old.parent.clone()),
+                );
                 if !self.partitions.contains_key(&key) {
                     return Err(Error::MissingPartition);
                 }
@@ -559,9 +1397,21 @@ impl IncrementalGeometry {
                 result.dirty.push(removed.dirty);
                 result.tiles.insert(old.id, None);
                 touched.insert(key);
+                if change
+                    .after
+                    .as_ref()
+                    .is_none_or(|new| new.parent != old.parent)
+                {
+                    overrides.remove(&old.id);
+                }
             }
             if let Some(new) = &change.after {
-                let key = Some(new.parent.clone());
+                let key = Some(
+                    overrides
+                        .get(&new.id)
+                        .cloned()
+                        .unwrap_or_else(|| new.parent.clone()),
+                );
                 if !self.partitions.contains_key(&key) {
                     return Err(Error::MissingPartition);
                 }
@@ -598,6 +1448,30 @@ impl IncrementalGeometry {
                 touched.insert(key);
             }
         }
+        // Adding/removing the last directly drawn tile can change whether a
+        // directory is represented by a platform, even when its child
+        // directory allocations themselves have not moved. Likewise, an
+        // empty child must be removed from its parent instead of leaving a
+        // drawable directory allocation with no live descendants. Both need
+        // the structural transaction so geometry, lighting and owners are
+        // committed together.
+        let unary = |partition: &Partition<Item>| {
+            let mut items = partition.entries();
+            matches!(
+                (items.next(), items.next()),
+                (Some((Item::Directory(_), _)), None)
+            )
+        };
+        for (key, partition) in &staged {
+            let Some(path) = key else { continue };
+            if !self.parents.contains_key(path) {
+                continue;
+            }
+            let old = self.partitions.get(key).ok_or(Error::MissingPartition)?;
+            if partition.entries().next().is_none() || unary(old) != unary(partition) {
+                return Err(Error::Rebuild);
+            }
+        }
         // A removal leaves a vacant rectangle. Compact the affected partition
         // in the background so its surviving tiles can transition into place.
         // A nested directory owns its own platform and descendants; moving it
@@ -605,40 +1479,21 @@ impl IncrementalGeometry {
         if deletion_batch {
             for key in &touched {
                 let p = staged.get_mut(key).ok_or(Error::MissingPartition)?;
-                if p.entries()
-                    .any(|(item, _)| matches!(item, Item::Directory(_)))
-                {
-                    let updates = p
-                        .compact_adjacent(|item| matches!(item, Item::Tile(_)), token, generation)
-                        .map_err(|e| {
-                            if e == incremental_layout::Error::Cancelled {
-                                Error::Cancelled
-                            } else {
-                                Error::InvalidDelta
-                            }
-                        })?;
-                    for update in updates {
-                        result.dirty.push(update.dirty);
-                        for (item, rect) in update.moved {
-                            if let Item::Tile(id) = item {
-                                result.tiles.insert(id, Some(rect));
-                            }
+                let updates = p
+                    .compact_adjacent(|item| matches!(item, Item::Tile(_)), token, generation)
+                    .map_err(|e| {
+                        if e == incremental_layout::Error::Cancelled {
+                            Error::Cancelled
+                        } else {
+                            Error::InvalidDelta
                         }
-                    }
-                    continue;
-                }
-                let bounds = p.bounds();
-                let update = p.repack(bounds, token, generation).map_err(|e| {
-                    if e == incremental_layout::Error::Cancelled {
-                        Error::Cancelled
-                    } else {
-                        Error::InvalidDelta
-                    }
-                })?;
-                result.dirty.push(update.dirty);
-                for (item, rect) in update.moved {
-                    if let Item::Tile(id) = item {
-                        result.tiles.insert(id, Some(rect));
+                    })?;
+                for update in updates {
+                    result.dirty.push(update.dirty);
+                    for (item, rect) in update.moved {
+                        if let Item::Tile(id) = item {
+                            result.tiles.insert(id, Some(rect));
+                        }
                     }
                 }
             }
@@ -684,6 +1539,7 @@ impl IncrementalGeometry {
         }
         self.partitions
             .extend(staged.into_iter().map(|(k, p)| (k, Arc::new(p))));
+        self.tile_parent_overrides = Arc::new(overrides);
         Ok(result)
     }
 }
@@ -691,7 +1547,10 @@ impl IncrementalGeometry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{directory_map::PartitionItem, scene_model::EntryId};
+    use crate::{
+        directory_map::PartitionItem,
+        scene_model::{DirectoryId, EntryId},
+    };
     use std::{sync::Arc, time::Duration};
 
     fn tile(slot: u32) -> TileId {
@@ -715,14 +1574,314 @@ mod tests {
             weight,
         }
     }
+
+    #[test]
+    fn root_child_can_allocate_in_empty_existing_partition() {
+        let root = std::path::Path::new("/disk");
+        let frame = rect(0.0, 100.0);
+        let partition =
+            Partition::from_layout(frame, std::iter::empty::<(Item, Placement)>()).unwrap();
+        let original = IncrementalGeometry {
+            partitions: BTreeMap::from([(Some(root.to_path_buf()), Arc::new(partition))]),
+            surfaces: Arc::new(BTreeMap::from([(
+                Some(root.to_path_buf()),
+                Surface {
+                    outer: frame,
+                    platform: None,
+                },
+            )])),
+            parents: Arc::new(BTreeMap::new()),
+            tile_parent_overrides: Arc::new(BTreeMap::new()),
+        };
+        let (updated, allocated, donor) = original
+            .allocate_root_child(root, std::path::Path::new("/disk/new"), None, 42)
+            .unwrap();
+        assert_eq!(allocated, frame);
+        assert!(donor.is_none());
+        assert!(
+            original
+                .parents
+                .get(std::path::Path::new("/disk/new"))
+                .is_none()
+        );
+        assert!(
+            updated
+                .parents
+                .get(std::path::Path::new("/disk/new"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn exported_platform_keeps_directory_ownership_when_content_frames_coincide() {
+        let platform = crate::render::Platform::new(
+            rect(0.0, 100.0),
+            eframe::egui::Color32::from_rgb(32, 48, 64),
+            0,
+            1.0,
+        )
+        .unwrap();
+        // Unary ancestors can share a content rectangle with a descendant.
+        // Ownership cannot be recovered by choosing the shallowest rectangle.
+        let parts = [
+            DirectoryPartition {
+                path: Some("/disk".into()),
+                bounds: platform.top,
+                platform: None,
+                vacancies: vec![],
+                items: vec![],
+            },
+            DirectoryPartition {
+                path: Some("/disk/child".into()),
+                bounds: platform.top,
+                platform: Some(platform),
+                vacancies: vec![],
+                items: vec![],
+            },
+        ];
+        let geometry = IncrementalGeometry::from_layout(&parts, &[]).unwrap();
+        let source = Arc::new(scan::ScanResult {
+            root: "/disk".into(),
+            files: vec![],
+            directories: Arc::from([]),
+            skipped: 0,
+            errors: vec![],
+            elapsed: Duration::ZERO,
+        });
+        let projection = crate::sparse_projection::SparseProjection::new(source, vec![]).unwrap();
+        let exported = geometry
+            .export_partitions(&projection, &[platform])
+            .unwrap();
+        assert!(
+            exported
+                .iter()
+                .find(|part| part.path.as_deref() == Some(std::path::Path::new("/disk")))
+                .unwrap()
+                .platform
+                .is_none()
+        );
+        assert_eq!(
+            exported
+                .iter()
+                .find(|part| part.path.as_deref() == Some(std::path::Path::new("/disk/child")))
+                .unwrap()
+                .platform,
+            Some(platform)
+        );
+    }
+
+    #[test]
+    fn root_aggregate_reuses_only_parent_vacancies() {
+        let parts = vec![
+            DirectoryPartition {
+                path: None,
+                bounds: rect(0.0, 100.0),
+                platform: None,
+                vacancies: vec![],
+                items: vec![PartitionItem {
+                    id: PartitionItemId::Directory(Box::new("/".into())),
+                    rect: rect(0.0, 100.0),
+                    weight: 100,
+                }],
+            },
+            DirectoryPartition {
+                path: Some("/".into()),
+                bounds: rect(0.0, 100.0),
+                platform: None,
+                vacancies: vec![],
+                items: vec![
+                    PartitionItem {
+                        id: PartitionItemId::File(0),
+                        rect: rect(0.0, 25.0),
+                        weight: 25,
+                    },
+                    PartitionItem {
+                        id: PartitionItemId::Directory(Box::new("/disk".into())),
+                        rect: rect(25.0, 75.0),
+                        weight: 75,
+                    },
+                ],
+            },
+            DirectoryPartition {
+                path: Some("/disk".into()),
+                bounds: rect(25.0, 75.0),
+                platform: None,
+                vacancies: vec![],
+                items: vec![PartitionItem {
+                    id: PartitionItemId::File(1),
+                    rect: rect(25.0, 75.0),
+                    weight: 75,
+                }],
+            },
+        ];
+        let original = IncrementalGeometry::from_layout(&parts, &[tile(0), tile(1)]).unwrap();
+        assert!(
+            original
+                .allocate_scan_root_aggregate_in_vacancy(std::path::Path::new("/disk"), tile(2), 30)
+                .unwrap()
+                .is_none()
+        );
+        let (removed, hole) = original
+            .remove_root_tile(std::path::Path::new("/"), tile(0))
+            .unwrap();
+        assert_eq!(hole, rect(0.0, 25.0));
+        let (updated, frame) = removed
+            .allocate_scan_root_aggregate_in_vacancy(std::path::Path::new("/disk"), tile(2), 30)
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame, hole);
+        assert_eq!(
+            updated.scan_root_frame(std::path::Path::new("/disk")),
+            Some(rect(25.0, 75.0))
+        );
+        assert_eq!(
+            original.scan_root_frame(std::path::Path::new("/disk")),
+            updated.scan_root_frame(std::path::Path::new("/disk"))
+        );
+
+        // A root aggregate may first be placed in its content partition and
+        // later reappear in a newly available synthetic-parent vacancy. Its
+        // logical parent and generational identity do not change, but the
+        // published layout-parent override must not survive that move.
+        let aggregate = TileId::Directory(DirectoryId {
+            slot: 42,
+            generation: 3,
+        });
+        let root = std::path::Path::new("/disk");
+        let parent = std::path::Path::new("/");
+        let (inside, _, _) = original
+            .allocate_root_child(root, root, Some(aggregate), 30)
+            .unwrap();
+        assert_eq!(inside.tile_layout_parent(aggregate, parent), root);
+        let (without, _) = inside.remove_root_tile(root, aggregate).unwrap();
+        let (with_outer_hole, _) = without.remove_root_tile(parent, tile(0)).unwrap();
+        let (reborn, _) = with_outer_hole
+            .allocate_scan_root_aggregate_in_vacancy(root, aggregate, 30)
+            .unwrap()
+            .expect("vacant synthetic parent frame");
+        assert_eq!(reborn.tile_layout_parent(aggregate, parent), parent);
+        assert_eq!(
+            inside.tile_layout_parent(aggregate, parent),
+            root,
+            "old snapshot unchanged"
+        );
+    }
+    #[test]
+    fn root_aggregate_can_use_content_partition_without_changing_logical_parent() {
+        let root = std::path::Path::new("/disk/a");
+        let logical_parent = std::path::Path::new("/disk");
+        let aggregate = TileId::Directory(DirectoryId {
+            slot: 42,
+            generation: 3,
+        });
+        let original = geometry();
+        let (mut allocated, frame, donor) = original
+            .allocate_root_child(root, root, Some(aggregate), 25)
+            .unwrap();
+        assert!(matches!(donor, Some(RootDonor::Tile(_, _, _))));
+        assert!(frame.w > 0.0 && frame.h > 0.0);
+        assert_eq!(
+            allocated.tile_layout_parent(aggregate, logical_parent),
+            root
+        );
+        assert_eq!(
+            original.tile_layout_parent(aggregate, logical_parent),
+            logical_parent
+        );
+        let token = AtomicU64::new(1);
+        let state = |weight| TileState {
+            id: aggregate,
+            parent: logical_parent.into(),
+            weight,
+        };
+        allocated
+            .apply_compacting(
+                &[TileDelta {
+                    before: Some(state(25)),
+                    after: Some(state(20)),
+                }],
+                1.0,
+                f64::MAX,
+                &token,
+                1,
+            )
+            .unwrap();
+        assert_eq!(
+            allocated.tile_layout_parent(aggregate, logical_parent),
+            root
+        );
+        let (removed, _) = allocated.remove_root_tile(root, aggregate).unwrap();
+        assert_eq!(
+            removed.tile_layout_parent(aggregate, logical_parent),
+            logical_parent
+        );
+        assert_eq!(
+            allocated.tile_layout_parent(aggregate, logical_parent),
+            root
+        );
+    }
+    #[test]
+    fn exported_content_aggregate_recovers_layout_parent() {
+        let root = std::path::Path::new("/disk/a");
+        let logical_parent = std::path::Path::new("/disk");
+        let aggregate = TileId::Directory(DirectoryId {
+            slot: 42,
+            generation: 3,
+        });
+        let (allocated, _, _) = geometry()
+            .allocate_root_child(root, root, Some(aggregate), 25)
+            .unwrap();
+        let entries = [
+            ("/disk/a/one", "/disk/a", 50),
+            ("/disk/a/two", "/disk/a", 50),
+            ("/disk/a", "/disk", 25),
+        ]
+        .into_iter()
+        .map(|(path, parent, size)| scan::FileEntry {
+            path: path.into(),
+            parent: Arc::from(std::path::Path::new(parent)),
+            size,
+            identity: Default::default(),
+            parent_identity: Default::default(),
+            parent_is_leaf: false,
+            can_trash: false,
+        })
+        .collect();
+        let source = Arc::new(scan::ScanResult {
+            root: root.into(),
+            files: entries,
+            directories: Vec::new().into(),
+            skipped: 0,
+            errors: Vec::new(),
+            elapsed: Duration::ZERO,
+        });
+        let projection = crate::sparse_projection::SparseProjection::new(
+            source,
+            vec![tile(0), tile(1), aggregate],
+        )
+        .unwrap();
+        let parts = allocated.export_partitions(&projection, &[]).unwrap();
+        let ids = vec![Some(tile(0)), Some(tile(1)), Some(aggregate)];
+        let mut restored = IncrementalGeometry::from_layout_optional(&parts, &ids).unwrap();
+        restored
+            .restore_tile_layout_parents(&parts, &projection)
+            .unwrap();
+        assert_eq!(restored.tile_layout_parent(aggregate, logical_parent), root);
+        let (removed, _) = restored.remove_root_tile(root, aggregate).unwrap();
+        assert_eq!(
+            removed.tile_layout_parent(aggregate, logical_parent),
+            logical_parent
+        );
+    }
     fn geometry() -> IncrementalGeometry {
         let parts = vec![
             DirectoryPartition {
                 path: None,
                 bounds: rect(0.0, 100.0),
                 platform: None,
+                vacancies: Vec::new(),
                 items: vec![PartitionItem {
-                    id: PartitionItemId::Directory("/disk/a".into()),
+                    id: PartitionItemId::Directory(Box::new("/disk/a".into())),
                     rect: rect(0.0, 100.0),
                     weight: 100,
                 }],
@@ -731,6 +1890,7 @@ mod tests {
                 path: Some("/disk/a".into()),
                 bounds: rect(0.0, 100.0),
                 platform: None,
+                vacancies: Vec::new(),
                 items: vec![
                     PartitionItem {
                         id: PartitionItemId::File(0),
@@ -781,14 +1941,114 @@ mod tests {
     }
 
     #[test]
+    fn deleting_last_tiles_requests_structural_update_without_mutation() {
+        let token = AtomicU64::new(1);
+        let mut geometry = geometry();
+        let deltas = [
+            TileDelta {
+                before: Some(state(0, 50)),
+                after: None,
+            },
+            TileDelta {
+                before: Some(state(1, 50)),
+                after: None,
+            },
+        ];
+        assert!(matches!(
+            geometry.apply_compacting(&deltas, 1.0, 1.0e12, &token, 1),
+            Err(Error::Rebuild)
+        ));
+        assert_eq!(
+            geometry.direct_tile_count_up_to(std::path::Path::new("/disk/a"), 2),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn large_flat_partition_deletion_moves_only_adjacent_tile() {
+        let count = 1024u32;
+        let parts = vec![
+            DirectoryPartition {
+                path: None,
+                bounds: rect(0.0, count as f32),
+                platform: None,
+                vacancies: vec![],
+                items: vec![PartitionItem {
+                    id: PartitionItemId::Directory(Box::new("/disk/a".into())),
+                    rect: rect(0.0, count as f32),
+                    weight: count as u64,
+                }],
+            },
+            DirectoryPartition {
+                path: Some("/disk/a".into()),
+                bounds: rect(0.0, count as f32),
+                platform: None,
+                vacancies: vec![],
+                items: (0..count)
+                    .map(|slot| PartitionItem {
+                        id: PartitionItemId::File(slot as usize),
+                        rect: rect(slot as f32, 1.0),
+                        weight: 1,
+                    })
+                    .collect(),
+            },
+        ];
+        let ids: Vec<_> = (0..count).map(tile).collect();
+        let mut geometry = IncrementalGeometry::from_layout(&parts, &ids).unwrap();
+        let token = AtomicU64::new(1);
+        let update = geometry
+            .apply_compacting(
+                &[TileDelta {
+                    before: Some(state(500, 1)),
+                    after: None,
+                }],
+                1.0,
+                1.0e12,
+                &token,
+                1,
+            )
+            .unwrap();
+        assert_eq!(update.tiles.get(&tile(500)), Some(&None));
+        assert!(
+            update.tiles.len() <= 2,
+            "a single vacancy must not repack unrelated entries"
+        );
+        assert!(!update.tiles.contains_key(&tile(0)));
+        assert!(!update.tiles.contains_key(&tile(count - 1)));
+        let inserted = geometry
+            .apply(
+                &[TileDelta {
+                    before: None,
+                    after: Some(state(count, 1)),
+                }],
+                1.0,
+                1.0e12,
+                &token,
+                1,
+            )
+            .unwrap();
+        assert!(
+            inserted.tiles.len() <= 2,
+            "a single insertion must split at most one donor"
+        );
+        assert!(
+            inserted
+                .tiles
+                .get(&tile(count))
+                .is_some_and(Option::is_some)
+        );
+    }
+
+    #[test]
     fn mixed_partition_deletion_compacts_adjacent_tile_without_moving_directory() {
         let parts = vec![
             DirectoryPartition {
                 path: None,
                 bounds: rect(0.0, 100.0),
                 platform: None,
+                vacancies: Vec::new(),
                 items: vec![PartitionItem {
-                    id: PartitionItemId::Directory("/disk/a".into()),
+                    id: PartitionItemId::Directory(Box::new("/disk/a".into())),
                     rect: rect(0.0, 100.0),
                     weight: 100,
                 }],
@@ -797,6 +2057,7 @@ mod tests {
                 path: Some("/disk/a".into()),
                 bounds: rect(0.0, 100.0),
                 platform: None,
+                vacancies: Vec::new(),
                 items: vec![
                     PartitionItem {
                         id: PartitionItemId::File(0),
@@ -809,7 +2070,7 @@ mod tests {
                         weight: 25,
                     },
                     PartitionItem {
-                        id: PartitionItemId::Directory("/disk/a/nested".into()),
+                        id: PartitionItemId::Directory(Box::new("/disk/a/nested".into())),
                         rect: rect(50.0, 50.0),
                         weight: 50,
                     },
@@ -819,6 +2080,7 @@ mod tests {
                 path: Some("/disk/a/nested".into()),
                 bounds: rect(50.0, 50.0),
                 platform: None,
+                vacancies: Vec::new(),
                 items: vec![PartitionItem {
                     id: PartitionItemId::File(2),
                     rect: rect(50.0, 50.0),
@@ -845,6 +2107,22 @@ mod tests {
         assert_eq!(changed.tiles[&tile(0)], None);
         assert_eq!(changed.tiles[&tile(1)], Some(rect(0.0, 50.0)));
         assert!(!changed.tiles.contains_key(&tile(2)));
+        // The last direct tile disappearing turns this directory into a unary
+        // ancestor and removes a platform; the structural path must update
+        // its descendants and lighting as one transaction.
+        assert!(matches!(
+            geometry.apply_compacting(
+                &[TileDelta {
+                    before: Some(state(1, 25)),
+                    after: None
+                }],
+                1.0,
+                1.0e12,
+                &token,
+                1
+            ),
+            Err(Error::Rebuild)
+        ));
     }
 
     #[test]
@@ -854,8 +2132,9 @@ mod tests {
                 path: None,
                 bounds: rect(0.0, 100.0),
                 platform: None,
+                vacancies: Vec::new(),
                 items: vec![PartitionItem {
-                    id: PartitionItemId::Directory("/disk".into()),
+                    id: PartitionItemId::Directory(Box::new("/disk".into())),
                     rect: rect(0.0, 100.0),
                     weight: 100,
                 }],
@@ -864,8 +2143,9 @@ mod tests {
                 path: Some("/disk".into()),
                 bounds: rect(0.0, 100.0),
                 platform: None,
+                vacancies: Vec::new(),
                 items: vec![PartitionItem {
-                    id: PartitionItemId::Directory("/disk/a".into()),
+                    id: PartitionItemId::Directory(Box::new("/disk/a".into())),
                     rect: rect(0.0, 100.0),
                     weight: 100,
                 }],
@@ -874,6 +2154,7 @@ mod tests {
                 path: Some("/disk/a".into()),
                 bounds: rect(0.0, 100.0),
                 platform: None,
+                vacancies: Vec::new(),
                 items: vec![
                     PartitionItem {
                         id: PartitionItemId::File(0),
@@ -1117,6 +2398,7 @@ mod tests {
                 identity: parent,
                 enumeration_complete: true,
                 has_subdirectories: false,
+                excluded: false,
             }]
             .into(),
             skipped: 0,
@@ -1153,14 +2435,15 @@ mod tests {
                 path: None,
                 bounds: rect(0.0, 100.0),
                 platform: None,
+                vacancies: Vec::new(),
                 items: vec![
                     PartitionItem {
-                        id: PartitionItemId::Directory("/disk/a".into()),
+                        id: PartitionItemId::Directory(Box::new("/disk/a".into())),
                         rect: rect(0.0, 50.0),
                         weight: 100,
                     },
                     PartitionItem {
-                        id: PartitionItemId::Directory("/disk/b".into()),
+                        id: PartitionItemId::Directory(Box::new("/disk/b".into())),
                         rect: rect(50.0, 50.0),
                         weight: 100,
                     },
@@ -1170,6 +2453,7 @@ mod tests {
                 path: Some("/disk/a".into()),
                 bounds: rect(0.0, 50.0),
                 platform: None,
+                vacancies: Vec::new(),
                 items: vec![
                     PartitionItem {
                         id: PartitionItemId::File(0),
@@ -1187,6 +2471,7 @@ mod tests {
                 path: Some("/disk/b".into()),
                 bounds: rect(50.0, 50.0),
                 platform: None,
+                vacancies: Vec::new(),
                 items: vec![PartitionItem {
                     id: PartitionItemId::File(2),
                     rect: rect(50.0, 50.0),

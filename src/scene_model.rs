@@ -57,26 +57,124 @@ impl Tile {
     }
 }
 
+#[derive(Clone)]
 struct Slot<T> {
     generation: u32,
     value: Option<T>,
 }
+// A checkpoint shares immutable pages with the active scene. Mutating one
+// entry copies at most one page, rather than the entire multi-million item
+// arena or a very large directory membership vector.
+const PAGE_SIZE: usize = 1024;
+#[derive(Clone)]
+struct PagedVec<T> {
+    pages: Vec<Arc<Vec<T>>>,
+    len: usize,
+}
+impl<T> Default for PagedVec<T> {
+    fn default() -> Self {
+        Self {
+            pages: Vec::new(),
+            len: 0,
+        }
+    }
+}
+impl<T: Clone> PagedVec<T> {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.len {
+            return None;
+        }
+        self.pages.get(index / PAGE_SIZE)?.get(index % PAGE_SIZE)
+    }
+    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= self.len {
+            return None;
+        }
+        Arc::make_mut(self.pages.get_mut(index / PAGE_SIZE)?).get_mut(index % PAGE_SIZE)
+    }
+    fn push(&mut self, value: T) {
+        if self.len % PAGE_SIZE == 0 {
+            // Most directories contain only a few files. Reserving a full
+            // page per directory would multiply memory for small folders.
+            self.pages.push(Arc::new(Vec::new()));
+        }
+        Arc::make_mut(self.pages.last_mut().unwrap()).push(value);
+        self.len += 1;
+    }
+    fn pop(&mut self) -> Option<T> {
+        let result = Arc::make_mut(self.pages.last_mut()?).pop()?;
+        self.len -= 1;
+        if self.len % PAGE_SIZE == 0 {
+            self.pages.pop();
+        }
+        Some(result)
+    }
+    fn swap_remove(&mut self, index: usize) -> T {
+        assert!(index < self.len);
+        let last = self.pop().unwrap();
+        if index == self.len {
+            last
+        } else {
+            std::mem::replace(self.get_mut(index).unwrap(), last)
+        }
+    }
+    fn iter(&self) -> impl Iterator<Item = &T> {
+        self.pages.iter().flat_map(|page| page.iter())
+    }
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.pages.iter().map(|p| p.capacity()).sum()
+    }
+}
+impl<T: Clone> IntoIterator for PagedVec<T> {
+    type Item = T;
+    type IntoIter = PagedIntoIter<T>;
+    fn into_iter(self) -> Self::IntoIter {
+        PagedIntoIter {
+            pages: self.pages.into_iter(),
+            current: Vec::new().into_iter(),
+        }
+    }
+}
+struct PagedIntoIter<T> {
+    pages: std::vec::IntoIter<Arc<Vec<T>>>,
+    current: std::vec::IntoIter<T>,
+}
+impl<T: Clone> Iterator for PagedIntoIter<T> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        loop {
+            if let Some(item) = self.current.next() {
+                return Some(item);
+            }
+            self.current = Arc::unwrap_or_clone(self.pages.next()?).into_iter();
+        }
+    }
+}
+
+#[derive(Clone)]
 struct Arena<T> {
-    slots: Vec<Slot<T>>,
-    free: Vec<u32>,
+    slots: PagedVec<Slot<T>>,
+    free: PagedVec<u32>,
 }
 impl<T> Default for Arena<T> {
     fn default() -> Self {
         Self {
-            slots: Vec::new(),
-            free: Vec::new(),
+            slots: PagedVec::default(),
+            free: PagedVec::default(),
         }
     }
 }
-impl<T> Arena<T> {
+impl<T: Clone> Arena<T> {
     fn insert(&mut self, value: T) -> (u32, u32) {
         if let Some(slot) = self.free.pop() {
-            let s = &mut self.slots[slot as usize];
+            let s = self.slots.get_mut(slot as usize).unwrap();
             debug_assert!(s.value.is_none());
             s.value = Some(value);
             (slot, s.generation)
@@ -118,9 +216,10 @@ impl<T> Arena<T> {
     }
 }
 
+#[derive(Clone)]
 struct Directory {
     fact: scan::DirectoryFact,
-    files: Vec<EntryId>,
+    files: PagedVec<EntryId>,
     size: u128,
     unsafe_count: usize,
 }
@@ -128,7 +227,7 @@ impl Directory {
     fn new(fact: scan::DirectoryFact) -> Self {
         Self {
             fact,
-            files: Vec::new(),
+            files: PagedVec::default(),
             size: 0,
             unsafe_count: 0,
         }
@@ -164,6 +263,19 @@ pub enum Change {
         identity: scan::FileIdentity,
         parent: scan::DirectoryFact,
     },
+    /// Remove a previously scanned directory subtree after its root was moved
+    /// to Trash. The parent is independently enumerated after the operation.
+    RemoveSubtreeDirectory {
+        path: PathBuf,
+        identity: scan::FileIdentity,
+        parent: scan::DirectoryFact,
+    },
+    /// Native Trash confirmed the old object moved, but its parent could not
+    /// be safely re-enumerated. The parent remains conservatively incomplete.
+    RemoveConfirmedSubtree {
+        path: PathBuf,
+        identity: scan::FileIdentity,
+    },
 }
 #[derive(Default, Debug)]
 pub struct Impact {
@@ -180,12 +292,15 @@ pub enum ChangeError {
     NonEmptyDirectory,
     ConflictingBatch,
     InvalidParent,
+    Cancelled,
 }
 
+#[derive(Clone)]
 enum FileStorage {
     Source(usize),
     Owned(Box<scan::FileEntry>),
 }
+#[derive(Clone)]
 struct FileRecord {
     storage: FileStorage,
     next: Option<EntryId>,
@@ -197,13 +312,91 @@ fn path_hash(path: &Path) -> u64 {
     h.finish()
 }
 
+// Hashes are already well distributed; shard by their high bits so a single
+// path edit only copies one small table while checkpoints share the rest.
+const PATH_SHARDS: usize = 256;
+#[derive(Clone)]
+struct FilePathIndex {
+    shards: Vec<Arc<HashMap<u64, EntryId>>>,
+}
+impl Default for FilePathIndex {
+    fn default() -> Self {
+        Self {
+            shards: (0..PATH_SHARDS).map(|_| Arc::new(HashMap::new())).collect(),
+        }
+    }
+}
+impl FilePathIndex {
+    fn shard(hash: u64) -> usize {
+        (hash >> 56) as usize
+    }
+    fn get(&self, hash: &u64) -> Option<&EntryId> {
+        self.shards[Self::shard(*hash)].get(hash)
+    }
+    fn insert(&mut self, hash: u64, id: EntryId) -> Option<EntryId> {
+        Arc::make_mut(&mut self.shards[Self::shard(hash)]).insert(hash, id)
+    }
+    fn remove(&mut self, hash: &u64) -> Option<EntryId> {
+        Arc::make_mut(&mut self.shards[Self::shard(*hash)]).remove(hash)
+    }
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.shards.iter().map(|s| s.capacity()).sum()
+    }
+}
+
+// Directory-dense trees can be as large as file-dense trees. Keep their
+// path and completeness indexes sharded as well, so checkpoints do not
+// duplicate every directory path.
+#[derive(Clone)]
+struct DirectoryPathMap<V> {
+    shards: Vec<Arc<HashMap<PathBuf, V>>>,
+}
+impl<V> Default for DirectoryPathMap<V> {
+    fn default() -> Self {
+        Self {
+            shards: (0..PATH_SHARDS).map(|_| Arc::new(HashMap::new())).collect(),
+        }
+    }
+}
+impl<V: Clone> DirectoryPathMap<V> {
+    fn shard(path: &Path) -> usize {
+        FilePathIndex::shard(path_hash(path))
+    }
+    fn get(&self, path: &Path) -> Option<&V> {
+        self.shards[Self::shard(path)].get(path)
+    }
+    fn get_mut(&mut self, path: &Path) -> Option<&mut V> {
+        Arc::make_mut(&mut self.shards[Self::shard(path)]).get_mut(path)
+    }
+    fn contains_key(&self, path: &Path) -> bool {
+        self.get(path).is_some()
+    }
+    fn insert(&mut self, path: PathBuf, value: V) -> Option<V> {
+        Arc::make_mut(&mut self.shards[Self::shard(&path)]).insert(path, value)
+    }
+    fn remove(&mut self, path: &Path) -> Option<V> {
+        Arc::make_mut(&mut self.shards[Self::shard(path)]).remove(path)
+    }
+    fn keys(&self) -> impl Iterator<Item = &PathBuf> {
+        self.shards.iter().flat_map(|shard| shard.keys())
+    }
+    fn iter(&self) -> impl Iterator<Item = (&PathBuf, &V)> {
+        self.shards.iter().flat_map(|shard| shard.iter())
+    }
+}
+
+#[derive(Clone)]
 pub struct Scene {
     root: PathBuf,
     source: Arc<scan::ScanResult>,
     files: Arena<FileRecord>,
     directories: Arena<Directory>,
-    file_paths: HashMap<u64, EntryId>,
-    directory_paths: HashMap<PathBuf, DirectoryId>,
+    file_paths: FilePathIndex,
+    directory_paths: DirectoryPathMap<DirectoryId>,
+    // Number of incompletely enumerated or excluded directories in each
+    // subtree. Directory actions cover descendants, not just direct files.
+    incomplete_subtrees: DirectoryPathMap<usize>,
 }
 impl Scene {
     #[cfg(test)]
@@ -219,8 +412,9 @@ impl Scene {
             source: data.clone(),
             files: Arena::default(),
             directories: Arena::default(),
-            file_paths: HashMap::new(),
-            directory_paths: HashMap::new(),
+            file_paths: FilePathIndex::default(),
+            directory_paths: DirectoryPathMap::default(),
+            incomplete_subtrees: DirectoryPathMap::default(),
         };
         for (i, fact) in data.directories.iter().enumerate() {
             if i % 4096 == 0 && cancelled.load(Ordering::Relaxed) {
@@ -240,6 +434,7 @@ impl Scene {
                     identity: file.parent_identity,
                     enumeration_complete: false,
                     has_subdirectories: true,
+                    excluded: false,
                 });
             }
             let previous = scene.file_paths.get(&path_hash(&file.path)).copied();
@@ -319,16 +514,112 @@ impl Scene {
     pub fn directory_leaf(&self, path: &Path) -> Option<bool> {
         Some(self.directory(self.directory_id(path)?)?.leaf())
     }
+    /// A missing directory or a complete leaf without direct files has no
+    /// projected tiles in any view. Incomplete directories are never assumed
+    /// empty, even if their current scan happened to find no files.
+    pub(crate) fn absent_or_empty_complete_leaf(&self, path: &Path) -> bool {
+        let Some(id) = self.directory_id(path) else {
+            return true;
+        };
+        self.directory(id)
+            .is_some_and(|dir| !dir.fact.excluded && dir.leaf() && dir.files.is_empty())
+    }
+    /// Whether the scene currently knows of no direct files. This says
+    /// nothing about unenumerated filesystem entries.
+    pub(crate) fn directory_has_no_known_files(&self, path: &Path) -> bool {
+        self.directory_id(path)
+            .and_then(|id| self.directory(id))
+            .is_some_and(|dir| dir.files.is_empty())
+    }
     pub fn directory_identity(&self, id: DirectoryId) -> Option<scan::FileIdentity> {
         Some(self.directory(id)?.fact.identity)
     }
     pub fn directory_id(&self, path: &Path) -> Option<DirectoryId> {
         self.directory_paths.get(path).copied()
     }
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+    fn contains_directory_path(&self, path: &Path) -> bool {
+        path.strip_prefix(&self.root).ok().is_some_and(|relative| {
+            !relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        })
+    }
+
+    /// Reject lexical escapes before looking up identities or mutating any
+    /// member of a batch. Filesystem identity checks remain mandatory at the
+    /// operation boundary; this only enforces the scene's scan-root scope.
+    fn validate_change_paths(&self, change: &Change) -> Result<(), ChangeError> {
+        let within = |path: &Path| self.contains_directory_path(path);
+        let file_path = |path: &Path| path != self.root && within(path);
+        let directory_removal = |path: &Path| path != self.root && within(path);
+        let entry = |file: &scan::FileEntry| {
+            file_path(&file.path)
+                && within(&file.parent)
+                && file.path.parent() == Some(file.parent.as_ref())
+        };
+        let valid = match change {
+            Change::UpsertDirectory(fact) => within(&fact.path),
+            Change::RemoveDirectory { path, .. } | Change::RemoveConfirmedSubtree { path, .. } => {
+                directory_removal(path)
+            }
+            Change::RemoveLeafDirectory { path, parent, .. }
+            | Change::RemoveSubtreeDirectory { path, parent, .. } => {
+                directory_removal(path)
+                    && within(&parent.path)
+                    && path.parent() == Some(parent.path.as_path())
+            }
+            Change::UpsertFile(file) => entry(file),
+            Change::RemoveFile { path, .. } => file_path(path),
+            Change::MoveFile { from, to, .. } => file_path(from) && entry(to),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(ChangeError::InvalidParent)
+        }
+    }
+    pub(crate) fn subtree_directories(&self, path: &Path) -> Vec<PathBuf> {
+        self.directory_paths
+            .keys()
+            .filter(|p| p.starts_with(path))
+            .cloned()
+            .collect()
+    }
+    pub(crate) fn for_each_directory(&self, mut visit: impl FnMut(&scan::DirectoryFact)) {
+        for slot in self.directories.slots.iter() {
+            if let Some(dir) = &slot.value {
+                visit(&dir.fact);
+            }
+        }
+    }
+    pub(crate) fn for_each_file(&self, mut visit: impl FnMut(&scan::FileEntry)) {
+        for (index, slot) in self.files.slots.iter().enumerate() {
+            if slot.value.is_some() {
+                let id = EntryId {
+                    slot: index as u32,
+                    generation: slot.generation,
+                };
+                if let Some(file) = self.file(id) {
+                    visit(file);
+                }
+            }
+        }
+    }
     fn upsert_directory(
         &mut self,
         fact: scan::DirectoryFact,
     ) -> (DirectoryId, Option<DirectoryId>) {
+        let was_incomplete = self
+            .directory_id(&fact.path)
+            .and_then(|id| self.directory(id))
+            .is_some_and(|dir| !dir.fact.enumeration_complete || dir.fact.excluded);
+        let is_incomplete = !fact.enumeration_complete || fact.excluded;
+        if was_incomplete != is_incomplete {
+            self.adjust_incomplete_subtrees(&fact.path, is_incomplete);
+        }
         if let Some(id) = self.directory_id(&fact.path) {
             if self.directory(id).unwrap().fact.identity == fact.identity {
                 self.directory_mut(id).unwrap().fact = fact;
@@ -351,6 +642,40 @@ impl Scene {
         let id = DirectoryId { slot, generation };
         self.directory_paths.insert(path, id);
         (id, None)
+    }
+    fn adjust_incomplete_subtrees(&mut self, path: &Path, adding: bool) {
+        let root = &self.root;
+        for ancestor in path.ancestors().take_while(|p| p.starts_with(root)) {
+            if adding {
+                if let Some(count) = self.incomplete_subtrees.get_mut(ancestor) {
+                    *count += 1;
+                } else {
+                    self.incomplete_subtrees.insert(ancestor.to_path_buf(), 1);
+                }
+            } else {
+                let count = self
+                    .incomplete_subtrees
+                    .get_mut(ancestor)
+                    .expect("incomplete subtree count must exist");
+                *count -= 1;
+                if *count == 0 {
+                    self.incomplete_subtrees.remove(ancestor);
+                }
+            }
+        }
+    }
+    fn remove_directory_record(&mut self, id: DirectoryId, path: &Path) {
+        let incomplete = self
+            .directory(id)
+            .is_some_and(|d| !d.fact.enumeration_complete || d.fact.excluded);
+        if incomplete {
+            self.adjust_incomplete_subtrees(path, false);
+        }
+        self.directories.remove(id.slot, id.generation);
+        self.directory_paths.remove(path);
+    }
+    fn directory_is_complete(&self, path: &Path) -> bool {
+        !self.incomplete_subtrees.contains_key(path)
     }
     fn attach(&mut self, id: EntryId, file: &scan::FileEntry) -> Result<(), ChangeError> {
         let dir_id = self
@@ -435,8 +760,83 @@ impl Scene {
     }
     /// A change is checked before mutating; stale identities cannot remove a replacement.
     pub fn apply(&mut self, change: Change) -> Result<Impact, ChangeError> {
+        self.validate_change_paths(&change)?;
         let mut impact = Impact::default();
         match change {
+            Change::RemoveConfirmedSubtree { path, identity } => {
+                let parent_path = path.parent().ok_or(ChangeError::InvalidParent)?;
+                let parent_id = self
+                    .directory_id(parent_path)
+                    .ok_or(ChangeError::MissingParent)?;
+                let mut parent = self.directory(parent_id).unwrap().fact.clone();
+                // This synthetic value is only used to reuse the identity-
+                // checked atomic remove; it is never published as complete.
+                parent.enumeration_complete = true;
+                parent.has_subdirectories = true;
+                let impact = self.apply(Change::RemoveSubtreeDirectory {
+                    path,
+                    identity,
+                    parent: parent.clone(),
+                })?;
+                parent.enumeration_complete = false;
+                self.upsert_directory(parent);
+                return Ok(impact);
+            }
+            Change::RemoveSubtreeDirectory {
+                path,
+                identity,
+                parent,
+            } => {
+                if path == self.root || !path.starts_with(&self.root) {
+                    return Err(ChangeError::InvalidParent);
+                }
+                let root_id = self.directory_id(&path).ok_or(ChangeError::MissingEntry)?;
+                if self.directory(root_id).unwrap().fact.identity != identity {
+                    return Err(ChangeError::IdentityMismatch);
+                }
+                if path.parent() != Some(parent.path.as_path()) || !parent.enumeration_complete {
+                    return Err(ChangeError::InvalidParent);
+                }
+                let parent_id = self
+                    .directory_id(&parent.path)
+                    .ok_or(ChangeError::MissingParent)?;
+                if self.directory(parent_id).unwrap().fact.identity != parent.identity {
+                    return Err(ChangeError::IdentityMismatch);
+                }
+                if !parent.has_subdirectories
+                    && self.directory_paths.keys().any(|other| {
+                        !other.starts_with(&path) && other.parent() == Some(parent.path.as_path())
+                    })
+                {
+                    return Err(ChangeError::ConflictingBatch);
+                }
+                // Validate everything before the first mutation. Directory membership
+                // owns its files, so collect each descendant directory only once.
+                let mut directories: Vec<_> = self
+                    .directory_paths
+                    .iter()
+                    .filter(|(candidate, _)| candidate.starts_with(&path))
+                    .map(|(candidate, id)| (candidate.clone(), *id))
+                    .collect();
+                // Replaying the same journal from a fresh scan must retire
+                // slots in the same order, independent of HashMap seeds.
+                directories.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                for (directory_path, id) in directories {
+                    let files = self.directory(id).expect("live directory").files.clone();
+                    for file_id in files {
+                        let file = self.file(file_id).expect("live directory file").clone();
+                        self.detach(file_id, &file);
+                        self.unlink_path(&file.path, file_id);
+                        self.files.remove(file_id.slot, file_id.generation);
+                        impact.removed.insert(TileId::File(file_id));
+                    }
+                    self.remove_directory_record(id, &directory_path);
+                    impact.directories.insert(directory_path);
+                    impact.removed.insert(TileId::Directory(id));
+                }
+                self.upsert_directory(parent.clone());
+                impact.directories.insert(parent.path);
+            }
             Change::RemoveLeafDirectory {
                 path,
                 identity,
@@ -484,14 +884,16 @@ impl Scene {
                     self.files.remove(id.slot, id.generation);
                     impact.removed.insert(TileId::File(id));
                 }
-                self.directories.remove(id.slot, id.generation);
-                self.directory_paths.remove(&path);
-                self.directory_mut(parent_id).unwrap().fact = parent.clone();
+                self.remove_directory_record(id, &path);
+                self.upsert_directory(parent.clone());
                 impact.directories.insert(path);
                 impact.directories.insert(parent.path);
                 impact.removed.insert(TileId::Directory(id));
             }
             Change::UpsertDirectory(fact) => {
+                if !self.contains_directory_path(&fact.path) {
+                    return Err(ChangeError::InvalidParent);
+                }
                 if self.file_id(&fact.path).is_some() {
                     return Err(ChangeError::DestinationExists);
                 }
@@ -527,8 +929,7 @@ impl Scene {
                 {
                     return Err(ChangeError::NonEmptyDirectory);
                 }
-                self.directories.remove(id.slot, id.generation);
-                self.directory_paths.remove(&path);
+                self.remove_directory_record(id, &path);
                 impact.directories.insert(path);
                 impact.removed.insert(TileId::Directory(id));
             }
@@ -590,12 +991,21 @@ impl Scene {
     /// before any mutation. Conflicting paths are rejected for reconciliation.
     pub fn apply_batch(&mut self, changes: Vec<Change>) -> Result<Impact, ChangeError> {
         use std::collections::{HashMap, HashSet};
+        // Validate the entire transaction before any operation can mutate
+        // scene state, including single-item subtree operations.
+        for change in &changes {
+            self.validate_change_paths(change)?;
+        }
         // A leaf removal is a self-contained atomic operation: mixing it with
         // other paths would require validating interactions before mutation.
-        if changes
-            .iter()
-            .any(|c| matches!(c, Change::RemoveLeafDirectory { .. }))
-        {
+        if changes.iter().any(|c| {
+            matches!(
+                c,
+                Change::RemoveLeafDirectory { .. }
+                    | Change::RemoveSubtreeDirectory { .. }
+                    | Change::RemoveConfirmedSubtree { .. }
+            )
+        }) {
             if changes.len() != 1 {
                 return Err(ChangeError::ConflictingBatch);
             }
@@ -606,6 +1016,9 @@ impl Scene {
         for change in &changes {
             match change {
                 Change::UpsertDirectory(fact) => {
+                    if !self.contains_directory_path(&fact.path) {
+                        return Err(ChangeError::InvalidParent);
+                    }
                     if dirs.insert(fact.path.clone(), true).is_some() {
                         return Err(ChangeError::ConflictingBatch);
                     }
@@ -748,7 +1161,7 @@ impl Scene {
                     && file.identity == entry.identity
                     && file.parent_identity == entry.parent_identity
                     && self.directory_leaf(&file.parent) == Some(entry.parent_is_leaf)
-                    && file.can_trash == entry.can_trash
+                    && self.file_can_trash(file) == entry.can_trash
             }),
             TileId::Directory(id) => self.directory(id).is_some_and(|dir| {
                 let path = &dir.fact.path;
@@ -761,6 +1174,7 @@ impl Scene {
                     && !entry.parent_is_leaf
                     && entry.can_trash
                         == (dir.unsafe_count == 0
+                            && self.directory_is_complete(path)
                             && path != &self.root
                             && file_actions::can_move_target(
                                 path,
@@ -768,6 +1182,13 @@ impl Scene {
                             ))
             }),
         }
+    }
+    fn file_can_trash(&self, file: &scan::FileEntry) -> bool {
+        file.can_trash
+            && self
+                .directory_id(&file.parent)
+                .and_then(|id| self.directory(id))
+                .is_some_and(|parent| parent.fact.identity == file.parent_identity)
     }
     pub fn tile(&self, id: TileId) -> Option<Tile> {
         match id {
@@ -784,7 +1205,7 @@ impl Scene {
                         .directory_id(&f.parent)
                         .and_then(|id| self.directory(id))
                         .is_some_and(Directory::leaf),
-                    can_trash: f.can_trash,
+                    can_trash: self.file_can_trash(f),
                 })
             }
             TileId::Directory(id) => {
@@ -802,6 +1223,7 @@ impl Scene {
                     parent_identity: scan::FileIdentity::default(),
                     parent_is_leaf: false,
                     can_trash: d.unsafe_count == 0
+                        && self.directory_is_complete(path)
                         && path != &self.root
                         && file_actions::can_move_target(path, file_actions::TargetKind::Directory),
                 })
@@ -841,6 +1263,87 @@ impl Scene {
 mod tests {
     use super::*;
     use std::{sync::Arc, time::Duration};
+
+    #[test]
+    fn checkpoint_pages_isolate_boundary_swaps_and_generation_reuse() {
+        let mut arena = Arena::default();
+        for value in 0..(PAGE_SIZE * 2 + 1) {
+            arena.insert(value);
+        }
+        let checkpoint = arena.clone();
+        assert!(Arc::ptr_eq(
+            &checkpoint.slots.pages[0],
+            &arena.slots.pages[0]
+        ));
+        assert_eq!(arena.remove(PAGE_SIZE as u32, 0), Some(PAGE_SIZE));
+        assert!(!Arc::ptr_eq(
+            &checkpoint.slots.pages[1],
+            &arena.slots.pages[1]
+        ));
+        assert!(Arc::ptr_eq(
+            &checkpoint.slots.pages[0],
+            &arena.slots.pages[0]
+        ));
+        let (slot, generation) = arena.insert(99);
+        assert_eq!((slot, generation), (PAGE_SIZE as u32, 1));
+        assert_eq!(checkpoint.get(slot, 0), Some(&PAGE_SIZE));
+        assert_eq!(arena.get(slot, 0), None);
+        assert_eq!(arena.get(slot, 1), Some(&99));
+
+        let mut members = PagedVec::default();
+        for value in 0..(PAGE_SIZE + 1) {
+            members.push(value);
+        }
+        let old = members.clone();
+        assert_eq!(members.swap_remove(0), 0);
+        assert_eq!(members.get(0), Some(&PAGE_SIZE));
+        assert_eq!(old.get(0), Some(&0));
+        assert_eq!(old.len(), PAGE_SIZE + 1);
+    }
+
+    #[test]
+    fn checkpoint_path_index_copies_only_affected_hash_shard() {
+        let mut index = FilePathIndex::default();
+        let a = 0x0100_0000_0000_0001;
+        let b = 0x0200_0000_0000_0001;
+        let first = EntryId {
+            slot: 1,
+            generation: 0,
+        };
+        let replacement = EntryId {
+            slot: 1,
+            generation: 1,
+        };
+        index.insert(a, first);
+        index.insert(b, first);
+        let old = index.clone();
+        index.insert(a, replacement);
+        assert_eq!(old.get(&a), Some(&first));
+        assert_eq!(index.get(&a), Some(&replacement));
+        assert!(!Arc::ptr_eq(&old.shards[1], &index.shards[1]));
+        assert!(Arc::ptr_eq(&old.shards[2], &index.shards[2]));
+        assert_eq!(index.remove(&a), Some(replacement));
+        assert_eq!(old.get(&a), Some(&first));
+    }
+
+    #[test]
+    fn checkpoint_directory_indexes_share_and_isolate_changes() {
+        let mut paths = DirectoryPathMap::default();
+        let a = PathBuf::from("/disk/a");
+        let id = DirectoryId {
+            slot: 7,
+            generation: 1,
+        };
+        paths.insert(a.clone(), id);
+        let old = paths.clone();
+        let shard = DirectoryPathMap::<DirectoryId>::shard(&a);
+        assert!(Arc::ptr_eq(&old.shards[shard], &paths.shards[shard]));
+        paths.remove(&a);
+        assert_eq!(old.get(&a), Some(&id));
+        assert_eq!(paths.get(&a), None);
+        assert!(!Arc::ptr_eq(&old.shards[shard], &paths.shards[shard]));
+        assert!(old.keys().any(|key| key == &a));
+    }
     fn identity(n: u64) -> scan::FileIdentity {
         scan::FileIdentity {
             device: n,
@@ -853,6 +1356,7 @@ mod tests {
             identity: identity(n),
             enumeration_complete: complete,
             has_subdirectories: children,
+            excluded: false,
         }
     }
     fn file(path: &str, size: u64, object: u64, parent: u64) -> scan::FileEntry {
@@ -886,6 +1390,259 @@ mod tests {
             errors: vec![],
             elapsed: Duration::ZERO,
         }
+    }
+    #[test]
+    fn directory_updates_cannot_escape_scan_root_or_partially_apply_a_batch() {
+        let mut scene = Scene::from_scan(Arc::new(fixture()));
+        for outside in ["/elsewhere", "/disk-other/new", "/disk/../elsewhere"] {
+            assert!(matches!(
+                scene.apply(Change::UpsertDirectory(dir(outside, 10, true, false))),
+                Err(ChangeError::InvalidParent)
+            ));
+            assert!(scene.directory_id(Path::new(outside)).is_none());
+        }
+        let valid = "/disk/new";
+        assert!(matches!(
+            scene.apply_batch(vec![
+                Change::UpsertDirectory(dir(valid, 11, true, false)),
+                Change::UpsertDirectory(dir("/elsewhere", 12, true, false)),
+            ]),
+            Err(ChangeError::InvalidParent)
+        ));
+        assert!(scene.directory_id(Path::new(valid)).is_none());
+        assert!(scene.directory_id(Path::new("/disk/a")).is_some());
+        scene
+            .apply_batch(vec![Change::UpsertDirectory(dir(valid, 11, true, false))])
+            .unwrap();
+        assert!(scene.directory_id(Path::new(valid)).is_some());
+    }
+
+    #[test]
+    fn every_change_rejects_root_escape_before_any_batch_mutation() {
+        let original = Arc::new(fixture());
+        let bad_changes = vec![
+            Change::UpsertDirectory(dir("/disk/../outside", 11, true, false)),
+            Change::RemoveDirectory {
+                path: "/disk".into(),
+                identity: identity(1),
+            },
+            Change::RemoveDirectory {
+                path: "/disk/../outside".into(),
+                identity: identity(1),
+            },
+            Change::RemoveLeafDirectory {
+                path: "/disk".into(),
+                identity: identity(1),
+                parent: dir("/", 0, true, true),
+            },
+            Change::RemoveSubtreeDirectory {
+                path: "/disk/../outside".into(),
+                identity: identity(1),
+                parent: dir("/disk/..", 0, true, true),
+            },
+            Change::UpsertFile(file("/disk/../outside/new", 1, 7, 1)),
+            Change::RemoveFile {
+                path: "/disk/../outside/item".into(),
+                identity: identity(7),
+            },
+            Change::MoveFile {
+                from: "/disk/a/f".into(),
+                identity: identity(3),
+                to: file("/disk/../outside/moved", 10, 3, 1),
+            },
+        ];
+        for bad in bad_changes {
+            let mut scene = Scene::from_scan(original.clone());
+            let before = scene.file_id(Path::new("/disk/a/f"));
+            let valid = Change::UpsertFile(file("/disk/a/new", 1, 20, 2));
+            assert!(
+                matches!(
+                    scene.apply_batch(vec![valid, bad.clone()]),
+                    Err(ChangeError::InvalidParent)
+                ),
+                "{bad:?}"
+            );
+            assert!(scene.file_id(Path::new("/disk/a/new")).is_none());
+            assert_eq!(scene.file_id(Path::new("/disk/a/f")), before);
+            assert!(matches!(scene.apply(bad), Err(ChangeError::InvalidParent)));
+        }
+    }
+    #[test]
+    fn collision_chain_mutation_does_not_change_checkpoint() {
+        let mut scene = Scene::from_scan(Arc::new(fixture()));
+        let path = Path::new("/disk/a/f");
+        let first = scene.file_id(path).unwrap();
+        let collision = scene.file_id(Path::new("/disk/a/g")).unwrap();
+        // Construct the linked chain that two equal path hashes would create.
+        scene.file_paths.insert(path_hash(path), collision);
+        scene
+            .files
+            .get_mut(collision.slot, collision.generation)
+            .unwrap()
+            .next = Some(first);
+        let checkpoint = scene.clone();
+        assert_eq!(scene.file_id(path), Some(first));
+        scene.unlink_path(path, first);
+        assert_eq!(scene.file_id(path), None);
+        let removed = scene.files.remove(first.slot, first.generation).unwrap();
+        let (reused, generation) = scene.files.insert(removed);
+        assert_eq!(reused, first.slot);
+        assert_ne!(generation, first.generation);
+        assert_eq!(checkpoint.file_id(path), Some(first));
+        assert_eq!(
+            checkpoint
+                .files
+                .get(collision.slot, collision.generation)
+                .unwrap()
+                .next,
+            Some(first)
+        );
+    }
+    #[test]
+    fn folder_delete_requires_every_descendant_to_be_enumerated() {
+        let mut data = fixture();
+        data.directories = vec![
+            dir("/disk", 1, true, true),
+            dir("/disk/a", 2, true, true),
+            dir("/disk/a/unknown", 7, false, false),
+            dir("/disk/b", 5, true, false),
+        ]
+        .into();
+        let mut scene = Scene::from_scan(Arc::new(data));
+        let a = TileId::Directory(scene.directory_id(Path::new("/disk/a")).unwrap());
+        let b = TileId::Directory(scene.directory_id(Path::new("/disk/b")).unwrap());
+        assert!(!scene.tile(a).unwrap().can_trash);
+        assert!(scene.tile(b).unwrap().can_trash);
+        let old = scene.clone();
+        scene
+            .apply(Change::UpsertDirectory(dir(
+                "/disk/a/unknown",
+                7,
+                true,
+                false,
+            )))
+            .unwrap();
+        assert!(scene.tile(a).unwrap().can_trash);
+        assert!(!old.tile(a).unwrap().can_trash);
+        let mut excluded = dir("/disk/a/unknown", 7, false, false);
+        excluded.excluded = true;
+        scene.apply(Change::UpsertDirectory(excluded)).unwrap();
+        assert!(!scene.tile(a).unwrap().can_trash);
+        scene
+            .apply(Change::RemoveDirectory {
+                path: "/disk/a/unknown".into(),
+                identity: identity(7),
+            })
+            .unwrap();
+        assert!(scene.tile(a).unwrap().can_trash);
+    }
+    #[test]
+    fn subtree_removal_is_atomic_and_preserves_unrelated_entries() {
+        let mut data = fixture();
+        data.files.push(file("/disk/a/nested/item", 11, 8, 7));
+        data.directories = vec![
+            dir("/disk", 1, true, true),
+            dir("/disk/a", 2, true, true),
+            dir("/disk/a/nested", 7, false, true),
+            dir("/disk/a/nested/empty", 9, true, false),
+            dir("/disk/b", 5, false, false),
+        ]
+        .into();
+        let mut scene = Scene::from_scan(Arc::new(data));
+        let old = scene.project(View::Files);
+        let unrelated = scene.file_id(Path::new("/disk/b/h")).unwrap();
+        let removed = scene.file_id(Path::new("/disk/a/nested/item")).unwrap();
+        let change = |id, parent| Change::RemoveSubtreeDirectory {
+            path: "/disk/a".into(),
+            identity: identity(id),
+            parent,
+        };
+        assert_eq!(
+            scene
+                .apply_batch(vec![change(99, dir("/disk", 1, true, true))])
+                .unwrap_err(),
+            ChangeError::IdentityMismatch
+        );
+        assert_eq!(scene.project(View::Files), old);
+        assert_eq!(
+            scene
+                .apply_batch(vec![change(2, dir("/disk", 99, true, true))])
+                .unwrap_err(),
+            ChangeError::IdentityMismatch
+        );
+        assert_eq!(scene.project(View::Files), old);
+        assert_eq!(
+            scene
+                .apply_batch(vec![change(2, dir("/disk", 1, false, true))])
+                .unwrap_err(),
+            ChangeError::InvalidParent
+        );
+        assert_eq!(scene.project(View::Files), old);
+        let impact = scene
+            .apply_batch(vec![change(2, dir("/disk", 1, true, true))])
+            .unwrap();
+        assert!(impact.removed.contains(&TileId::File(removed)));
+        assert!(scene.file(removed).is_none());
+        assert!(
+            scene
+                .directory_id(Path::new("/disk/a/nested/empty"))
+                .is_none()
+        );
+        assert_eq!(scene.file_id(Path::new("/disk/b/h")), Some(unrelated));
+        assert_eq!(scene.project(View::Files).len(), 1);
+    }
+    #[test]
+    fn confirmed_subtree_removal_keeps_parent_conservatively_incomplete() {
+        let mut data = fixture();
+        data.files.push(file("/disk/a/nested/item", 11, 8, 7));
+        data.directories = vec![
+            dir("/disk", 1, true, true),
+            dir("/disk/a", 2, true, true),
+            dir("/disk/a/nested", 7, true, false),
+            dir("/disk/b", 5, true, false),
+        ]
+        .into();
+        let mut scene = Scene::from_scan(Arc::new(data));
+        let old_id = scene.directory_id(Path::new("/disk/a/nested")).unwrap();
+        let parent_id = scene.directory_id(Path::new("/disk/a")).unwrap();
+        let action = |id| Change::RemoveConfirmedSubtree {
+            path: "/disk/a/nested".into(),
+            identity: identity(id),
+        };
+        assert_eq!(
+            scene.apply_batch(vec![action(99)]).unwrap_err(),
+            ChangeError::IdentityMismatch
+        );
+        assert!(scene.directory(old_id).is_some());
+        assert!(scene.tile(TileId::Directory(parent_id)).unwrap().can_trash);
+        scene.apply_batch(vec![action(7)]).unwrap();
+        assert!(scene.directory(old_id).is_none());
+        assert_eq!(scene.directory_leaf(Path::new("/disk/a")), Some(false));
+        assert!(!scene.tile(TileId::Directory(parent_id)).unwrap().can_trash);
+        assert!(scene.file_id(Path::new("/disk/b/h")).is_some());
+        scene
+            .apply_batch(vec![Change::UpsertDirectory(dir(
+                "/disk/a", 2, true, false,
+            ))])
+            .unwrap();
+        assert!(scene.tile(TileId::Directory(parent_id)).unwrap().can_trash);
+        assert_eq!(scene.directory_leaf(Path::new("/disk/a")), Some(true));
+    }
+    #[test]
+    fn cloned_scene_isolated_for_reconciliation() {
+        let scene = Scene::from_scan(Arc::new(fixture()));
+        let mut shadow = scene.clone();
+        let id = scene.file_id(Path::new("/disk/a/f")).unwrap();
+        shadow
+            .apply_batch(vec![Change::RemoveFile {
+                path: "/disk/a/f".into(),
+                identity: identity(3),
+            }])
+            .unwrap();
+        assert!(shadow.file(id).is_none());
+        assert!(scene.file(id).is_some());
+        assert_eq!(scene.project(View::Files).len(), 3);
+        assert_eq!(shadow.project(View::Files).len(), 2);
     }
     #[test]
     fn projections_count_hardlinks_as_entries_and_respect_incomplete_directories() {

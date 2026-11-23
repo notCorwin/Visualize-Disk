@@ -83,15 +83,19 @@ pub struct DirectoryFact {
     pub identity: FileIdentity,
     pub enumeration_complete: bool,
     pub has_subdirectories: bool,
+    /// The directory was positively excluded (for example by Trash policy),
+    /// rather than merely unavailable or incompletely enumerated.
+    pub excluded: bool,
 }
 
 impl DirectoryFact {
-    fn skipped(directory: &PendingDirectory) -> Self {
+    fn skipped(directory: &PendingDirectory, excluded: bool) -> Self {
         Self {
             path: directory.path.clone(),
             identity: directory.identity,
             enumeration_complete: false,
             has_subdirectories: false,
+            excluded,
         }
     }
 }
@@ -154,10 +158,13 @@ fn scan_impl(
         return Ok(ScanResult {
             root: root.clone(),
             files: Vec::new(),
-            directories: vec![DirectoryFact::skipped(&PendingDirectory {
-                path: root.clone(),
-                identity: root_identity,
-            })]
+            directories: vec![DirectoryFact::skipped(
+                &PendingDirectory {
+                    path: root.clone(),
+                    identity: root_identity,
+                },
+                true,
+            )]
             .into(),
             skipped: 0,
             errors: Vec::new(),
@@ -170,10 +177,13 @@ fn scan_impl(
             return Ok(ScanResult {
                 root: root.clone(),
                 files: Vec::new(),
-                directories: vec![DirectoryFact::skipped(&PendingDirectory {
-                    path: root.clone(),
-                    identity: root_identity,
-                })]
+                directories: vec![DirectoryFact::skipped(
+                    &PendingDirectory {
+                        path: root.clone(),
+                        identity: root_identity,
+                    },
+                    true,
+                )]
                 .into(),
                 skipped: 0,
                 errors: Vec::new(),
@@ -323,14 +333,13 @@ impl Traversal<'_> {
                 } else {
                     self.real_path(&directory.path)
                 };
-                if self
-                    .skip_trash_or_unknown(&directory.path, macos::trash_relationship(&real_path))
-                {
+                let relationship = macos::trash_relationship(&real_path);
+                if self.skip_trash_or_unknown(&directory.path, relationship) {
                     self.state
                         .lock()
                         .unwrap()
                         .directories
-                        .push(DirectoryFact::skipped(&directory));
+                        .push(DirectoryFact::skipped(&directory, relationship == Ok(true)));
                     return;
                 }
             }
@@ -375,6 +384,7 @@ impl Traversal<'_> {
                     identity: directory.identity,
                     enumeration_complete,
                     has_subdirectories,
+                    excluded: false,
                 });
                 if state.files.is_empty() {
                     state.files = report.files;
@@ -443,21 +453,23 @@ impl Traversal<'_> {
         child: PendingDirectory,
         skipped: &mut u64,
     ) -> Option<PendingDirectory> {
-        if self.excluded_trash.as_ref().is_some_and(|trash| {
+        let excluded = self.excluded_trash.as_ref().is_some_and(|trash| {
             is_excluded_trash(&child.path, trash)
                 || (self.root != self.real_root
                     && is_excluded_trash(&self.real_path(&child.path), trash))
         }) || (cfg!(windows) && child.identity.device != self.root_device)
-            || (self.startup_disk && excluded_from_startup_disk(&child.path))
-        {
-            state.directories.push(DirectoryFact::skipped(&child));
+            || (self.startup_disk && excluded_from_startup_disk(&child.path));
+        if excluded {
+            state.directories.push(DirectoryFact::skipped(&child, true));
             *skipped += 1;
         } else if self.startup_disk && child.path == Path::new("/System/Volumes/Data") {
             state.deferred_data = Some(child);
         } else if state.visited.insert(child.identity) {
             return Some(child);
         } else {
-            state.directories.push(DirectoryFact::skipped(&child));
+            state
+                .directories
+                .push(DirectoryFact::skipped(&child, false));
             *skipped += 1;
         }
         None
@@ -546,6 +558,7 @@ pub(crate) fn directory_fact_after_change(
         identity: expected,
         enumeration_complete: true,
         has_subdirectories: !report.directories.is_empty(),
+        excluded: false,
     })
 }
 
@@ -1045,6 +1058,7 @@ mod tests {
             .unwrap();
         assert!(!fact.enumeration_complete);
         assert!(!fact.has_subdirectories);
+        assert!(!fact.excluded);
     }
 
     #[test]
@@ -1079,6 +1093,23 @@ mod tests {
         assert_eq!(state.directories.len(), 1);
         assert_eq!(state.directories[0].path, Path::new("/Volumes"));
         assert!(!state.directories[0].enumeration_complete);
+        assert!(state.directories[0].excluded);
+        // Duplicate identity is only an unscanned alias, not proof that the
+        // directory is covered by an exclusion policy.
+        let duplicate = PendingDirectory {
+            path: "/elsewhere".into(),
+            identity: FileIdentity {
+                device: 1,
+                inode: 42,
+            },
+        };
+        state.visited.insert(duplicate.identity);
+        assert!(
+            traversal
+                .queue_child(&mut state, duplicate, &mut skipped)
+                .is_none()
+        );
+        assert!(!state.directories[1].excluded);
     }
 
     #[cfg(target_os = "macos")]
