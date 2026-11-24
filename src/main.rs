@@ -11,7 +11,7 @@ mod treemap;
 mod watcher;
 
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Vec2};
-use scene::{NodeId, TileInfo, TransitionBatch, TransitionKind};
+use scene::{NodeId, TileInfo};
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     hash::{Hash, Hasher},
@@ -43,7 +43,6 @@ const PALETTE: [Color32; 12] = {
     ]
 };
 
-const TRANSITION_SECONDS: f64 = 0.30;
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(180);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
 
@@ -385,7 +384,6 @@ enum WorkerEvent {
         patches: Vec<render::RasterPatch>,
         removed_ids: Vec<NodeId>,
         upserted_tiles: Vec<TileInfo>,
-        transitions: TransitionBatch,
         stats: SceneStats,
     },
     StreamFinished {
@@ -465,7 +463,6 @@ impl SceneWorker {
                     patches,
                     removed_ids: diff.removed_ids,
                     upserted_tiles: diff.upserted_tiles,
-                    transitions: diff.transitions,
                     stats: make_stats(s),
                 });
                 wake();
@@ -647,7 +644,6 @@ impl SceneWorker {
                                         patches: Vec::new(),
                                         removed_ids: diff.removed_ids,
                                         upserted_tiles: Vec::new(),
-                                        transitions: diff.transitions,
                                         stats: make_stats(s),
                                     });
                                 }
@@ -681,7 +677,6 @@ impl SceneWorker {
                                     patches,
                                     removed_ids: diff.removed_ids,
                                     upserted_tiles: diff.upserted_tiles,
-                                    transitions: diff.transitions,
                                     stats: make_stats(s),
                                 });
                                 wake();
@@ -888,12 +883,6 @@ impl Drop for SceneWorker {
     }
 }
 
-struct ActiveTransition {
-    batch: TransitionBatch,
-    started: f64,
-    duration: f64,
-}
-
 struct UiScene {
     generation: u64,
     bounds: treemap::Rect,
@@ -901,25 +890,6 @@ struct UiScene {
     texture: egui::TextureHandle,
     owners: render::OwnerGrid,
     tiles: HashMap<NodeId, TileInfo>,
-    transitions: Vec<ActiveTransition>,
-}
-
-impl UiScene {
-    fn is_animating_at(&self, now: f64, world_point: Option<(f32, f32)>) -> bool {
-        self.transitions.iter().any(|tr| {
-            if now - tr.started >= tr.duration {
-                return false;
-            }
-            match world_point {
-                None => true,
-                Some((wx, wy)) => tr
-                    .batch
-                    .dirty_rects
-                    .iter()
-                    .any(|r| wx >= r.x && wx <= r.x + r.w && wy >= r.y && wy <= r.y + r.h),
-            }
-        })
-    }
 }
 
 enum ScanJobKind {
@@ -1619,7 +1589,6 @@ impl App {
         }
 
         // Drain SceneWorker events and apply atomically to the UI frame.
-        let now = ctx.input(|i| i.time);
         let mut new_watch_root: Option<(PathBuf, PathBuf)> = None;
         let mut need_rescan = false;
         if let Some(worker) = &self.worker {
@@ -1656,7 +1625,6 @@ impl App {
                             texture,
                             owners,
                             tiles,
-                            transitions: Vec::new(),
                         }) {
                             defer_drop(old);
                         }
@@ -1687,7 +1655,6 @@ impl App {
                         patches,
                         removed_ids,
                         upserted_tiles,
-                        transitions,
                         stats,
                     } => {
                         if generation != worker.current_generation() {
@@ -1715,20 +1682,6 @@ impl App {
                             }
                             for tile in upserted_tiles {
                                 scene.tiles.insert(tile.id, tile);
-                            }
-                            if !transitions.items.is_empty() || !transitions.backdrops.is_empty() {
-                                let merged = retarget_transition(
-                                    &scene.transitions,
-                                    transitions,
-                                    &removed_ids,
-                                    now,
-                                );
-                                scene.transitions.clear();
-                                scene.transitions.push(ActiveTransition {
-                                    batch: merged,
-                                    started: now,
-                                    duration: TRANSITION_SECONDS,
-                                });
                             }
                         }
                     }
@@ -1770,11 +1723,6 @@ impl App {
             let action = self.next_demo_auto_action();
             self.trigger_demo_action(action);
             self.demo_next_tick = Some(Instant::now() + DEMO_AUTO_INTERVAL);
-        }
-        if let Some(scene) = self.ui_scene.as_mut() {
-            scene
-                .transitions
-                .retain(|tr| now - tr.started < tr.duration);
         }
     }
 
@@ -1952,14 +1900,7 @@ impl App {
         {
             self.trash_selected(id);
         }
-        let now = ctx.input(|i| i.time);
-        let animating = self
-            .ui_scene
-            .as_ref()
-            .is_some_and(|s| s.is_animating_at(now, None));
-        if animating {
-            ctx.request_repaint();
-        } else if self.job.is_some()
+        if self.job.is_some()
             || self.reveal_rx.is_some()
             || self.trash_rx.is_some()
             || self.permission_rx.is_some()
@@ -2171,10 +2112,6 @@ impl App {
 
                 if self.job.is_none()
                     && self.stats.as_ref().is_some_and(|s| s.total_files == 0)
-                    && self
-                        .ui_scene
-                        .as_ref()
-                        .is_none_or(|s| s.transitions.is_empty())
                 {
                     ui.painter_at(canvas).text(
                         canvas.center(),
@@ -2188,7 +2125,6 @@ impl App {
 
                 let painter = ui.painter_at(canvas);
                 let pointer = tooltip_pointer(&response);
-                let now = ctx.input(|i| i.time);
                 let mut hovered: Option<NodeId> = None;
 
                 if let Some(scene) = &self.ui_scene {
@@ -2202,29 +2138,16 @@ impl App {
                         Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0)),
                         Color32::WHITE,
                     );
-                    if !scene.transitions.is_empty() {
-                        paint_transitions(
-                            &painter,
-                            canvas,
-                            scene.bounds,
-                            scale,
-                            &scene.transitions,
-                            now,
-                        );
-                    }
 
                     if let Some(p) = pointer {
                         let wx = (p.x - canvas.min.x) / scale.x;
                         let wy = (p.y - canvas.min.y) / scale.y;
-                        if !scene.is_animating_at(now, Some((wx, wy))) {
-                            hovered = scene.owners.hit_test(wx, wy).map(NodeId);
-                        }
+                        hovered = scene.owners.hit_test(wx, wy).map(NodeId);
                     }
 
                     for (id, width) in [(self.selected, 2.0_f32), (hovered, 1.5_f32)] {
                         if let Some(tile) = id.and_then(|i| scene.tiles.get(&i)) {
-                            let r = animated_tile_rect(&scene.transitions, tile.id, now)
-                                .unwrap_or(tile.rect);
+                            let r = tile.rect;
                             let rect = Rect::from_min_size(
                                 canvas.min + Vec2::new(r.x * scale.x, r.y * scale.y),
                                 Vec2::new(r.w * scale.x, r.h * scale.y),
@@ -2270,263 +2193,6 @@ impl App {
         }
         self.overlays(&ctx);
     }
-}
-
-fn ease_out_cubic(raw_t: f32) -> f32 {
-    1.0 - (1.0 - raw_t.clamp(0.0, 1.0)).powi(3)
-}
-
-fn animated_tile_rect(
-    transitions: &[ActiveTransition],
-    id: NodeId,
-    now: f64,
-) -> Option<treemap::Rect> {
-    for tr in transitions.iter().rev() {
-        let raw_t = ((now - tr.started) / tr.duration).clamp(0.0, 1.0) as f32;
-        if raw_t >= 1.0 {
-            continue;
-        }
-        let ease = ease_out_cubic(raw_t);
-        if let Some(item) = tr.batch.items.iter().find(|item| item.id == id) {
-            return Some(lerp_rect(item.from, item.to, ease));
-        }
-    }
-    None
-}
-
-fn rects_overlap(a: treemap::Rect, b: treemap::Rect) -> bool {
-    a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
-}
-
-/// Retarget an incoming transition batch smoothly from the current in-flight
-/// on-screen positions so rapid mutations never stack opaque overlays, drop
-/// ghost confetti tiles over updated regions, or jump.
-fn retarget_transition(
-    active: &[ActiveTransition],
-    mut next: TransitionBatch,
-    removed_ids: &[NodeId],
-    now: f64,
-) -> TransitionBatch {
-    let Some(prev) = active.last() else {
-        return next;
-    };
-    let raw_t = ((now - prev.started) / prev.duration).clamp(0.0, 1.0) as f32;
-    if raw_t >= 1.0 {
-        return next;
-    }
-    let ease = ease_out_cubic(raw_t);
-
-    let live_tiles: HashMap<NodeId, treemap::Rect> = prev
-        .batch
-        .items
-        .iter()
-        .map(|it| (it.id, lerp_rect(it.from, it.to, ease)))
-        .collect();
-    let live_backdrops: HashMap<usize, treemap::Rect> = prev
-        .batch
-        .backdrops
-        .iter()
-        .map(|b| (b.dir_idx, lerp_rect(b.from, b.to, ease)))
-        .collect();
-
-    let mut next_tile_ids = std::collections::HashSet::with_capacity(next.items.len());
-    for item in &mut next.items {
-        next_tile_ids.insert(item.id);
-        if let Some(&cur) = live_tiles.get(&item.id) {
-            item.from = cur;
-        }
-    }
-    let mut next_backdrop_ids = std::collections::HashSet::with_capacity(next.backdrops.len());
-    for backdrop in &mut next.backdrops {
-        next_backdrop_ids.insert(backdrop.dir_idx);
-        if let Some(&cur) = live_backdrops.get(&backdrop.dir_idx) {
-            backdrop.from = cur;
-        }
-    }
-
-    // Carry forward ONLY still-moving items whose regions are completely
-    // disjoint from `next.dirty_rects`. Any item inside `next.dirty_rects` is
-    // already superseded by `next` (e.g. re-squarified, LOD-collapsed, or
-    // budget-trimmed) and must NOT be painted as ghost confetti over new tiles.
-    let next_dirty = next.dirty_rects.clone();
-    let overlaps_next_dirty = |r: treemap::Rect| next_dirty.iter().any(|&d| rects_overlap(r, d));
-    let removed_set: std::collections::HashSet<NodeId> = removed_ids.iter().copied().collect();
-    let mut carried_items = Vec::new();
-    for prev_item in &prev.batch.items {
-        if prev_item.kind != TransitionKind::FadeOut
-            && !next_tile_ids.contains(&prev_item.id)
-            && !removed_set.contains(&prev_item.id)
-        {
-            let cur = lerp_rect(prev_item.from, prev_item.to, ease);
-            if !overlaps_next_dirty(cur) && !overlaps_next_dirty(prev_item.to) {
-                carried_items.push(scene::TransitionItem {
-                    id: prev_item.id,
-                    from: cur,
-                    to: prev_item.to,
-                    color: prev_item.color,
-                    kind: TransitionKind::Move,
-                });
-            }
-        }
-    }
-    if !carried_items.is_empty() {
-        next.items.extend(carried_items);
-        for prev_b in &prev.batch.backdrops {
-            if !next_backdrop_ids.contains(&prev_b.dir_idx) {
-                let cur = lerp_rect(prev_b.from, prev_b.to, ease);
-                if !overlaps_next_dirty(cur) && !overlaps_next_dirty(prev_b.to) {
-                    next.backdrops.push(scene::TransitionBackdrop {
-                        dir_idx: prev_b.dir_idx,
-                        from: cur,
-                        to: prev_b.to,
-                        color: prev_b.color,
-                    });
-                }
-            }
-        }
-        for &d in &prev.batch.dirty_rects {
-            if !overlaps_next_dirty(d) {
-                next.dirty_rects.push(d);
-            }
-        }
-    }
-    next
-}
-
-fn paint_transitions(
-    painter: &egui::Painter,
-    canvas: Rect,
-    bounds: treemap::Rect,
-    scale: Vec2,
-    transitions: &[ActiveTransition],
-    now: f64,
-) {
-    let to_screen = |r: treemap::Rect| -> Rect {
-        Rect::from_min_size(
-            canvas.min + Vec2::new((r.x - bounds.x) * scale.x, (r.y - bounds.y) * scale.y),
-            Vec2::new(r.w * scale.x, r.h * scale.y),
-        )
-    };
-    let mut mesh = egui::Mesh::default();
-    for tr in transitions {
-        let raw_t = ((now - tr.started) / tr.duration).clamp(0.0, 1.0) as f32;
-        if raw_t >= 1.0 {
-            continue;
-        }
-        let ease = ease_out_cubic(raw_t);
-        // Keep animated quads opaque while blocks glide (>98% settled by 0.75),
-        // then smoothly reveal the crisp hill-shaded raster over 0.75..1.0.
-        let fade_out_overlay = if raw_t < 0.75 {
-            1.0
-        } else {
-            let u = ((raw_t - 0.75) / 0.25).clamp(0.0, 1.0);
-            1.0 - u * u * (3.0 - 2.0 * u)
-        };
-        // Fade the backdrop mask slightly ahead of the tiles so the already-settled
-        // raster underneath replaces tiles with zero dark flash.
-        let bg_fade = if raw_t < 0.70 {
-            1.0
-        } else {
-            let u = ((raw_t - 0.70) / 0.12).clamp(0.0, 1.0);
-            1.0 - u * u * (3.0 - 2.0 * u)
-        };
-
-        let bg_alpha = (bg_fade * 255.0).round() as u8;
-        if bg_alpha > 0 {
-            let bg_color = Color32::from_rgba_unmultiplied(BG.r(), BG.g(), BG.b(), bg_alpha);
-            for &dirty in &tr.batch.dirty_rects {
-                let screen = to_screen(dirty).intersect(canvas);
-                if screen.is_positive() {
-                    mesh.add_colored_rect(screen, bg_color);
-                }
-            }
-        }
-
-        let backdrop_alpha = (fade_out_overlay * 255.0).round() as u8;
-        if backdrop_alpha > 0 {
-            for backdrop in &tr.batch.backdrops {
-                let rect = lerp_rect(backdrop.from, backdrop.to, ease);
-                let screen = to_screen(rect).intersect(canvas);
-                if screen.width() < 0.5 || screen.height() < 0.5 {
-                    continue;
-                }
-                let c = backdrop.color;
-                mesh.add_colored_rect(
-                    screen,
-                    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), backdrop_alpha),
-                );
-            }
-        }
-
-        for item in &tr.batch.items {
-            let rect = lerp_rect(item.from, item.to, ease);
-            // Because SplitTree expands FadeIn from a flush edge and collapses
-            // FadeOut to a flush edge, keeping all tiles opaque during motion
-            // guarantees 100% solid coverage with zero black-BG flash.
-            let alpha_mul = fade_out_overlay;
-            let screen = to_screen(rect).intersect(canvas);
-            if screen.width() < 0.5 || screen.height() < 0.5 || alpha_mul <= 0.01 {
-                continue;
-            }
-            add_shaded_quad(&mut mesh, screen, item.color, alpha_mul);
-        }
-    }
-    if !mesh.is_empty() {
-        painter.add(mesh);
-    }
-}
-
-fn lerp_rect(a: treemap::Rect, b: treemap::Rect, t: f32) -> treemap::Rect {
-    treemap::Rect {
-        x: a.x + (b.x - a.x) * t,
-        y: a.y + (b.y - a.y) * t,
-        w: (a.w + (b.w - a.w) * t).max(0.0),
-        h: (a.h + (b.h - a.h) * t).max(0.0),
-    }
-}
-
-/// Push one quad whose 4 corners match `render.rs`'s top-left-to-bottom-right
-/// directional shading so GPU motion blends seamlessly into the final raster.
-fn add_shaded_quad(mesh: &mut egui::Mesh, rect: Rect, base: Color32, alpha_mul: f32) {
-    let a = (alpha_mul.clamp(0.0, 1.0) * 255.0).round() as u8;
-    let tint = |shade: f64| -> Color32 {
-        let c = render::shaded(base, shade as f32);
-        Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
-    };
-    let tl = tint(render::FILE_SHADE_LIGHT);
-    let tr = tint(render::FILE_SHADE_LIGHT - render::FILE_SHADE_X);
-    let bl = tint(render::FILE_SHADE_LIGHT - render::FILE_SHADE_Y);
-    let br = tint(render::FILE_SHADE_LIGHT - render::FILE_SHADE_X - render::FILE_SHADE_Y);
-    let base_idx = mesh.vertices.len() as u32;
-    let uv = Pos2::ZERO;
-    mesh.vertices.push(egui::epaint::Vertex {
-        pos: rect.left_top(),
-        uv,
-        color: tl,
-    });
-    mesh.vertices.push(egui::epaint::Vertex {
-        pos: rect.right_top(),
-        uv,
-        color: tr,
-    });
-    mesh.vertices.push(egui::epaint::Vertex {
-        pos: rect.right_bottom(),
-        uv,
-        color: br,
-    });
-    mesh.vertices.push(egui::epaint::Vertex {
-        pos: rect.left_bottom(),
-        uv,
-        color: bl,
-    });
-    mesh.indices.extend_from_slice(&[
-        base_idx,
-        base_idx + 1,
-        base_idx + 2,
-        base_idx,
-        base_idx + 2,
-        base_idx + 3,
-    ]);
 }
 
 impl eframe::App for App {
@@ -2760,7 +2426,6 @@ mod tests {
         let scene = app.ui_scene.as_ref().unwrap();
         assert_eq!(scene.texture.id(), initial_tex);
         assert_eq!(app.stats.as_ref().unwrap().total_files, 2);
-        assert!(!scene.transitions.is_empty());
     }
 
     #[test]
@@ -2907,7 +2572,6 @@ mod tests {
         settle(&mut app, &ctx);
         assert!(app.stats.as_ref().unwrap().total_files < initial_files);
         assert_eq!(app.ui_scene.as_ref().unwrap().texture.id(), tex_id);
-        assert!(!app.ui_scene.as_ref().unwrap().transitions.is_empty());
 
         // AddFile and ResizeRandom work in-memory on the same texture.
         let count_after_del = app.stats.as_ref().unwrap().total_files;
@@ -3069,10 +2733,6 @@ mod tests {
         assert_eq!(app.stats.as_ref().unwrap().total_files, 2);
         assert_eq!(app.stats.as_ref().unwrap().total_bytes, 4000);
         assert_eq!(app.ui_scene.as_ref().unwrap().texture.id(), tex_id);
-        assert!(
-            app.ui_scene.as_ref().unwrap().transitions.is_empty(),
-            "streaming batches should publish complete rasters directly without quad-capped overlays"
-        );
 
         // Subsequent rescan on an already-loaded scene uses non-streaming Full mode.
         app.launch_scan(&ctx);
@@ -3083,105 +2743,5 @@ mod tests {
         if let Some(job) = app.job.take() {
             job.cancel.store(true, Ordering::Relaxed);
         }
-    }
-
-    #[test]
-    fn retarget_transition_drops_ghost_tiles_in_updated_regions() {
-        let prev = ActiveTransition {
-            started: 0.0,
-            duration: TRANSITION_SECONDS,
-            batch: TransitionBatch {
-                dirty_rects: vec![
-                    treemap::Rect {
-                        x: 0.0,
-                        y: 0.0,
-                        w: 400.0,
-                        h: 400.0,
-                    },
-                    treemap::Rect {
-                        x: 600.0,
-                        y: 0.0,
-                        w: 200.0,
-                        h: 200.0,
-                    },
-                ],
-                backdrops: Vec::new(),
-                items: vec![
-                    // Inside region that next batch replaces -> MUST NOT be carried forward.
-                    scene::TransitionItem {
-                        id: NodeId(10),
-                        from: treemap::Rect {
-                            x: 20.0,
-                            y: 20.0,
-                            w: 10.0,
-                            h: 10.0,
-                        },
-                        to: treemap::Rect {
-                            x: 30.0,
-                            y: 30.0,
-                            w: 10.0,
-                            h: 10.0,
-                        },
-                        color: PALETTE[0],
-                        kind: TransitionKind::Move,
-                    },
-                    // In completely disjoint untouched region -> carried forward cleanly.
-                    scene::TransitionItem {
-                        id: NodeId(20),
-                        from: treemap::Rect {
-                            x: 610.0,
-                            y: 10.0,
-                            w: 50.0,
-                            h: 50.0,
-                        },
-                        to: treemap::Rect {
-                            x: 650.0,
-                            y: 10.0,
-                            w: 50.0,
-                            h: 50.0,
-                        },
-                        color: PALETTE[1],
-                        kind: TransitionKind::Move,
-                    },
-                ],
-            },
-        };
-        let next = TransitionBatch {
-            dirty_rects: vec![treemap::Rect {
-                x: 0.0,
-                y: 0.0,
-                w: 400.0,
-                h: 400.0,
-            }],
-            backdrops: Vec::new(),
-            items: vec![scene::TransitionItem {
-                id: NodeId(99),
-                from: treemap::Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    w: 400.0,
-                    h: 400.0,
-                },
-                to: treemap::Rect {
-                    x: 0.0,
-                    y: 0.0,
-                    w: 400.0,
-                    h: 400.0,
-                },
-                color: PALETTE[2],
-                kind: TransitionKind::Move,
-            }],
-        };
-        let merged = retarget_transition(&[prev], next, &[], 0.15);
-        let ids: Vec<NodeId> = merged.items.iter().map(|it| it.id).collect();
-        assert!(ids.contains(&NodeId(99)));
-        assert!(
-            !ids.contains(&NodeId(10)),
-            "stale tile inside updated region must not float as ghost confetti"
-        );
-        assert!(
-            ids.contains(&NodeId(20)),
-            "disjoint still-moving tile should finish its transition smoothly"
-        );
     }
 }

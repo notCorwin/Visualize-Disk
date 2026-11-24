@@ -23,9 +23,9 @@ const BEVEL_WIDTH: f32 = 3.0;
 const LAYER_HEIGHT: f32 = 4.0;
 pub const LIGHT_REACH: f32 = 6.0;
 const DECORATION_DECAY: f32 = 0.9;
-pub const FILE_SHADE_LIGHT: f64 = 1.20;
-pub const FILE_SHADE_X: f64 = 0.18;
-pub const FILE_SHADE_Y: f64 = 0.12;
+const FILE_SHADE_LIGHT: f64 = 1.20;
+const FILE_SHADE_X: f64 = 0.18;
+const FILE_SHADE_Y: f64 = 0.12;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Platform {
@@ -328,7 +328,7 @@ fn contact_occlusion(field: &HeightField, x: f32, y: f32) -> f32 {
     occlusion
 }
 
-pub fn shaded(color: Color32, shade: f32) -> Color32 {
+fn shaded(color: Color32, shade: f32) -> Color32 {
     let alpha = color.a();
     let channel = |v: u8| (v as f32 * shade).round().min(alpha as f32) as u8;
     Color32::from_rgba_premultiplied(
