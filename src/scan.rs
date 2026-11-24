@@ -108,6 +108,60 @@ pub struct ScanProgress {
     pub skipped: u64,
 }
 
+/// Incremental batch of newly scanned directories and files emitted during
+/// initial live-rendered scans.
+#[derive(Debug, Default)]
+pub struct ScanBatch {
+    pub directories: Vec<DirectoryFact>,
+    pub files: Vec<FileEntry>,
+    pub errors: Vec<String>,
+    pub skipped: u64,
+    pub elapsed: Duration,
+}
+
+impl ScanBatch {
+    pub fn is_empty(&self) -> bool {
+        self.directories.is_empty() && self.files.is_empty() && self.errors.is_empty()
+    }
+
+    pub fn merge_from(&mut self, mut other: ScanBatch) {
+        if self.directories.is_empty() {
+            self.directories = other.directories;
+        } else {
+            self.directories.append(&mut other.directories);
+        }
+        if self.files.is_empty() {
+            self.files = other.files;
+        } else {
+            self.files.append(&mut other.files);
+        }
+        let remain = 24usize.saturating_sub(self.errors.len());
+        self.errors.extend(other.errors.into_iter().take(remain));
+        self.skipped = self.skipped.max(other.skipped);
+        self.elapsed = self.elapsed.max(other.elapsed);
+    }
+}
+
+#[derive(Debug)]
+pub enum ScanStreamEvent {
+    Started {
+        root: PathBuf,
+        real_root: PathBuf,
+        root_identity: FileIdentity,
+    },
+    Batch(ScanBatch),
+    Finished(ScanBatch),
+}
+
+const STREAM_FIRST_FLUSH_DELAY: Duration = Duration::from_millis(40);
+const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(180);
+
+struct StreamSink {
+    tx: std::sync::mpsc::Sender<ScanStreamEvent>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+    started: Instant,
+}
+
 /// Scan on a worker thread. Symlinks and special files are never followed.
 /// Hard links are counted by directory entry, matching the file-based display.
 pub fn scan(
@@ -115,7 +169,33 @@ pub fn scan(
     cancel: Arc<AtomicBool>,
     progress: Arc<Mutex<ScanProgress>>,
 ) -> Result<ScanResult, String> {
-    let started = Instant::now();
+    scan_impl(root, cancel, progress, None)
+}
+
+/// Scan on a worker thread while streaming periodic directory/file batches so
+/// the UI can progressively render the initial map without waiting for completion.
+pub fn scan_streaming(
+    root: PathBuf,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<Mutex<ScanProgress>>,
+    tx: std::sync::mpsc::Sender<ScanStreamEvent>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+) -> Result<(), String> {
+    let sink = StreamSink {
+        tx,
+        wake,
+        started: Instant::now(),
+    };
+    scan_impl(root, cancel, progress, Some(sink)).map(|_| ())
+}
+
+fn scan_impl(
+    root: PathBuf,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<Mutex<ScanProgress>>,
+    stream: Option<StreamSink>,
+) -> Result<ScanResult, String> {
+    let started = stream.as_ref().map_or_else(Instant::now, |s| s.started);
     let metadata = fs::symlink_metadata(&root).map_err(|e| root_error(&e))?;
     if !metadata.is_dir() || is_link_or_reparse(&metadata) {
         return Err("扫描位置不是可读取的真实目录；不扫描符号链接。".into());
@@ -124,46 +204,56 @@ pub fn scan(
     let real_root = fs::canonicalize(&root).map_err(|e| root_error(&e))?;
     let root_identity = FileIdentity::from_path(&root, &metadata).map_err(|e| root_error(&e))?;
     let excluded_trash = excluded_trash_path();
-    if excluded_trash.as_ref().is_some_and(|trash| {
-        is_excluded_trash(&root, trash) || is_excluded_trash(&real_root, trash)
-    }) {
-        return Ok(ScanResult {
+    let emit_excluded = |stream: Option<StreamSink>| -> Result<ScanResult, String> {
+        let fact = DirectoryFact::skipped(
+            &PendingDirectory {
+                path: root.clone(),
+                identity: root_identity,
+            },
+            true,
+        );
+        if let Some(sink) = stream {
+            let _ = sink.tx.send(ScanStreamEvent::Started {
+                root: root.clone(),
+                real_root: real_root.clone(),
+                root_identity,
+            });
+            let _ = sink.tx.send(ScanStreamEvent::Finished(ScanBatch {
+                directories: vec![fact.clone()],
+                files: Vec::new(),
+                errors: Vec::new(),
+                skipped: 0,
+                elapsed: started.elapsed(),
+            }));
+            (sink.wake)();
+        }
+        Ok(ScanResult {
             root: root.clone(),
             files: Vec::new(),
-            directories: vec![DirectoryFact::skipped(
-                &PendingDirectory {
-                    path: root.clone(),
-                    identity: root_identity,
-                },
-                true,
-            )]
-            .into(),
+            directories: vec![fact].into(),
             skipped: 0,
             errors: Vec::new(),
             elapsed: started.elapsed(),
-        });
+        })
+    };
+    if excluded_trash.as_ref().is_some_and(|trash| {
+        is_excluded_trash(&root, trash) || is_excluded_trash(&real_root, trash)
+    }) {
+        return emit_excluded(stream);
     }
     #[cfg(target_os = "macos")]
     match macos::trash_relationship(&real_root) {
-        Ok(true) => {
-            return Ok(ScanResult {
-                root: root.clone(),
-                files: Vec::new(),
-                directories: vec![DirectoryFact::skipped(
-                    &PendingDirectory {
-                        path: root.clone(),
-                        identity: root_identity,
-                    },
-                    true,
-                )]
-                .into(),
-                skipped: 0,
-                errors: Vec::new(),
-                elapsed: started.elapsed(),
-            });
-        }
+        Ok(true) => return emit_excluded(stream),
         Ok(false) => {}
         Err(()) => return Err("无法确认扫描位置是否位于废纸篓，请检查磁盘和访问权限。".into()),
+    }
+    if let Some(sink) = &stream {
+        let _ = sink.tx.send(ScanStreamEvent::Started {
+            root: root.clone(),
+            real_root: real_root.clone(),
+            root_identity,
+        });
+        (sink.wake)();
     }
     #[cfg(target_os = "macos")]
     let known_trash_ids = macos::volume_trash_identities(&real_root);
@@ -177,36 +267,55 @@ pub fn scan(
         known_trash_ids,
         cancel: &cancel,
         progress: &progress,
-        state: Mutex::new(TraversalState::default()),
+        stream: stream.as_ref(),
+        state: Mutex::new(TraversalState::new(started)),
     };
-    let mut next = Some(PendingDirectory {
-        identity: root_identity,
-        path: root.clone(),
-    });
-    while let Some(directory) = next {
-        if cancel.load(Ordering::Relaxed) {
-            break;
+    let run_traversal = || {
+        let mut next = Some(PendingDirectory {
+            identity: root_identity,
+            path: root.clone(),
+        });
+        while let Some(directory) = next {
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let new_identity = traversal
+                .state
+                .lock()
+                .unwrap()
+                .visited
+                .insert(directory.identity);
+            if !new_identity {
+                publish(
+                    &progress,
+                    ScanProgress {
+                        skipped: 1,
+                        ..Default::default()
+                    },
+                );
+                break;
+            }
+            // Schedule descendants immediately, giving earlier discoveries priority
+            // on each worker. Finish this phase before the Data aliases can claim identities.
+            rayon::scope_fifo(|scope| traversal.spawn(scope, directory));
+            next = traversal.state.lock().unwrap().deferred_data.take();
         }
-        let new_identity = traversal
-            .state
-            .lock()
-            .unwrap()
-            .visited
-            .insert(directory.identity);
-        if !new_identity {
-            publish(
-                &progress,
-                ScanProgress {
-                    skipped: 1,
-                    ..Default::default()
-                },
-            );
-            break;
+    };
+    if stream.is_some() {
+        // Isolate streaming directory traversal from the global Rayon pool so
+        // live layout & rasterization on `SceneWorker` never starve behind scan tasks.
+        let scan_threads = std::thread::available_parallelism()
+            .map_or(2, |n| n.get().saturating_sub(2).max(2));
+        if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+            .num_threads(scan_threads)
+            .build()
+        {
+            pool.install(run_traversal);
+        } else {
+            run_traversal();
         }
-        // Schedule descendants immediately, giving earlier discoveries priority
-        // on each worker. Finish this phase before the Data aliases can claim identities.
-        rayon::scope_fifo(|scope| traversal.spawn(scope, directory));
-        next = traversal.state.lock().unwrap().deferred_data.take();
+    } else {
+        run_traversal();
     }
     let TraversalState {
         mut files,
@@ -221,11 +330,29 @@ pub fn scan(
     if cancel.load(Ordering::Relaxed) {
         return Err("扫描已取消。".into());
     }
+    let state = *progress.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(sink) = stream {
+        let _ = sink.tx.send(ScanStreamEvent::Finished(ScanBatch {
+            directories,
+            files,
+            errors,
+            skipped: state.skipped,
+            elapsed: started.elapsed(),
+        }));
+        (sink.wake)();
+        return Ok(ScanResult {
+            root,
+            files: Vec::new(),
+            directories: Vec::new().into(),
+            skipped: state.skipped,
+            errors: Vec::new(),
+            elapsed: started.elapsed(),
+        });
+    }
     sort_scanned_files(&mut files);
     if cancel.load(Ordering::Relaxed) {
         return Err("扫描已取消。".into());
     }
-    let state = *progress.lock().unwrap_or_else(|e| e.into_inner());
     Ok(ScanResult {
         root,
         files,
@@ -275,14 +402,40 @@ fn compare_scanned_paths(a: &Path, b: &Path) -> std::cmp::Ordering {
     a.len().cmp(&b.len())
 }
 
-#[derive(Default)]
 struct TraversalState {
     visited: HashSet<DirectoryIdentity>,
     files: Vec<FileEntry>,
     directories: Vec<DirectoryFact>,
     errors: Vec<String>,
+    total_errors: usize,
     deferred_data: Option<PendingDirectory>,
     root_failure: Option<String>,
+    last_flush: Instant,
+    dirs_since_flush: usize,
+    flushed_any: bool,
+}
+
+impl Default for TraversalState {
+    fn default() -> Self {
+        Self::new(Instant::now())
+    }
+}
+
+impl TraversalState {
+    fn new(started: Instant) -> Self {
+        Self {
+            visited: HashSet::new(),
+            files: Vec::new(),
+            directories: Vec::new(),
+            errors: Vec::new(),
+            total_errors: 0,
+            deferred_data: None,
+            root_failure: None,
+            last_flush: started,
+            dirs_since_flush: 0,
+            flushed_any: false,
+        }
+    }
 }
 
 struct Traversal<'a> {
@@ -295,6 +448,7 @@ struct Traversal<'a> {
     known_trash_ids: HashSet<FileIdentity>,
     cancel: &'a AtomicBool,
     progress: &'a Mutex<ScanProgress>,
+    stream: Option<&'a StreamSink>,
     state: Mutex<TraversalState>,
 }
 
@@ -357,7 +511,7 @@ impl Traversal<'_> {
                             )));
             }
             let mut skipped = 0;
-            let children: Vec<_> = {
+            let (children, flush_batch): (Vec<_>, Option<ScanBatch>) = {
                 let mut state = self.state.lock().unwrap();
                 if let Some(error) = report.unreadable
                     && directory.path == self.root
@@ -377,16 +531,50 @@ impl Traversal<'_> {
                 } else {
                     state.files.append(&mut report.files);
                 }
-                let retain_errors = 24usize.saturating_sub(state.errors.len());
+                let retain_errors = 24usize.saturating_sub(state.total_errors);
+                let added_errors = report.errors.len().min(retain_errors);
                 state
                     .errors
-                    .extend(report.errors.into_iter().take(retain_errors));
-                report
+                    .extend(report.errors.into_iter().take(added_errors));
+                state.total_errors += added_errors;
+                let children: Vec<_> = report
                     .directories
                     .into_iter()
                     .filter_map(|child| self.queue_child(&mut state, child, &mut skipped))
-                    .collect()
+                    .collect();
+
+                let mut batch = None;
+                if let Some(sink) = self.stream {
+                    state.dirs_since_flush += 1;
+                    let first_ready = !state.flushed_any
+                        && !state.files.is_empty()
+                        && (state.files.len() >= 64
+                            || state.dirs_since_flush >= 4
+                            || state.last_flush.elapsed() >= STREAM_FIRST_FLUSH_DELAY);
+                    let next_ready = state.flushed_any
+                        && (!state.files.is_empty() || !state.directories.is_empty())
+                        && (state.dirs_since_flush >= 8 || state.files.len() >= 256)
+                        && state.last_flush.elapsed() >= STREAM_FLUSH_INTERVAL;
+                    if first_ready || next_ready {
+                        let prog = *self.progress.lock().unwrap_or_else(|e| e.into_inner());
+                        state.flushed_any = true;
+                        state.last_flush = Instant::now();
+                        state.dirs_since_flush = 0;
+                        batch = Some(ScanBatch {
+                            directories: std::mem::take(&mut state.directories),
+                            files: std::mem::take(&mut state.files),
+                            errors: std::mem::take(&mut state.errors),
+                            skipped: prog.skipped.saturating_add(skipped),
+                            elapsed: sink.started.elapsed(),
+                        });
+                    }
+                }
+                (children, batch)
             };
+            if let (Some(sink), Some(batch)) = (self.stream, flush_batch) {
+                let _ = sink.tx.send(ScanStreamEvent::Batch(batch));
+                (sink.wake)();
+            }
             if skipped != 0 {
                 publish(
                     self.progress,
@@ -1194,6 +1382,7 @@ mod tests {
             known_trash_ids: HashSet::new(),
             cancel: &cancel,
             progress: &progress,
+            stream: None,
             state: Mutex::default(),
         };
         let mut state = TraversalState::default();
@@ -1344,6 +1533,7 @@ mod tests {
             known_trash_ids: HashSet::new(),
             cancel: &cancel,
             progress: &progress,
+            stream: None,
             state: Mutex::new(TraversalState::default()),
         };
         assert!(!traversal.skip_trash_or_unknown(Path::new("/ordinary"), Ok(false)));
@@ -1371,6 +1561,7 @@ mod tests {
             known_trash_ids: HashSet::new(),
             cancel: &cancel,
             progress: &progress,
+            stream: None,
             state: Mutex::default(),
         };
         let identity = FileIdentity {
@@ -1411,6 +1602,7 @@ mod tests {
             excluded_trash: None,
             cancel: &cancel,
             progress: &progress,
+            stream: None,
             state: Mutex::default(),
         };
         let identity = FileIdentity {
@@ -1952,5 +2144,58 @@ mod tests {
         assert_eq!(report.files.len(), 512);
         assert_eq!(progress.lock().unwrap().files, 512);
         assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn streaming_scan_produces_same_files_and_bytes_as_full_scan() {
+        let temp = Temp::new();
+        for dir in 0..8 {
+            let sub = temp.0.join(format!("dir-{dir}"));
+            fs::create_dir(&sub).unwrap();
+            for file in 0..5 {
+                fs::write(sub.join(format!("f-{file}")), vec![0u8; (dir + 1) * 128 + file])
+                    .unwrap();
+            }
+        }
+        let full = scan(
+            temp.0.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(ScanProgress::default())),
+        )
+        .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        scan_streaming(
+            temp.0.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(ScanProgress::default())),
+            tx,
+            Arc::new(|| {}),
+        )
+        .unwrap();
+
+        let mut started = false;
+        let mut finished = false;
+        let mut streamed_files = Vec::new();
+        for evt in rx {
+            match evt {
+                ScanStreamEvent::Started { root, .. } => {
+                    assert_eq!(root, temp.0);
+                    started = true;
+                }
+                ScanStreamEvent::Batch(batch) => {
+                    streamed_files.extend(batch.files);
+                }
+                ScanStreamEvent::Finished(batch) => {
+                    streamed_files.extend(batch.files);
+                    finished = true;
+                }
+            }
+        }
+        assert!(started && finished);
+        assert_eq!(streamed_files.len(), full.files.len());
+        let streamed_bytes: u64 = streamed_files.iter().map(|f| f.size).sum();
+        let full_bytes: u64 = full.files.iter().map(|f| f.size).sum();
+        assert_eq!(streamed_bytes, full_bytes);
     }
 }

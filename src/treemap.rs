@@ -286,9 +286,10 @@ impl<K: Copy + Eq + Hash + Send> SplitTree<K> {
 
         let mut before_weights: Vec<u64> = self.nodes.iter().map(|n| n.weight).collect();
 
-        // Splice newly added items along the right-most spine of the existing
-        // tree with `before_weight = 0` so existing items keep their exact
-        // `before` geometry and new items slide cleanly out from an edge.
+        // Splice newly added items along the right-most spine at the depth that
+        // gives the new subtree the squarest aspect ratio, with `before_weight = 0`
+        // so existing items keep their exact `before` geometry and new items slide
+        // cleanly out from an edge without reordering anything.
         if !added.is_empty() {
             let added_total: u64 = added
                 .iter()
@@ -299,10 +300,12 @@ impl<K: Copy + Eq + Hash + Send> SplitTree<K> {
             while let SplitKind::Branch { axis, left, right } = self.nodes[cur].kind {
                 let lw = before_weights[left as usize];
                 let rw = before_weights[right as usize];
-                if added_total >= rw {
+                let (_, right_rect) = split_rect_by_weights(cur_rect, axis, lw, rw);
+                let aspect_here = candidate_split_aspect(cur_rect, before_weights[cur], added_total);
+                let aspect_deeper = candidate_split_aspect(right_rect, rw, added_total);
+                if aspect_deeper >= aspect_here {
                     break;
                 }
-                let (_, right_rect) = split_rect_by_weights(cur_rect, axis, lw, rw);
                 cur = right as usize;
                 cur_rect = right_rect;
             }
@@ -479,93 +482,232 @@ fn split_rect_by_weights(rect: Rect, axis: SplitAxis, left_w: u64, right_w: u64)
     }
 }
 
-fn build_nodes<K: Copy>(
-    ordered: &[(usize, K, u64)],
-    bounds: Rect,
+fn candidate_split_aspect(rect: Rect, existing_w: u64, added_w: u64) -> f64 {
+    let axis = if rect.w >= rect.h {
+        SplitAxis::Vertical
+    } else {
+        SplitAxis::Horizontal
+    };
+    let (_, new_r) = split_rect_by_weights(rect, axis, existing_w, added_w);
+    rect_aspect(new_r)
+}
+
+pub fn rect_aspect(r: Rect) -> f64 {
+    let w = r.w as f64;
+    let h = r.h as f64;
+    if w <= 1e-6 || h <= 1e-6 {
+        return f64::INFINITY;
+    }
+    (w / h).max(h / w)
+}
+
+fn strip_worst_aspect(row_w: f64, max_item: f64, min_item: f64, total_w: f64, short: f64, long: f64) -> f64 {
+    if row_w <= 0.0 || min_item <= 0.0 || max_item <= 0.0 || short <= 0.0 || long <= 0.0 {
+        return f64::INFINITY;
+    }
+    let s2 = row_w * row_w;
+    let coeff = long / (short * total_w);
+    let r_min = coeff * s2 / min_item;
+    let r_max = coeff * s2 / max_item;
+    r_min.max(1.0 / r_max)
+}
+
+/// Build a balanced binary subtree for a 1D squarified strip whose items are
+/// stacked along `axis`, writing its root directly into `root_slot`.
+fn build_strip_nodes_into<K: Copy>(
+    root_slot: u32,
+    slice: &[(usize, K, u64)],
+    prefix_u64: &[u64],
+    base_idx: usize,
+    axis: SplitAxis,
     nodes: &mut Vec<SplitNode<K>>,
-    token: Generation<'_>,
-) -> Option<u32> {
-    // Iterative construction using pre-allocated slot indices so arbitrarily
-    // deep distributions never overflow the stack.
-    let root_idx = nodes.len() as u32;
-    nodes.push(SplitNode {
-        weight: 0,
-        kind: SplitKind::Leaf(ordered[0].1),
-    });
-    let mut stack = vec![(root_idx, ordered, bounds)];
-    let mut processed = 0usize;
-    while let Some((slot, slice, rect)) = stack.pop() {
-        if processed.is_multiple_of(128) && cancelled(token) {
-            return None;
-        }
-        processed += 1;
-        if slice.len() == 1 {
+) {
+    let mut stack = vec![(root_slot, 0usize, slice.len())];
+    while let Some((slot, lo, hi)) = stack.pop() {
+        let len = hi - lo;
+        let total = prefix_u64[base_idx + hi].saturating_sub(prefix_u64[base_idx + lo]);
+        if len == 1 {
             nodes[slot as usize] = SplitNode {
-                weight: slice[0].2,
-                kind: SplitKind::Leaf(slice[0].1),
+                weight: slice[lo].2,
+                kind: SplitKind::Leaf(slice[lo].1),
             };
             continue;
         }
-        let mut total = 0.0f64;
-        let mut total_u64 = 0u64;
-        for chunk in slice.chunks(4096) {
-            if slice.len() >= 4096 && cancelled(token) {
-                return None;
-            }
-            for &(_, _, w) in chunk {
-                total += w as f64;
-                total_u64 = total_u64.saturating_add(w);
-            }
-        }
-        let target = total / 2.0;
-        let mut left_sum = 0.0f64;
-        let mut left_u64 = 0u64;
-        let mut split = 1usize;
-        for (index, &(_, _, w)) in slice.iter().enumerate().take(slice.len() - 1) {
-            if index.is_multiple_of(4096) && slice.len() >= 4096 && cancelled(token) {
-                return None;
-            }
-            let next = left_sum + w as f64;
-            if index > 0 && (left_sum - target).abs() <= (next - target).abs() {
-                split = index;
-                break;
-            }
-            left_sum = next;
-            left_u64 = left_u64.saturating_add(w);
-            split = index + 1;
-            if left_sum >= target {
-                break;
-            }
-        }
-        let right_u64 = total_u64.saturating_sub(left_u64);
-        let axis = if rect.w >= rect.h {
-            SplitAxis::Vertical
-        } else {
-            SplitAxis::Horizontal
-        };
-        let (a, b) = split_rect_by_weights(rect, axis, left_u64, right_u64);
+        let mid = lo + len / 2;
         let left_slot = nodes.len() as u32;
         nodes.push(SplitNode {
             weight: 0,
-            kind: SplitKind::Leaf(slice[0].1),
+            kind: SplitKind::Leaf(slice[lo].1),
         });
         let right_slot = nodes.len() as u32;
         nodes.push(SplitNode {
             weight: 0,
-            kind: SplitKind::Leaf(slice[split].1),
+            kind: SplitKind::Leaf(slice[mid].1),
         });
         nodes[slot as usize] = SplitNode {
-            weight: total_u64,
+            weight: total,
             kind: SplitKind::Branch {
                 axis,
                 left: left_slot,
                 right: right_slot,
             },
         };
-        stack.push((right_slot, &slice[split..], b));
-        stack.push((left_slot, &slice[..split], a));
+        stack.push((right_slot, mid, hi));
+        stack.push((left_slot, lo, mid));
     }
-    (!cancelled(token)).then_some(root_idx)
+}
+
+/// Build a Squarified Treemap (Bruls, Huizing, van Wijk) directly as a
+/// persistent binary `SplitTree` in O(n) partitioning time.
+fn build_nodes<K: Copy>(
+    ordered: &[(usize, K, u64)],
+    bounds: Rect,
+    nodes: &mut Vec<SplitNode<K>>,
+    token: Generation<'_>,
+) -> Option<u32> {
+    let n = ordered.len();
+    if n == 0 {
+        return None;
+    }
+    if n == 1 {
+        let idx = nodes.len() as u32;
+        nodes.push(SplitNode {
+            weight: ordered[0].2,
+            kind: SplitKind::Leaf(ordered[0].1),
+        });
+        return Some(idx);
+    }
+
+    let mut prefix_f64 = Vec::with_capacity(n + 1);
+    let mut prefix_u64 = Vec::with_capacity(n + 1);
+    prefix_f64.push(0.0);
+    prefix_u64.push(0);
+    let mut acc_f64 = 0.0f64;
+    let mut acc_u64 = 0u64;
+    for (i, &(_, _, w)) in ordered.iter().enumerate() {
+        if i.is_multiple_of(4096) && cancelled(token) {
+            return None;
+        }
+        acc_f64 += w as f64;
+        acc_u64 = acc_u64.saturating_add(w);
+        prefix_f64.push(acc_f64);
+        prefix_u64.push(acc_u64);
+    }
+
+    let root_slot = nodes.len() as u32;
+    nodes.push(SplitNode {
+        weight: 0,
+        kind: SplitKind::Leaf(ordered[0].1),
+    });
+
+    let mut slot = root_slot;
+    let mut start = 0usize;
+    let mut rect = bounds;
+    let mut strips = 0usize;
+
+    while start < n {
+        if strips.is_multiple_of(128) && cancelled(token) {
+            return None;
+        }
+        strips += 1;
+
+        let remaining = n - start;
+        if remaining == 1 {
+            nodes[slot as usize] = SplitNode {
+                weight: ordered[start].2,
+                kind: SplitKind::Leaf(ordered[start].1),
+            };
+            break;
+        }
+
+        let total_f64 = (prefix_f64[n] - prefix_f64[start]).max(1.0);
+        let total_u64 = prefix_u64[n].saturating_sub(prefix_u64[start]);
+        let (outer_axis, perp_axis, short, long) = if rect.w >= rect.h {
+            (
+                SplitAxis::Vertical,
+                SplitAxis::Horizontal,
+                (rect.h as f64).max(1e-6),
+                (rect.w as f64).max(1e-6),
+            )
+        } else {
+            (
+                SplitAxis::Horizontal,
+                SplitAxis::Vertical,
+                (rect.w as f64).max(1e-6),
+                (rect.h as f64).max(1e-6),
+            )
+        };
+
+        // Greedily grow the strip along the shorter side while worst aspect improves.
+        let max_item = ordered[start].2 as f64;
+        let mut count = 1usize;
+        let mut row_w = max_item;
+        let mut best_worst = strip_worst_aspect(row_w, max_item, max_item, total_f64, short, long);
+
+        while start + count < n {
+            let next_item = ordered[start + count].2 as f64;
+            let next_row_w = row_w + next_item;
+            let next_worst =
+                strip_worst_aspect(next_row_w, max_item, next_item, total_f64, short, long);
+            if next_worst <= best_worst {
+                count += 1;
+                row_w = next_row_w;
+                best_worst = next_worst;
+            } else {
+                break;
+            }
+        }
+
+        if start + count == n {
+            // All remaining items belong to this final 1D strip.
+            build_strip_nodes_into(
+                slot,
+                &ordered[start..n],
+                &prefix_u64,
+                start,
+                perp_axis,
+                nodes,
+            );
+            break;
+        }
+
+        let strip_u64 = prefix_u64[start + count].saturating_sub(prefix_u64[start]);
+        let rest_u64 = total_u64.saturating_sub(strip_u64);
+        let (_, rest_rect) = split_rect_by_weights(rect, outer_axis, strip_u64, rest_u64);
+
+        let left_slot = nodes.len() as u32;
+        nodes.push(SplitNode {
+            weight: 0,
+            kind: SplitKind::Leaf(ordered[start].1),
+        });
+        build_strip_nodes_into(
+            left_slot,
+            &ordered[start..start + count],
+            &prefix_u64,
+            start,
+            perp_axis,
+            nodes,
+        );
+        let right_slot = nodes.len() as u32;
+        nodes.push(SplitNode {
+            weight: 0,
+            kind: SplitKind::Leaf(ordered[start + count].1),
+        });
+        nodes[slot as usize] = SplitNode {
+            weight: total_u64,
+            kind: SplitKind::Branch {
+                axis: outer_axis,
+                left: left_slot,
+                right: right_slot,
+            },
+        };
+
+        slot = right_slot;
+        start += count;
+        rect = rest_rect;
+    }
+
+    (!cancelled(token)).then_some(root_slot)
 }
 
 fn post_order<K>(nodes: &[SplitNode<K>], root: u32) -> Vec<usize> {
@@ -1050,5 +1192,42 @@ mod tests {
             let exp = weight_map[k] as f32 / total_w as f32;
             assert!((frac - exp).abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn squarified_split_tree_produces_near_square_rectangles() {
+        // Classic Bruls-Huizing-van Wijk paper example: [6, 6, 4, 3, 2, 2, 1] in 600x400.
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 600.0,
+            h: 400.0,
+        };
+        let items = vec![
+            (0u32, 6),
+            (1, 6),
+            (2, 4),
+            (3, 3),
+            (4, 2),
+            (5, 2),
+            (6, 1),
+        ];
+        let tree = SplitTree::build(&items, bounds);
+        let rects = tree.evaluate(bounds);
+        assert_eq!(rects.len(), items.len());
+        let max_aspect = rects
+            .iter()
+            .map(|(_, r)| rect_aspect(*r))
+            .fold(0.0f64, f64::max);
+        assert!(
+            max_aspect <= 3.05,
+            "expected squarified max aspect <= 3.05, got {max_aspect}"
+        );
+        // Verify average aspect ratio is very close to 1.
+        let avg_aspect = rects.iter().map(|(_, r)| rect_aspect(*r)).sum::<f64>() / rects.len() as f64;
+        assert!(
+            avg_aspect <= 1.85,
+            "expected squarified avg aspect <= 1.85, got {avg_aspect}"
+        );
     }
 }

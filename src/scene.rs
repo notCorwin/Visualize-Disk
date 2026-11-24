@@ -11,7 +11,7 @@ use crate::{
     file_actions,
     render::{self, LIGHT_REACH, Platform, RasterPatch, RenderEntry},
     scan::{self, DirectorySnapshot, FileIdentity, ScanResult},
-    treemap::{Rect, SplitTree, SyncStatus},
+    treemap::{self, Rect, SplitTree, SyncEntry, SyncStatus},
 };
 use eframe::egui::Color32;
 use std::{
@@ -24,14 +24,6 @@ use std::{
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NodeId(pub u32);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ViewMode {
-    Files,
-    Folders,
-    #[default]
-    Hybrid,
-}
 
 #[derive(Clone, Debug)]
 pub struct TileInfo {
@@ -94,6 +86,7 @@ struct DirNode {
     parent: Option<usize>,
     identity: FileIdentity,
     enumeration_complete: bool,
+    has_subdirectories: bool,
     excluded: bool,
     files: Vec<FileNode>,
     subdirs: Vec<usize>,
@@ -153,6 +146,7 @@ impl SceneTree {
             parent,
             identity,
             enumeration_complete,
+            has_subdirectories: false,
             excluded,
             files: Vec::new(),
             subdirs: Vec::new(),
@@ -169,9 +163,139 @@ impl SceneTree {
                 if !parent_node.subdirs.contains(&idx) {
                     parent_node.subdirs.push(idx);
                 }
+                parent_node.has_subdirectories = true;
             }
         }
         idx
+    }
+
+    /// Create an empty `SceneTree` rooted at `root` for progressive initial-scan streaming.
+    pub fn empty_for_stream(
+        root: PathBuf,
+        real_root: PathBuf,
+        root_identity: FileIdentity,
+    ) -> Self {
+        let mut tree = Self {
+            root: root.clone(),
+            real_root,
+            #[cfg(test)]
+            root_identity,
+            skipped: 0,
+            errors: Vec::new(),
+            elapsed: Duration::ZERO,
+            dirs: Vec::with_capacity(256),
+            dir_by_path: HashMap::with_capacity(256),
+            id_to_dir: Vec::with_capacity(4096),
+            next_id: 1,
+        };
+        tree.alloc_dir(root, None, root_identity, false, false);
+        tree.recompute_dir_local(0);
+        tree
+    }
+
+    /// Incrementally absorb one streaming `ScanBatch` during an initial scan,
+    /// returning the directory indices touched by this batch.
+    pub fn apply_stream_batch(&mut self, batch: scan::ScanBatch) -> Vec<usize> {
+        self.skipped = self.skipped.max(batch.skipped);
+        self.elapsed = self.elapsed.max(batch.elapsed);
+        let remain = 24usize.saturating_sub(self.errors.len());
+        self.errors.extend(batch.errors.into_iter().take(remain));
+
+        let mut facts = batch.directories;
+        facts.sort_unstable_by(|a, b| {
+            a.path
+                .components()
+                .count()
+                .cmp(&b.path.components().count())
+                .then_with(|| a.path.cmp(&b.path))
+        });
+
+        let mut touched = HashSet::new();
+        for fact in facts {
+            if fact.path == self.root {
+                if let Some(root_node) = self.dirs[0].as_mut() {
+                    root_node.identity = fact.identity;
+                    root_node.enumeration_complete = fact.enumeration_complete;
+                    root_node.has_subdirectories |= fact.has_subdirectories;
+                    root_node.excluded = fact.excluded;
+                }
+                touched.insert(0usize);
+                continue;
+            }
+            if !fact.path.starts_with(&self.root) {
+                continue;
+            }
+            let idx = self.ensure_dir_chain(&fact.path);
+            if let Some(dir) = self.dirs[idx].as_mut() {
+                dir.identity = fact.identity;
+                dir.enumeration_complete = fact.enumeration_complete;
+                dir.has_subdirectories |= fact.has_subdirectories;
+                dir.excluded = fact.excluded;
+            }
+            touched.insert(idx);
+        }
+
+        for entry in batch.files {
+            if !entry.path.starts_with(&self.root) {
+                continue;
+            }
+            let dir_idx = self.ensure_dir_chain(entry.parent.as_ref());
+            let name = entry
+                .path
+                .file_name()
+                .unwrap_or_else(|| entry.path.as_os_str())
+                .to_os_string()
+                .into_boxed_os_str();
+            let file_id = self.alloc_id(dir_idx);
+            if let Some(dir) = self.dirs[dir_idx].as_mut() {
+                if dir.identity == FileIdentity::default()
+                    && entry.parent_identity != FileIdentity::default()
+                {
+                    dir.identity = entry.parent_identity;
+                }
+                if entry.parent_is_leaf && !dir.excluded {
+                    dir.enumeration_complete = true;
+                }
+                dir.files.push(FileNode {
+                    id: file_id,
+                    name,
+                    size: entry.size,
+                    identity: entry.identity,
+                    can_trash: entry.can_trash,
+                });
+            }
+            touched.insert(dir_idx);
+        }
+
+        if touched.is_empty() {
+            return Vec::new();
+        }
+
+        // Recompute aggregates bottom-up across only touched dirs and their ancestors.
+        let mut affected = HashSet::with_capacity(touched.len() * 2);
+        for &d in &touched {
+            let mut cur = Some(d);
+            while let Some(idx) = cur {
+                if !affected.insert(idx) {
+                    break;
+                }
+                cur = self.dirs[idx].as_ref().and_then(|n| n.parent);
+            }
+        }
+        let mut order: Vec<(usize, usize)> = affected
+            .into_iter()
+            .filter_map(|idx| {
+                self.dirs[idx]
+                    .as_ref()
+                    .map(|d| (d.path.components().count(), idx))
+            })
+            .collect();
+        order.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, idx) in order {
+            self.recompute_dir_local(idx);
+        }
+
+        touched.into_iter().collect()
     }
 
     pub fn from_scan(result: ScanResult) -> Self {
@@ -237,6 +361,7 @@ impl SceneTree {
                 if let Some(root_node) = tree.dirs[0].as_mut() {
                     root_node.identity = fact.identity;
                     root_node.enumeration_complete = fact.enumeration_complete;
+                    root_node.has_subdirectories |= fact.has_subdirectories;
                     root_node.excluded = fact.excluded;
                 }
                 continue;
@@ -248,6 +373,7 @@ impl SceneTree {
             if let Some(dir) = tree.dirs[idx].as_mut() {
                 dir.identity = fact.identity;
                 dir.enumeration_complete = fact.enumeration_complete;
+                dir.has_subdirectories |= fact.has_subdirectories;
                 dir.excluded = fact.excluded;
             }
         }
@@ -332,7 +458,10 @@ impl SceneTree {
             }
         }
         let is_root = idx == 0;
-        let is_leaf = dir.enumeration_complete && !dir.excluded && dir.subdirs.is_empty();
+        let is_leaf = dir.enumeration_complete
+            && !dir.excluded
+            && !dir.has_subdirectories
+            && dir.subdirs.is_empty();
         let direct_can_trash = !is_root
             && all_files_trashable
             && !dir.excluded
@@ -430,6 +559,7 @@ impl SceneTree {
         if let Some(p) = parent_idx {
             if let Some(parent_node) = self.dirs[p].as_mut() {
                 parent_node.subdirs.retain(|&c| c != dir_idx);
+                parent_node.has_subdirectories = !parent_node.subdirs.is_empty();
             }
             self.recompute_upwards(p);
             vec![p]
@@ -487,6 +617,7 @@ impl SceneTree {
                 self.unlink_subtree(idx);
                 if let Some(p) = self.dirs[parent].as_mut() {
                     p.subdirs.retain(|&c| c != idx);
+                    p.has_subdirectories = !p.subdirs.is_empty();
                 }
                 self.recompute_upwards(parent);
                 return (vec![parent], Vec::new());
@@ -628,6 +759,7 @@ impl SceneTree {
         }
         if let Some(dir) = self.dirs[dir_idx].as_mut() {
             dir.subdirs = kept_subdirs;
+            dir.has_subdirectories = !dir.subdirs.is_empty();
         }
         for (sub_path, sub_id) in new_subdir_map {
             if !self.dir_by_path.contains_key(&sub_path) {
@@ -723,12 +855,7 @@ impl SceneTree {
     }
 
     /// Apply an in-memory virtual mutation for Demo animation testing.
-    pub fn apply_demo_action(
-        &mut self,
-        action: crate::demo::DemoAction,
-        seed: u64,
-        mode: ViewMode,
-    ) -> Vec<usize> {
+    pub fn apply_demo_action(&mut self, action: crate::demo::DemoAction, seed: u64) -> Vec<usize> {
         let live_dirs: Vec<usize> = self
             .dirs
             .iter()
@@ -791,8 +918,8 @@ impl SceneTree {
                 vec![dir_idx]
             }
             crate::demo::DemoAction::DeleteRandom => {
-                // In Hybrid/Folders mode, alternate deleting leaf folders and files.
-                if mode != ViewMode::Files && seed % 2 == 0 {
+                // Alternate deleting leaf folders and files.
+                if seed.is_multiple_of(2) {
                     let folders: Vec<PathBuf> = live_dirs
                         .iter()
                         .filter_map(|&i| {
@@ -832,21 +959,17 @@ impl SceneTree {
         }
     }
 
-    pub fn tile_info(&self, id: NodeId, mode: ViewMode, rect: Rect) -> Option<TileInfo> {
+    pub fn tile_info(&self, id: NodeId, rect: Rect) -> Option<TileInfo> {
         let dir_idx = *self.id_to_dir.get(id.0 as usize)?;
         if dir_idx == u32::MAX {
             return None;
         }
         let dir = self.dirs.get(dir_idx as usize)?.as_ref()?;
         if dir.id == id {
-            let size = match mode {
-                ViewMode::Folders | ViewMode::Hybrid => dir.direct_file_bytes,
-                ViewMode::Files => dir.total_bytes,
-            };
             return Some(TileInfo {
                 id,
                 path: dir.path.clone(),
-                size,
+                size: dir.direct_file_bytes,
                 identity: dir.identity,
                 is_folder: true,
                 can_trash: dir.direct_can_trash,
@@ -907,24 +1030,21 @@ pub struct LayoutDiff {
 }
 
 pub struct LayoutTree {
-    pub mode: ViewMode,
     pub bounds: Rect,
     pub pixel_size: f32,
     dirs: HashMap<usize, DirLayout>,
 }
 
 impl LayoutTree {
-    /// Build the initial layout tree for `mode`.
+    /// Build the initial hybrid layout tree.
     pub fn build(
         scene: &SceneTree,
-        mode: ViewMode,
         bounds: Rect,
         pixel_size: f32,
         token: &AtomicU64,
         generation: u64,
     ) -> Option<Self> {
         let mut tree = Self {
-            mode,
             bounds,
             pixel_size,
             dirs: HashMap::new(),
@@ -968,7 +1088,7 @@ impl LayoutTree {
                 continue;
             }
 
-            let items = collect_dir_items(scene, dir_idx, self.mode);
+            let items = collect_dir_items(scene, dir_idx);
             let (platform, content, next_depth) =
                 compute_platform(dir_idx, bounds, depth, self.pixel_size, &items);
 
@@ -1025,6 +1145,147 @@ impl LayoutTree {
         scene: &SceneTree,
         dirty_dirs: &[usize],
         pixel_size: f32,
+        token: &AtomicU64,
+        generation: u64,
+    ) -> Option<LayoutDiff> {
+        self.apply_dirty_inner(scene, dirty_dirs, pixel_size, false, token, generation)
+    }
+
+    /// Streaming initial-scan update: keeps exact proportions and allows any
+    /// directory that grew into stretched strips mid-scan to re-squarify cleanly.
+    pub fn apply_dirty_streaming(
+        &mut self,
+        scene: &SceneTree,
+        dirty_dirs: &[usize],
+        pixel_size: f32,
+        token: &AtomicU64,
+        generation: u64,
+    ) -> Option<LayoutDiff> {
+        self.apply_dirty_inner(scene, dirty_dirs, pixel_size, true, token, generation)
+    }
+
+    /// Settle a live-streamed initial scan into an optimal Squarified layout
+    /// with a smooth one-shot transition from the last streamed frame.
+    pub fn rebalance_after_stream(
+        &mut self,
+        scene: &SceneTree,
+        pixel_size: f32,
+        token: &AtomicU64,
+        generation: u64,
+    ) -> Option<LayoutDiff> {
+        let min_dim = pixel_size.max(0.5);
+        let mut before_tiles: HashMap<NodeId, (Rect, Color32)> = HashMap::new();
+        let mut before_backdrops: HashMap<usize, (Rect, Color32)> = HashMap::new();
+        for (&dir_idx, layout) in &self.dirs {
+            if let Some(p) = layout.platform {
+                before_backdrops.insert(dir_idx, (layout.bounds, p.color));
+            }
+            for t in &layout.tiles {
+                if t.rect.w >= min_dim && t.rect.h >= min_dim {
+                    before_tiles.insert(t.id, (t.rect, t.color));
+                }
+            }
+        }
+
+        let next = Self::build(scene, self.bounds, pixel_size, token, generation)?;
+
+        let mut backdrops: Vec<(u8, TransitionBackdrop)> = Vec::new();
+        let mut transitions: Vec<TransitionItem> = Vec::new();
+        let mut after_ids: HashSet<NodeId> = HashSet::new();
+        let mut upserted_tiles: Vec<TileInfo> = Vec::new();
+        let visible_min = pixel_size * 0.25;
+
+        for (&dir_idx, layout) in &next.dirs {
+            if let Some(p) = layout.platform {
+                let from = before_backdrops
+                    .get(&dir_idx)
+                    .map_or(layout.bounds, |&(r, _)| r);
+                backdrops.push((
+                    layout.depth,
+                    TransitionBackdrop {
+                        dir_idx,
+                        from,
+                        to: layout.bounds,
+                        color: p.color,
+                    },
+                ));
+            }
+            for t in &layout.tiles {
+                after_ids.insert(t.id);
+                if t.rect.w >= visible_min
+                    && t.rect.h >= visible_min
+                    && let Some(info) = scene.tile_info(t.id, t.rect)
+                {
+                    upserted_tiles.push(info);
+                }
+                if t.rect.w >= min_dim && t.rect.h >= min_dim {
+                    if let Some(&(from, _)) = before_tiles.get(&t.id) {
+                        transitions.push(TransitionItem {
+                            id: t.id,
+                            from,
+                            to: t.rect,
+                            color: t.color,
+                            kind: TransitionKind::Move,
+                        });
+                    } else {
+                        transitions.push(TransitionItem {
+                            id: t.id,
+                            from: center_rect(t.rect),
+                            to: t.rect,
+                            color: t.color,
+                            kind: TransitionKind::FadeIn,
+                        });
+                    }
+                }
+            }
+        }
+
+        let mut removed_ids = Vec::new();
+        for (&id, &(from, color)) in &before_tiles {
+            if !after_ids.contains(&id) {
+                removed_ids.push(id);
+                transitions.push(TransitionItem {
+                    id,
+                    from,
+                    to: center_rect(from),
+                    color,
+                    kind: TransitionKind::FadeOut,
+                });
+            }
+        }
+
+        if transitions.len() > MAX_ANIMATED_TILES {
+            transitions.sort_unstable_by(|a, b| {
+                let area_a = (a.from.w * a.from.h).max(a.to.w * a.to.h);
+                let area_b = (b.from.w * b.from.h).max(b.to.w * b.to.h);
+                area_b.total_cmp(&area_a)
+            });
+            transitions.truncate(MAX_ANIMATED_TILES);
+        }
+        backdrops.sort_by_key(|(depth, _)| *depth);
+        if backdrops.len() > MAX_ANIMATED_BACKDROPS {
+            backdrops.truncate(MAX_ANIMATED_BACKDROPS);
+        }
+
+        *self = next;
+        Some(LayoutDiff {
+            dirty_rects: vec![self.bounds],
+            removed_ids,
+            upserted_tiles,
+            transitions: TransitionBatch {
+                dirty_rects: vec![self.bounds],
+                backdrops: backdrops.into_iter().map(|(_, b)| b).collect(),
+                items: transitions,
+            },
+        })
+    }
+
+    fn apply_dirty_inner(
+        &mut self,
+        scene: &SceneTree,
+        dirty_dirs: &[usize],
+        pixel_size: f32,
+        allow_streaming_resquarify: bool,
         token: &AtomicU64,
         generation: u64,
     ) -> Option<LayoutDiff> {
@@ -1199,7 +1460,7 @@ impl LayoutTree {
 
             // Case 2: Live directory container.
             let is_dirty = dirty_set.contains(&dir_idx);
-            let items = collect_dir_items(scene, dir_idx, self.mode);
+            let items = collect_dir_items(scene, dir_idx);
             let (platform, new_content, next_depth) =
                 compute_platform(dir_idx, new_bounds, depth, self.pixel_size, &items);
             let dir_color = scene
@@ -1274,7 +1535,7 @@ impl LayoutTree {
                             });
                             if to.w >= visible_min
                                 && to.h >= visible_min
-                                && let Some(info) = scene.tile_info(id, self.mode, to)
+                                && let Some(info) = scene.tile_info(id, to)
                             {
                                 upserted_tiles.push(info);
                             }
@@ -1389,6 +1650,54 @@ impl LayoutTree {
                 generation,
             )?;
 
+            // During live initial-scan streaming, early batches can grow 100x+
+            // and turn locked splits into stretched strips. If this container's
+            // worst visible child aspect exceeds 3.5 and a fresh Squarified split
+            // materially improves it, re-squarify this container cleanly.
+            let entries = if allow_streaming_resquarify
+                && is_dirty
+                && weights.len() > 1
+                && render::valid(eval_new_content)
+            {
+                let old_worst = entries
+                    .iter()
+                    .filter(|e| e.status != SyncStatus::Removed && e.to.w >= min_dim && e.to.h >= min_dim)
+                    .map(|e| treemap::rect_aspect(e.to))
+                    .fold(1.0f64, f64::max);
+                if old_worst > 3.5 {
+                    let candidate =
+                        SplitTree::build_with_cancel(&weights, eval_new_content, token, generation)?;
+                    let cand_rects = candidate.evaluate(eval_new_content);
+                    let new_worst = cand_rects
+                        .iter()
+                        .filter(|(_, r)| r.w >= min_dim && r.h >= min_dim)
+                        .map(|(_, r)| treemap::rect_aspect(*r))
+                        .fold(1.0f64, f64::max);
+                    if new_worst < old_worst * 0.85 {
+                        let new_map: HashMap<SlotKey, Rect> = cand_rects.into_iter().collect();
+                        existing.split_tree = candidate;
+                        entries
+                            .into_iter()
+                            .map(|mut e| {
+                                if let Some(&new_to) = new_map.get(&e.key) {
+                                    e.to = new_to;
+                                    if e.status == SyncStatus::Added {
+                                        e.from = center_rect(new_to);
+                                    }
+                                }
+                                e
+                            })
+                            .collect::<Vec<SyncEntry<SlotKey>>>()
+                    } else {
+                        entries
+                    }
+                } else {
+                    entries
+                }
+            } else {
+                entries
+            };
+
             let mut laid_tiles = Vec::new();
             let mut laid_children = Vec::new();
 
@@ -1450,7 +1759,7 @@ impl LayoutTree {
                             }
                             if entry.to.w >= visible_min
                                 && entry.to.h >= visible_min
-                                && let Some(info) = scene.tile_info(id, self.mode, entry.to)
+                                && let Some(info) = scene.tile_info(id, entry.to)
                             {
                                 upserted_tiles.push(info);
                             }
@@ -1523,7 +1832,7 @@ impl LayoutTree {
                             if tile_dirty
                                 && entry.to.w >= visible_min
                                 && entry.to.h >= visible_min
-                                && let Some(info) = scene.tile_info(id, self.mode, entry.to)
+                                && let Some(info) = scene.tile_info(id, entry.to)
                             {
                                 upserted_tiles.push(info);
                             }
@@ -1707,7 +2016,7 @@ impl LayoutTree {
             for t in &layout.tiles {
                 if t.rect.w >= min_side
                     && t.rect.h >= min_side
-                    && let Some(info) = scene.tile_info(t.id, self.mode, t.rect)
+                    && let Some(info) = scene.tile_info(t.id, t.rect)
                 {
                     out.insert(t.id, info);
                 }
@@ -1774,18 +2083,14 @@ impl LayoutTree {
     }
 }
 
-fn collect_dir_items(
-    scene: &SceneTree,
-    dir_idx: usize,
-    mode: ViewMode,
-) -> Vec<(SlotKey, VisualItem, u64)> {
+fn collect_dir_items(scene: &SceneTree, dir_idx: usize) -> Vec<(SlotKey, VisualItem, u64)> {
     let Some(dir) = scene.dirs.get(dir_idx).and_then(|d| d.as_ref()) else {
         return Vec::new();
     };
     let mut items = Vec::new();
     let dir_color = crate::color(&dir.path);
 
-    if dir_idx == 0 && mode == ViewMode::Hybrid && dir.is_leaf {
+    if dir_idx == 0 && dir.is_leaf {
         if !dir.files.is_empty() {
             items.push((
                 SlotKey::SelfFiles,
@@ -1796,85 +2101,29 @@ fn collect_dir_items(
         return items;
     }
 
-    match mode {
-        ViewMode::Files => {
-            for f in &dir.files {
+    for f in &dir.files {
+        items.push((
+            SlotKey::File(f.id),
+            VisualItem::File(f.id, dir_color),
+            f.size.max(1),
+        ));
+    }
+    for &child in &dir.subdirs {
+        if let Some(c) = scene.dirs[child].as_ref()
+            && c.total_files > 0
+        {
+            if c.is_leaf {
                 items.push((
-                    SlotKey::File(f.id),
-                    VisualItem::File(f.id, dir_color),
-                    f.size.max(1),
+                    SlotKey::Subdir(child as u32),
+                    VisualItem::FolderTile(c.id, crate::color(&c.path)),
+                    c.direct_file_bytes.max(1),
                 ));
-            }
-            for &child in &dir.subdirs {
-                if let Some(c) = scene.dirs[child].as_ref()
-                    && c.total_files > 0
-                {
-                    items.push((
-                        SlotKey::Subdir(child as u32),
-                        VisualItem::SubdirContainer(child),
-                        c.total_bytes.max(1),
-                    ));
-                }
-            }
-        }
-        ViewMode::Folders => {
-            if !dir.files.is_empty() {
+            } else {
                 items.push((
-                    SlotKey::SelfFiles,
-                    VisualItem::FolderTile(dir.id, dir_color),
-                    dir.direct_file_bytes.max(1),
+                    SlotKey::Subdir(child as u32),
+                    VisualItem::SubdirContainer(child),
+                    c.total_bytes.max(1),
                 ));
-            }
-            for &child in &dir.subdirs {
-                if let Some(c) = scene.dirs[child].as_ref()
-                    && c.total_files > 0
-                {
-                    let child_has_nonempty_sub = c
-                        .subdirs
-                        .iter()
-                        .any(|&gc| scene.dirs[gc].as_ref().is_some_and(|g| g.total_files > 0));
-                    if !child_has_nonempty_sub && !c.files.is_empty() {
-                        items.push((
-                            SlotKey::Subdir(child as u32),
-                            VisualItem::FolderTile(c.id, crate::color(&c.path)),
-                            c.direct_file_bytes.max(1),
-                        ));
-                    } else {
-                        items.push((
-                            SlotKey::Subdir(child as u32),
-                            VisualItem::SubdirContainer(child),
-                            c.total_bytes.max(1),
-                        ));
-                    }
-                }
-            }
-        }
-        ViewMode::Hybrid => {
-            for f in &dir.files {
-                items.push((
-                    SlotKey::File(f.id),
-                    VisualItem::File(f.id, dir_color),
-                    f.size.max(1),
-                ));
-            }
-            for &child in &dir.subdirs {
-                if let Some(c) = scene.dirs[child].as_ref()
-                    && c.total_files > 0
-                {
-                    if c.is_leaf {
-                        items.push((
-                            SlotKey::Subdir(child as u32),
-                            VisualItem::FolderTile(c.id, crate::color(&c.path)),
-                            c.direct_file_bytes.max(1),
-                        ));
-                    } else {
-                        items.push((
-                            SlotKey::Subdir(child as u32),
-                            VisualItem::SubdirContainer(child),
-                            c.total_bytes.max(1),
-                        ));
-                    }
-                }
             }
         }
     }
@@ -2055,8 +2304,8 @@ mod tests {
     #[test]
     fn file_deletion_updates_global_proportions_and_preserves_spatial_order() {
         let scan = make_scan(&[
-            ("/disk/a/f1", 500, true),
-            ("/disk/a/f2", 500, true),
+            ("/disk/a/f1", 500, false),
+            ("/disk/a/sub/f2", 500, true),
             ("/disk/b/g1", 1000, true),
         ]);
         let mut scene = SceneTree::from_scan(scan);
@@ -2067,17 +2316,16 @@ mod tests {
             h: 600.0,
         };
         let token = AtomicU64::new(1);
-        let mut layout =
-            LayoutTree::build(&scene, ViewMode::Files, bounds, 1.0, &token, 1).unwrap();
+        let mut layout = LayoutTree::build(&scene, bounds, 1.0, &token, 1).unwrap();
         let before = layout.collect_visible_tiles(&scene);
-        let f2_before = before
+        let sub_before = before
             .values()
-            .find(|t| t.path == Path::new("/disk/a/f2"))
+            .find(|t| t.path == Path::new("/disk/a/sub"))
             .unwrap()
             .rect;
-        let g1_before = before
+        let b_before = before
             .values()
-            .find(|t| t.path == Path::new("/disk/b/g1"))
+            .find(|t| t.path == Path::new("/disk/b"))
             .unwrap()
             .rect;
 
@@ -2099,32 +2347,32 @@ mod tests {
         // Deleted tile collapses flush to a zero-area edge rather than shrinking to center.
         assert_eq!(fade_out.to.w * fade_out.to.h, 0.0);
 
-        // True proportions: f2 (500) = 1/3, g1 (1000) = 2/3!
+        // True proportions: /disk/a/sub (500) = 1/3, /disk/b (1000) = 2/3!
         let after = layout.collect_visible_tiles(&scene);
-        let f2_after = after
+        let sub_after = after
             .values()
-            .find(|t| t.path == Path::new("/disk/a/f2"))
+            .find(|t| t.path == Path::new("/disk/a/sub"))
             .unwrap()
             .rect;
-        let g1_after = after
+        let b_after = after
             .values()
-            .find(|t| t.path == Path::new("/disk/b/g1"))
+            .find(|t| t.path == Path::new("/disk/b"))
             .unwrap()
             .rect;
         let canvas_area = bounds.w * bounds.h;
         assert!(
-            (f2_after.w * f2_after.h / canvas_area - 1.0 / 3.0).abs() < 0.02,
-            "f2 area should reflect 1/3 proportion, got {}",
-            f2_after.w * f2_after.h / canvas_area
+            (sub_after.w * sub_after.h / canvas_area - 1.0 / 3.0).abs() < 0.02,
+            "sub area should reflect 1/3 proportion, got {}",
+            sub_after.w * sub_after.h / canvas_area
         );
         assert!(
-            (g1_after.w * g1_after.h / canvas_area - 2.0 / 3.0).abs() < 0.02,
-            "g1 area should reflect 2/3 proportion, got {}",
-            g1_after.w * g1_after.h / canvas_area
+            (b_after.w * b_after.h / canvas_area - 2.0 / 3.0).abs() < 0.02,
+            "b area should reflect 2/3 proportion, got {}",
+            b_after.w * b_after.h / canvas_area
         );
         // Spatial order between folder `a` and folder `b` must be preserved!
-        let a_was_left = f2_before.x < g1_before.x;
-        let a_is_left = f2_after.x < g1_after.x;
+        let a_was_left = sub_before.x < b_before.x;
+        let a_is_left = sub_after.x < b_after.x;
         assert_eq!(a_was_left, a_is_left, "folders must never swap sides");
     }
 
@@ -2144,8 +2392,7 @@ mod tests {
             h: 600.0,
         };
         let token = AtomicU64::new(1);
-        let mut layout =
-            LayoutTree::build(&scene, ViewMode::Hybrid, bounds, 1.0, &token, 1).unwrap();
+        let mut layout = LayoutTree::build(&scene, bounds, 1.0, &token, 1).unwrap();
         let before: HashMap<PathBuf, Rect> = layout
             .collect_visible_tiles(&scene)
             .into_values()
@@ -2220,8 +2467,8 @@ mod tests {
     #[test]
     fn tiny_mutation_skips_unaffected_sibling_subtrees() {
         let scan = make_scan(&[
-            ("/disk/a/f1", 100, true),
-            ("/disk/a/f2", 100, true),
+            ("/disk/a/f1", 100, false),
+            ("/disk/a/sub/f2", 100, true),
             ("/disk/b/g1", 100_000_000, true),
         ]);
         let mut scene = SceneTree::from_scan(scan);
@@ -2232,8 +2479,7 @@ mod tests {
             h: 600.0,
         };
         let token = AtomicU64::new(1);
-        let mut layout =
-            LayoutTree::build(&scene, ViewMode::Files, bounds, 1.0, &token, 1).unwrap();
+        let mut layout = LayoutTree::build(&scene, bounds, 1.0, &token, 1).unwrap();
 
         let dirty = scene.remove_file(Path::new("/disk/a/f1"), FileIdentity::default());
         let diff = layout.apply_dirty(&scene, &dirty, 1.0, &token, 1).unwrap();
@@ -2243,7 +2489,7 @@ mod tests {
     }
 
     #[test]
-    fn demo_mutations_keep_exact_proportions_and_spatial_order_across_all_modes() {
+    fn demo_mutations_keep_exact_proportions_and_spatial_order() {
         let bounds = Rect {
             x: 0.0,
             y: 0.0,
@@ -2253,89 +2499,85 @@ mod tests {
         let canvas_area = bounds.w * bounds.h;
         let token = AtomicU64::new(1);
 
-        for mode in [ViewMode::Hybrid, ViewMode::Files, ViewMode::Folders] {
-            let mut scene = SceneTree::from_scan(crate::demo::virtual_scan());
-            let mut layout = LayoutTree::build(&scene, mode, bounds, 1.0, &token, 1).unwrap();
+        let mut scene = SceneTree::from_scan(crate::demo::virtual_scan());
+        let mut layout = LayoutTree::build(&scene, bounds, 1.0, &token, 1).unwrap();
 
-            // Record initial top-level folder rectangles from root's split tree.
-            let root_rects = |l: &LayoutTree| -> HashMap<SlotKey, Rect> {
-                let root_layout = &l.dirs[&0];
-                root_layout.split_tree.evaluate(bounds).into_iter().collect()
-            };
-            let initial_top = root_rects(&layout);
+        // Record initial top-level folder rectangles from root's split tree.
+        let root_rects = |l: &LayoutTree| -> HashMap<SlotKey, Rect> {
+            let root_layout = &l.dirs[&0];
+            root_layout.split_tree.evaluate(bounds).into_iter().collect()
+        };
+        let initial_top = root_rects(&layout);
 
-            let actions = [
-                crate::demo::DemoAction::AddFile,
-                crate::demo::DemoAction::ResizeRandom,
-                crate::demo::DemoAction::DeleteRandom,
-                crate::demo::DemoAction::ResizeRandom,
-                crate::demo::DemoAction::AddFile,
-                crate::demo::DemoAction::DeleteRandom,
-            ];
-            for (step, action) in actions.into_iter().enumerate() {
-                let dirty = scene.apply_demo_action(action, step as u64 + 1, mode);
-                let _diff = layout.apply_dirty(&scene, &dirty, 1.0, &token, 1).unwrap();
+        let actions = [
+            crate::demo::DemoAction::AddFile,
+            crate::demo::DemoAction::ResizeRandom,
+            crate::demo::DemoAction::DeleteRandom,
+            crate::demo::DemoAction::ResizeRandom,
+            crate::demo::DemoAction::AddFile,
+            crate::demo::DemoAction::DeleteRandom,
+        ];
+        for (step, action) in actions.into_iter().enumerate() {
+            let dirty = scene.apply_demo_action(action, step as u64 + 1);
+            let _diff = layout.apply_dirty(&scene, &dirty, 1.0, &token, 1).unwrap();
 
-                let now_top = root_rects(&layout);
-                let total_bytes = scene.total_bytes() as f32;
-                assert!(total_bytes > 0.0);
+            let now_top = root_rects(&layout);
+            let total_bytes = scene.total_bytes() as f32;
+            assert!(total_bytes > 0.0);
 
-                // 1. Every top-level folder area must reflect its real byte share!
-                for (&key, &rect) in &now_top {
-                    if let SlotKey::Subdir(idx) = key
-                        && let Some(dir) = scene.dirs[idx as usize].as_ref()
-                    {
-                        let expected_share = dir.total_bytes.max(1) as f32 / total_bytes;
-                        let actual_share = (rect.w * rect.h) / canvas_area;
+            // 1. Every top-level folder area must reflect its real byte share!
+            for (&key, &rect) in &now_top {
+                if let SlotKey::Subdir(idx) = key
+                    && let Some(dir) = scene.dirs[idx as usize].as_ref()
+                {
+                    let expected_share = dir.total_bytes.max(1) as f32 / total_bytes;
+                    let actual_share = (rect.w * rect.h) / canvas_area;
+                    assert!(
+                        (actual_share - expected_share).abs() < 1e-3,
+                        "step={step}: dir {} share {actual_share} != expected {expected_share}",
+                        dir.path.display()
+                    );
+                }
+            }
+
+            // 2. Relative spatial ordering of every surviving top-level pair must never flip!
+            let surviving: Vec<SlotKey> = initial_top
+                .keys()
+                .copied()
+                .filter(|k| now_top.contains_key(k))
+                .collect();
+            for &k1 in &surviving {
+                for &k2 in &surviving {
+                    if k1 == k2 {
+                        continue;
+                    }
+                    let (b1, b2) = (initial_top[&k1], initial_top[&k2]);
+                    let (a1, a2) = (now_top[&k1], now_top[&k2]);
+                    let was_left = b1.x + b1.w <= b2.x + 1e-2;
+                    let was_right = b2.x + b2.w <= b1.x + 1e-2;
+                    let was_above = b1.y + b1.h <= b2.y + 1e-2;
+                    let was_below = b2.y + b2.h <= b1.y + 1e-2;
+                    let is_left = a1.x + a1.w <= a2.x + 1e-1;
+                    let is_right = a2.x + a2.w <= a1.x + 1e-1;
+                    let is_above = a1.y + a1.h <= a2.y + 1e-1;
+                    let is_below = a2.y + a2.h <= a1.y + 1e-1;
+                    if was_left && !was_above && !was_below {
+                        assert!(is_left, "step={step}: horizontal order flipped");
+                    }
+                    if was_above && !was_left && !was_right {
+                        assert!(is_above, "step={step}: vertical order flipped");
+                    }
+                    if was_left && was_above {
                         assert!(
-                            (actual_share - expected_share).abs() < 1e-3,
-                            "mode={mode:?} step={step}: dir {} share {actual_share} != expected {expected_share}",
-                            dir.path.display()
+                            (is_left || is_above) && !is_right && !is_below,
+                            "step={step}: top-left/bottom-right order flipped"
                         );
                     }
-                }
-
-                // 2. Relative spatial ordering of every surviving top-level pair must never flip!
-                let surviving: Vec<SlotKey> = initial_top
-                    .keys()
-                    .copied()
-                    .filter(|k| now_top.contains_key(k))
-                    .collect();
-                for &k1 in &surviving {
-                    for &k2 in &surviving {
-                        if k1 == k2 {
-                            continue;
-                        }
-                        let (b1, b2) = (initial_top[&k1], initial_top[&k2]);
-                        let (a1, a2) = (now_top[&k1], now_top[&k2]);
-                        let was_left = b1.x + b1.w <= b2.x + 1e-2;
-                        let was_right = b2.x + b2.w <= b1.x + 1e-2;
-                        let was_above = b1.y + b1.h <= b2.y + 1e-2;
-                        let was_below = b2.y + b2.h <= b1.y + 1e-2;
-                        let is_left = a1.x + a1.w <= a2.x + 1e-1;
-                        let is_right = a2.x + a2.w <= a1.x + 1e-1;
-                        let is_above = a1.y + a1.h <= a2.y + 1e-1;
-                        let is_below = a2.y + a2.h <= a1.y + 1e-1;
-                        // In a persistent BSP tree, the LCA separating axis between
-                        // any two leaves never changes or flips direction:
-                        if was_left && !was_above && !was_below {
-                            assert!(is_left, "mode={mode:?} step={step}: horizontal order flipped");
-                        }
-                        if was_above && !was_left && !was_right {
-                            assert!(is_above, "mode={mode:?} step={step}: vertical order flipped");
-                        }
-                        if was_left && was_above {
-                            assert!(
-                                (is_left || is_above) && !is_right && !is_below,
-                                "mode={mode:?} step={step}: top-left/bottom-right order flipped"
-                            );
-                        }
-                        if was_left && was_below {
-                            assert!(
-                                (is_left || is_below) && !is_right && !is_above,
-                                "mode={mode:?} step={step}: bottom-left/top-right order flipped"
-                            );
-                        }
+                    if was_left && was_below {
+                        assert!(
+                            (is_left || is_below) && !is_right && !is_above,
+                            "step={step}: bottom-left/top-right order flipped"
+                        );
                     }
                 }
             }
@@ -2353,8 +2595,7 @@ mod tests {
             h: 600.0,
         };
         let token = AtomicU64::new(1);
-        let mut layout =
-            LayoutTree::build(&scene, ViewMode::Hybrid, bounds, 1.0, &token, 1).unwrap();
+        let mut layout = LayoutTree::build(&scene, bounds, 1.0, &token, 1).unwrap();
 
         // Delete leaf1 -> leaf2 expands smoothly across root.
         let dirty = scene.remove_directory(Path::new("/disk/leaf1"), FileIdentity::default());
@@ -2415,8 +2656,7 @@ mod tests {
             h: 600.0,
         };
         let token = AtomicU64::new(1);
-        let mut layout =
-            LayoutTree::build(&scene, ViewMode::Hybrid, bounds, 1.0, &token, 1).unwrap();
+        let mut layout = LayoutTree::build(&scene, bounds, 1.0, &token, 1).unwrap();
         assert_eq!(layout.collect_visible_tiles(&scene).len(), 2);
 
         // Create a subdirectory inside `a` -> `a` stops being a leaf and unfolds!
@@ -2488,8 +2728,8 @@ mod tests {
     #[test]
     fn incremental_patch_matches_full_raster_after_deletion() {
         let scan = make_scan(&[
-            ("/disk/a/f1", 300, true),
-            ("/disk/a/f2", 500, true),
+            ("/disk/a/f1", 300, false),
+            ("/disk/a/sub/f2", 500, true),
             ("/disk/b/g1", 800, true),
         ]);
         let mut scene = SceneTree::from_scan(scan);
@@ -2501,8 +2741,7 @@ mod tests {
         };
         let size = [400, 300];
         let token = AtomicU64::new(1);
-        let mut layout =
-            LayoutTree::build(&scene, ViewMode::Files, bounds, 1.0, &token, 1).unwrap();
+        let mut layout = LayoutTree::build(&scene, bounds, 1.0, &token, 1).unwrap();
         let initial = layout.raster_full(size, &token, 1).unwrap();
         let mut grid = render::OwnerGrid::from_patch(bounds, &initial);
 

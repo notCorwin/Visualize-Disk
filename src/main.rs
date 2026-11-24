@@ -11,7 +11,7 @@ mod treemap;
 mod watcher;
 
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Vec2};
-use scene::{NodeId, TileInfo, TransitionBatch, TransitionKind, ViewMode};
+use scene::{NodeId, TileInfo, TransitionBatch, TransitionKind};
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
     hash::{Hash, Hasher},
@@ -91,7 +91,8 @@ fn configure(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
-    let mut style = (*ctx.style()).clone();
+    ctx.set_theme(egui::Theme::Dark);
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
     style.visuals = egui::Visuals::dark();
     style.visuals.panel_fill = PANEL;
     style.visuals.window_fill = PANEL;
@@ -107,7 +108,7 @@ fn configure(ctx: &egui::Context) {
     style
         .text_styles
         .insert(egui::TextStyle::Button, FontId::proportional(14.0));
-    ctx.set_style(style);
+    ctx.set_style_of(egui::Theme::Dark, style);
 }
 
 fn wrapped_text(ui: &mut egui::Ui, text: String, size: f32, color: Color32) -> egui::Response {
@@ -211,12 +212,12 @@ fn show_tile_tooltip(response: &egui::Response, tile: &TileInfo) {
                 tile_tooltip_content(ui, tile);
                 return;
             }
-            let scroll_id = egui::Id::new(("file-tooltip-scroll", &tile.path));
+            let scroll_id = egui::Id::unique(("file-tooltip-scroll", &tile.path));
             let previous_offset = ui
                 .ctx()
                 .data(|data| data.get_temp::<f32>(scroll_id))
                 .unwrap_or(0.0);
-            let wheel = ui.ctx().input(|input| input.raw_scroll_delta.y);
+            let wheel = ui.ctx().input(|input| input.smooth_scroll_delta.y);
             let content = egui::ScrollArea::vertical()
                 .id_salt(scroll_id)
                 .max_height(max_height)
@@ -224,7 +225,7 @@ fn show_tile_tooltip(response: &egui::Response, tile: &TileInfo) {
                 .vertical_scroll_offset((previous_offset - wheel).max(0.0))
                 .show(ui, |ui| tile_tooltip_content(ui, tile));
             ui.ctx()
-                .data_mut(|data| data.insert_temp(scroll_id, content.state.offset.y));
+                .data_mut(|data| data.insert_temp(scroll_id, content.state.clamped_offset().y));
             if content.content_size.y > content.inner_rect.height() {
                 ui.label(RichText::new("滚动查看完整路径").color(MUTED).small());
             }
@@ -321,16 +322,23 @@ enum WorkerCmd {
     LoadScan {
         generation: u64,
         scan: scan::ScanResult,
-        mode: ViewMode,
         bounds: treemap::Rect,
         physical_size: [usize; 2],
         reconcile: bool,
     },
-    SwitchMode {
+    StartStream {
         generation: u64,
-        mode: ViewMode,
+        root: PathBuf,
+        real_root: PathBuf,
+        root_identity: scan::FileIdentity,
+        physical_size: [usize; 2],
+    },
+    StreamBatch {
+        generation: u64,
+        batch: scan::ScanBatch,
         bounds: treemap::Rect,
         physical_size: [usize; 2],
+        finished: bool,
     },
     Resize {
         generation: u64,
@@ -361,7 +369,6 @@ enum WorkerCmd {
 enum WorkerEvent {
     FullFrame {
         generation: u64,
-        mode: ViewMode,
         bounds: treemap::Rect,
         patch: render::RasterPatch,
         tiles: HashMap<NodeId, TileInfo>,
@@ -379,6 +386,10 @@ enum WorkerEvent {
         removed_ids: Vec<NodeId>,
         upserted_tiles: Vec<TileInfo>,
         transitions: TransitionBatch,
+        stats: SceneStats,
+    },
+    StreamFinished {
+        generation: u64,
         stats: SceneStats,
     },
     RootChanged {
@@ -439,14 +450,15 @@ impl SceneWorker {
                 let Some(diff) = l.apply_dirty(s, dirty, px, &worker_token, generation) else {
                     return;
                 };
-                if diff.dirty_rects.is_empty() {
-                    emit_idle(generation, evt_tx);
-                    return;
-                }
-                let Some(patches) =
-                    l.raster_dirty(&diff.dirty_rects, phys, &worker_token, generation)
-                else {
-                    return;
+                let patches = if diff.dirty_rects.is_empty() {
+                    Vec::new()
+                } else {
+                    let Some(patches) =
+                        l.raster_dirty(&diff.dirty_rects, phys, &worker_token, generation)
+                    else {
+                        return;
+                    };
+                    patches
                 };
                 let _ = evt_tx.send(WorkerEvent::Patch {
                     generation,
@@ -465,7 +477,6 @@ impl SceneWorker {
                     WorkerCmd::LoadScan {
                         generation,
                         scan,
-                        mode,
                         bounds,
                         physical_size: phys,
                         reconcile,
@@ -476,9 +487,7 @@ impl SceneWorker {
                         physical_size = render::capped_size(phys);
                         let same_root = reconcile
                             && scene_tree.as_ref().is_some_and(|s| s.root == scan.root)
-                            && layout_tree
-                                .as_ref()
-                                .is_some_and(|l| l.mode == mode && l.bounds == bounds);
+                            && layout_tree.as_ref().is_some_and(|l| l.bounds == bounds);
                         if same_root {
                             if let (Some(s), Some(l)) = (scene_tree.as_mut(), layout_tree.as_mut())
                                 && let Some(dirty) = s.reconcile_scan(scan)
@@ -494,7 +503,6 @@ impl SceneWorker {
                         let px = render::logical_pixel_size(bounds, physical_size);
                         let Some(layout) = scene::LayoutTree::build(
                             &tree,
-                            mode,
                             bounds,
                             px,
                             &worker_token,
@@ -513,7 +521,6 @@ impl SceneWorker {
                         layout_tree = Some(layout);
                         let _ = evt_tx.send(WorkerEvent::FullFrame {
                             generation,
-                            mode,
                             bounds,
                             patch,
                             tiles,
@@ -522,48 +529,151 @@ impl SceneWorker {
                         });
                         wake();
                     }
-                    WorkerCmd::SwitchMode {
+                    WorkerCmd::StartStream {
                         generation,
-                        mode,
-                        bounds,
+                        root,
+                        real_root,
+                        root_identity,
                         physical_size: phys,
                     } => {
                         if worker_token.load(Ordering::Relaxed) != generation {
                             continue;
                         }
-                        let Some(s) = scene_tree.as_ref() else {
-                            continue;
-                        };
                         physical_size = render::capped_size(phys);
-                        let px = render::logical_pixel_size(bounds, physical_size);
-                        let Some(layout) = scene::LayoutTree::build(
-                            s,
-                            mode,
-                            bounds,
-                            px,
-                            &worker_token,
-                            generation,
-                        ) else {
+                        scene_tree = Some(scene::SceneTree::empty_for_stream(
+                            root,
+                            real_root,
+                            root_identity,
+                        ));
+                        layout_tree = None;
+                    }
+                    WorkerCmd::StreamBatch {
+                        generation,
+                        batch,
+                        bounds,
+                        physical_size: phys,
+                        finished,
+                    } => {
+                        if worker_token.load(Ordering::Relaxed) != generation {
+                            continue;
+                        }
+                        let Some(s) = scene_tree.as_mut() else {
+                            emit_idle(generation, &evt_tx);
                             continue;
                         };
-                        let Some(patch) =
-                            layout.raster_full(physical_size, &worker_token, generation)
-                        else {
+                        let dirty = s.apply_stream_batch(batch);
+                        if layout_tree.is_none() {
+                            if !finished && s.total_files() == 0 {
+                                emit_idle(generation, &evt_tx);
+                                continue;
+                            }
+                            physical_size = render::capped_size(phys);
+                            let px = render::logical_pixel_size(bounds, physical_size);
+                            let Some(layout) = scene::LayoutTree::build(
+                                s,
+                                bounds,
+                                px,
+                                &worker_token,
+                                generation,
+                            ) else {
+                                continue;
+                            };
+                            let Some(patch) =
+                                layout.raster_full(physical_size, &worker_token, generation)
+                            else {
+                                continue;
+                            };
+                            let tiles = layout.collect_visible_tiles(s);
+                            let stats = make_stats(s);
+                            layout_tree = Some(layout);
+                            let _ = evt_tx.send(WorkerEvent::FullFrame {
+                                generation,
+                                bounds,
+                                patch,
+                                tiles,
+                                stats,
+                                new_root: false,
+                            });
+                            if finished {
+                                let _ = evt_tx.send(WorkerEvent::StreamFinished {
+                                    generation,
+                                    stats: make_stats(s),
+                                });
+                            }
+                            wake();
                             continue;
-                        };
-                        let tiles = layout.collect_visible_tiles(s);
-                        let stats = make_stats(s);
-                        layout_tree = Some(layout);
-                        let _ = evt_tx.send(WorkerEvent::FullFrame {
-                            generation,
-                            mode,
-                            bounds,
-                            patch,
-                            tiles,
-                            stats,
-                            new_root: false,
-                        });
-                        wake();
+                        }
+
+                        if let Some(l) = layout_tree.as_mut() {
+                            if finished {
+                                let px = render::logical_pixel_size(l.bounds, physical_size);
+                                let Some(diff) = l.rebalance_after_stream(
+                                    s,
+                                    px,
+                                    &worker_token,
+                                    generation,
+                                ) else {
+                                    continue;
+                                };
+                                let Some(patches) = l.raster_dirty(
+                                    &diff.dirty_rects,
+                                    physical_size,
+                                    &worker_token,
+                                    generation,
+                                ) else {
+                                    continue;
+                                };
+                                let _ = evt_tx.send(WorkerEvent::Patch {
+                                    generation,
+                                    patches,
+                                    removed_ids: diff.removed_ids,
+                                    upserted_tiles: diff.upserted_tiles,
+                                    transitions: diff.transitions,
+                                    stats: make_stats(s),
+                                });
+                            } else if !dirty.is_empty() {
+                                let px = render::logical_pixel_size(l.bounds, physical_size);
+                                let Some(diff) = l.apply_dirty_streaming(
+                                    s,
+                                    &dirty,
+                                    px,
+                                    &worker_token,
+                                    generation,
+                                ) else {
+                                    continue;
+                                };
+                                if diff.dirty_rects.is_empty() {
+                                    emit_idle(generation, &evt_tx);
+                                } else {
+                                    let Some(patches) = l.raster_dirty(
+                                        &diff.dirty_rects,
+                                        physical_size,
+                                        &worker_token,
+                                        generation,
+                                    ) else {
+                                        continue;
+                                    };
+                                    let _ = evt_tx.send(WorkerEvent::Patch {
+                                        generation,
+                                        patches,
+                                        removed_ids: diff.removed_ids,
+                                        upserted_tiles: diff.upserted_tiles,
+                                        transitions: diff.transitions,
+                                        stats: make_stats(s),
+                                    });
+                                    wake();
+                                }
+                            } else {
+                                emit_idle(generation, &evt_tx);
+                            }
+                        }
+                        if finished && worker_token.load(Ordering::Relaxed) == generation {
+                            let _ = evt_tx.send(WorkerEvent::StreamFinished {
+                                generation,
+                                stats: make_stats(s),
+                            });
+                            wake();
+                        }
                     }
                     WorkerCmd::Resize {
                         generation,
@@ -633,7 +743,7 @@ impl SceneWorker {
                         let (Some(s), Some(l)) = (scene_tree.as_mut(), layout_tree.as_mut()) else {
                             continue;
                         };
-                        let dirty = s.apply_demo_action(action, seed, l.mode);
+                        let dirty = s.apply_demo_action(action, seed);
                         emit_dirty(s, l, &dirty, generation, physical_size, &evt_tx);
                     }
                     WorkerCmd::WatchEvents { generation, events } => {
@@ -758,7 +868,6 @@ struct ActiveTransition {
 
 struct UiScene {
     generation: u64,
-    mode: ViewMode,
     bounds: treemap::Rect,
     physical_size: [usize; 2],
     texture: egui::TextureHandle,
@@ -785,10 +894,30 @@ impl UiScene {
     }
 }
 
+enum ScanJobKind {
+    Full(mpsc::Receiver<Result<scan::ScanResult, String>>),
+    Streaming {
+        stream_rx: mpsc::Receiver<scan::ScanStreamEvent>,
+        done_rx: mpsc::Receiver<Result<(), String>>,
+        pending_start: Option<(PathBuf, PathBuf, scan::FileIdentity)>,
+        pending_batch: scan::ScanBatch,
+        stream_started_on_worker: bool,
+        finished_received: bool,
+        finish_dispatched: bool,
+        done_ok: bool,
+    },
+}
+
 struct ScanJob {
     cancel: Arc<AtomicBool>,
     progress: Arc<Mutex<scan::ScanProgress>>,
-    rx: mpsc::Receiver<Result<scan::ScanResult, String>>,
+    kind: ScanJobKind,
+}
+
+impl ScanJob {
+    fn is_streaming(&self) -> bool {
+        matches!(self.kind, ScanJobKind::Streaming { .. })
+    }
 }
 
 struct TrashResult {
@@ -809,7 +938,6 @@ struct App {
     access: permission::Access,
     permission_rx: Option<mpsc::Receiver<permission::Access>>,
     pending_scan: bool,
-    mode: ViewMode,
     job: Option<ScanJob>,
     pending_scan_result: Option<scan::ScanResult>,
     stats: Option<SceneStats>,
@@ -841,7 +969,6 @@ impl Default for App {
             access: permission::Access::Unverified,
             permission_rx: None,
             pending_scan: false,
-            mode: ViewMode::default(),
             job: None,
             pending_scan_result: None,
             stats: None,
@@ -954,7 +1081,11 @@ impl App {
         access == permission::Access::Granted && std::mem::take(&mut self.pending_scan)
     }
 
-    fn launch_scan(&mut self) {
+    fn is_streaming_scan(&self) -> bool {
+        self.job.as_ref().is_some_and(ScanJob::is_streaming)
+    }
+
+    fn launch_scan(&mut self, ctx: &egui::Context) {
         if self.demo {
             self.reset_demo();
             return;
@@ -968,17 +1099,45 @@ impl App {
         }
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Mutex::new(scan::ScanProgress::default()));
-        let (tx, rx) = mpsc::channel();
-        let (c, stats) = (cancel.clone(), progress.clone());
-        std::thread::spawn(move || {
-            let result = platform::scan_root().and_then(|root| scan::scan(root, c, stats));
-            let _ = tx.send(result);
-        });
-        self.job = Some(ScanJob {
-            cancel,
-            progress,
-            rx,
-        });
+        let streaming = self.stats.is_none() && self.ui_scene.is_none();
+        if streaming {
+            let (stream_tx, stream_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let (c, stats) = (cancel.clone(), progress.clone());
+            let wake_ctx = ctx.clone();
+            let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || wake_ctx.request_repaint());
+            std::thread::spawn(move || {
+                let result = platform::scan_root()
+                    .and_then(|root| scan::scan_streaming(root, c, stats, stream_tx, wake));
+                let _ = done_tx.send(result);
+            });
+            self.job = Some(ScanJob {
+                cancel,
+                progress,
+                kind: ScanJobKind::Streaming {
+                    stream_rx,
+                    done_rx,
+                    pending_start: None,
+                    pending_batch: scan::ScanBatch::default(),
+                    stream_started_on_worker: false,
+                    finished_received: false,
+                    finish_dispatched: false,
+                    done_ok: false,
+                },
+            });
+        } else {
+            let (tx, rx) = mpsc::channel();
+            let (c, stats) = (cancel.clone(), progress.clone());
+            std::thread::spawn(move || {
+                let result = platform::scan_root().and_then(|root| scan::scan(root, c, stats));
+                let _ = tx.send(result);
+            });
+            self.job = Some(ScanJob {
+                cancel,
+                progress,
+                kind: ScanJobKind::Full(rx),
+            });
+        }
         self.message = None;
     }
 
@@ -1010,8 +1169,7 @@ impl App {
         ctx: &egui::Context,
     ) {
         let same_root = self.stats.as_ref().is_some_and(|s| s.root == scan.root)
-            && self.ui_scene.as_ref().is_some_and(|u| u.mode == self.mode);
-        let mode = self.mode;
+            && self.ui_scene.is_some();
         let bounds = self
             .ui_scene
             .as_ref()
@@ -1036,34 +1194,9 @@ impl App {
         let _ = worker.tx.send(WorkerCmd::LoadScan {
             generation,
             scan,
-            mode,
             bounds,
             physical_size,
             reconcile: same_root,
-        });
-        self.worker_busy = true;
-    }
-
-    fn set_mode(&mut self, mode: ViewMode, ctx: &egui::Context) {
-        if self.mode == mode {
-            return;
-        }
-        self.mode = mode;
-        self.selected = None;
-        if self.stats.is_none() {
-            return;
-        }
-        let key = self
-            .canvas_rect
-            .map(|r| ViewportKey::new(r.size(), ctx.pixels_per_point()))
-            .unwrap_or_else(|| ViewportKey::new(Vec2::new(1180.0, 700.0), ctx.pixels_per_point()));
-        let worker = self.ensure_worker(ctx);
-        let generation = worker.bump_generation();
-        let _ = worker.tx.send(WorkerCmd::SwitchMode {
-            generation,
-            mode,
-            bounds: key.bounds(),
-            physical_size: key.physical_size,
         });
         self.worker_busy = true;
     }
@@ -1074,7 +1207,10 @@ impl App {
     }
 
     fn trash_selected(&mut self, id: NodeId) {
-        if self.access != permission::Access::Granted || self.trash_rx.is_some() {
+        if self.access != permission::Access::Granted
+            || self.trash_rx.is_some()
+            || self.is_streaming_scan()
+        {
             return;
         }
         let Some((generation, tile)) = self
@@ -1206,7 +1342,7 @@ impl App {
             match rx.try_recv() {
                 Ok(access) => {
                     if self.permission_result(access) {
-                        self.launch_scan();
+                        self.launch_scan(ctx);
                     }
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -1230,31 +1366,166 @@ impl App {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        if let Some(job) = &self.job {
-            match job.rx.try_recv() {
-                Ok(result) => {
-                    let cancelled = job.cancel.load(Ordering::Relaxed);
-                    self.job = None;
-                    if cancelled {
-                        defer_drop(result);
-                        self.set_notice(Notice::new(
-                            "已取消扫描，保留上次扫描结果。".into(),
-                            NoticeKind::Info,
-                        ));
-                    } else {
-                        match result {
-                            Ok(data) => {
-                                self.pending_scan_result = Some(data);
+        let mut clear_job = false;
+        let mut cancel_notice: Option<String> = None;
+        let mut start_stream_cmd: Option<(PathBuf, PathBuf, scan::FileIdentity)> = None;
+        let mut dispatch_stream_batch: Option<(scan::ScanBatch, bool)> = None;
+        if let Some(job) = self.job.as_mut() {
+            match &mut job.kind {
+                ScanJobKind::Full(rx) => match rx.try_recv() {
+                    Ok(result) => {
+                        let cancelled = job.cancel.load(Ordering::Relaxed);
+                        clear_job = true;
+                        if cancelled {
+                            defer_drop(result);
+                            cancel_notice = Some("已取消扫描，保留上次扫描结果。".into());
+                        } else {
+                            match result {
+                                Ok(data) => {
+                                    self.pending_scan_result = Some(data);
+                                }
+                                Err(e) => self.message = Some(e),
                             }
-                            Err(e) => self.message = Some(e),
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        clear_job = true;
+                        self.message = Some("扫描任务意外结束，请重新扫描。".into());
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                },
+                ScanJobKind::Streaming {
+                    stream_rx,
+                    done_rx,
+                    pending_start,
+                    pending_batch,
+                    stream_started_on_worker,
+                    finished_received,
+                    finish_dispatched,
+                    done_ok,
+                } => {
+                    let drain_stream =
+                        |rx: &mpsc::Receiver<scan::ScanStreamEvent>,
+                         pending_start: &mut Option<(PathBuf, PathBuf, scan::FileIdentity)>,
+                         pending_batch: &mut scan::ScanBatch,
+                         finished_received: &mut bool| {
+                            while let Ok(evt) = rx.try_recv() {
+                                match evt {
+                                    scan::ScanStreamEvent::Started {
+                                        root,
+                                        real_root,
+                                        root_identity,
+                                    } => {
+                                        *pending_start = Some((root, real_root, root_identity));
+                                    }
+                                    scan::ScanStreamEvent::Batch(batch) => {
+                                        pending_batch.merge_from(batch);
+                                    }
+                                    scan::ScanStreamEvent::Finished(batch) => {
+                                        pending_batch.merge_from(batch);
+                                        *finished_received = true;
+                                    }
+                                }
+                            }
+                        };
+
+                    drain_stream(stream_rx, pending_start, pending_batch, finished_received);
+                    if !*done_ok {
+                        match done_rx.try_recv() {
+                            Ok(Ok(())) => {
+                                *done_ok = true;
+                                drain_stream(
+                                    stream_rx,
+                                    pending_start,
+                                    pending_batch,
+                                    finished_received,
+                                );
+                            }
+                            Ok(Err(e)) => {
+                                let cancelled = job.cancel.load(Ordering::Relaxed);
+                                clear_job = true;
+                                if cancelled {
+                                    if self.ui_scene.is_some() {
+                                        cancel_notice =
+                                            Some("已取消扫描，当前仅显示部分扫描结果。".into());
+                                    }
+                                } else {
+                                    self.message = Some(e);
+                                }
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                clear_job = true;
+                                self.message = Some("扫描任务意外结束，请重新扫描。".into());
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {}
+                        }
+                    }
+
+                    if !clear_job && !self.worker_busy {
+                        if let Some(start) = pending_start.take() {
+                            start_stream_cmd = Some(start);
+                            *stream_started_on_worker = true;
+                        }
+                        if *stream_started_on_worker
+                            && !*finish_dispatched
+                            && (!pending_batch.is_empty() || *finished_received)
+                        {
+                            let batch = std::mem::take(pending_batch);
+                            let finished = *finished_received;
+                            if finished {
+                                *finish_dispatched = true;
+                            }
+                            dispatch_stream_batch = Some((batch, finished));
+                        }
+                        if *done_ok && (*finish_dispatched || !*finished_received) {
+                            clear_job = true;
                         }
                     }
                 }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.job = None;
-                    self.message = Some("扫描任务意外结束，请重新扫描。".into());
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if clear_job {
+            self.job = None;
+        }
+        if let Some(text) = cancel_notice {
+            self.set_notice(Notice::new(text, NoticeKind::Info));
+        }
+        if start_stream_cmd.is_some() || dispatch_stream_batch.is_some() {
+            let key = self
+                .ui_scene
+                .as_ref()
+                .map(|u| ViewportKey {
+                    logical_size: Vec2::new(u.bounds.w, u.bounds.h),
+                    physical_size: u.physical_size,
+                })
+                .unwrap_or_else(|| {
+                    let size = self
+                        .canvas_rect
+                        .map(|r| r.size().max(Vec2::splat(1.0)))
+                        .unwrap_or(Vec2::new(1156.0, 676.0));
+                    ViewportKey::new(size, ctx.pixels_per_point())
+                });
+            let worker = self.ensure_worker(ctx);
+            if let Some((root, real_root, root_identity)) = start_stream_cmd {
+                let generation = worker.bump_generation();
+                let _ = worker.tx.send(WorkerCmd::StartStream {
+                    generation,
+                    root,
+                    real_root,
+                    root_identity,
+                    physical_size: key.physical_size,
+                });
+            }
+            if let Some((batch, finished)) = dispatch_stream_batch {
+                let generation = worker.current_generation();
+                let _ = worker.tx.send(WorkerCmd::StreamBatch {
+                    generation,
+                    batch,
+                    bounds: key.bounds(),
+                    physical_size: key.physical_size,
+                    finished,
+                });
+                self.worker_busy = true;
             }
         }
         if let Some(rx) = &self.trash_rx {
@@ -1333,7 +1604,6 @@ impl App {
                 match event {
                     WorkerEvent::FullFrame {
                         generation,
-                        mode,
                         bounds,
                         patch,
                         tiles,
@@ -1358,7 +1628,6 @@ impl App {
                         self.stats = Some(stats);
                         if let Some(old) = self.ui_scene.replace(UiScene {
                             generation,
-                            mode,
                             bounds,
                             physical_size,
                             texture,
@@ -1439,6 +1708,13 @@ impl App {
                             }
                         }
                     }
+                    WorkerEvent::StreamFinished { generation, stats } => {
+                        if generation == worker.current_generation() {
+                            self.worker_busy = false;
+                            new_watch_root = Some((stats.root.clone(), stats.real_root.clone()));
+                            self.stats = Some(stats);
+                        }
+                    }
                     WorkerEvent::RootChanged { generation } => {
                         if generation == worker.current_generation() {
                             self.worker_busy = false;
@@ -1457,7 +1733,7 @@ impl App {
             self.start_watcher(root, real_root, ctx);
         }
         if need_rescan && self.job.is_none() {
-            self.launch_scan();
+            self.launch_scan(ctx);
         }
         if self.demo
             && self.demo_auto
@@ -1518,7 +1794,7 @@ impl App {
             if let Some(deadline) = notice.expires {
                 ctx.request_repaint_after(deadline.saturating_duration_since(Instant::now()));
             }
-            egui::Area::new("notification".into())
+            egui::Area::new(egui::Id::unique("notification"))
                 .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -44.0])
                 .show(ctx, |ui| {
@@ -1573,26 +1849,28 @@ impl App {
         }
     }
 
-    fn status_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status")
-            .exact_height(36.0)
+    fn status_bar(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::bottom("status")
+            .exact_size(36.0)
             .frame(egui::Frame::new().fill(PANEL).inner_margin(8.0))
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let status = if self.demo {
                         "虚拟演示 · 零磁盘文件 · 可用顶部按钮或删除选中项测试动画".to_owned()
                     } else if let Some(job) = &self.job {
                         let p = *job.progress.lock().unwrap_or_else(|e| e.into_inner());
+                        let suffix = if self.stats.is_none() {
+                            ""
+                        } else if job.is_streaming() {
+                            " · 正在实时生成视图"
+                        } else {
+                            " · 当前为上次扫描结果"
+                        };
                         format!(
-                            "扫描中 · {} 个文件 · {} · 跳过 {} 项{}",
+                            "扫描中 · {} 个文件 · {} · 跳过 {} 项{suffix}",
                             p.files,
                             bytes(p.bytes),
                             p.skipped,
-                            if self.stats.is_some() {
-                                " · 当前为上次扫描结果"
-                            } else {
-                                ""
-                            }
                         )
                     } else if let Some(stats) = &self.stats {
                         let watch_tag = if self.watcher.is_some() {
@@ -1635,9 +1913,10 @@ impl App {
             });
     }
 
-    fn ui(&mut self, ctx: &egui::Context) {
-        self.ui_contents(ctx);
-        if !ctx.wants_keyboard_input()
+    fn ui_root(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.ui_contents(ui);
+        if !ctx.egui_wants_keyboard_input()
             && ctx.input_mut(|input| {
                 input.consume_key(egui::Modifiers::COMMAND, egui::Key::Backspace)
             })
@@ -1668,13 +1947,14 @@ impl App {
         }
     }
 
-    fn ui_contents(&mut self, ctx: &egui::Context) {
-        self.canvas_rect = None;
-        self.poll(ctx);
+    fn ui_contents(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.poll(&ctx);
         if self.access != permission::Access::Granted {
+            self.canvas_rect = None;
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(BG))
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space((ui.available_height() * 0.28).max(24.0));
                         ui.label(
@@ -1723,17 +2003,16 @@ impl App {
                         }
                     });
                 });
-            self.overlays(ctx);
+            self.overlays(&ctx);
             return;
         }
 
         let mut reveal = None;
         let mut trash = None;
-        let mut next_mode = None;
         let mut demo_action = None;
-        egui::TopBottomPanel::top("toolbar")
+        egui::Panel::top("toolbar")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(16.0))
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 let padding = ui.spacing().button_padding;
                 let control_height =
                     ui.text_style_height(&egui::TextStyle::Button) + 2.0 * padding.y;
@@ -1773,40 +2052,6 @@ impl App {
                         {
                             self.toggle_demo_auto();
                         }
-                    } else {
-                        if ui
-                            .add_enabled(self.job.is_none(), egui::Button::new("重新扫描"))
-                            .clicked()
-                        {
-                            self.start();
-                        }
-                        if ui
-                            .add_enabled(self.job.is_some(), egui::Button::new("取消扫描"))
-                            .clicked()
-                        {
-                            if let Some(job) = &self.job {
-                                job.cancel.store(true, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    if ui
-                        .selectable_label(self.mode == ViewMode::Files, "文件")
-                        .clicked()
-                    {
-                        next_mode = Some(ViewMode::Files);
-                    }
-                    if ui
-                        .selectable_label(self.mode == ViewMode::Folders, "文件夹")
-                        .on_hover_text("按文件夹汇总")
-                        .clicked()
-                    {
-                        next_mode = Some(ViewMode::Folders);
-                    }
-                    if ui
-                        .selectable_label(self.mode == ViewMode::Hybrid, "折中")
-                        .clicked()
-                    {
-                        next_mode = Some(ViewMode::Hybrid);
                     }
 
                     let selected = self.selected_tile().cloned();
@@ -1840,7 +2085,9 @@ impl App {
                     if can_show_trash
                         && ui
                             .add_enabled(
-                                selected.is_some() && self.trash_rx.is_none(),
+                                selected.is_some()
+                                    && self.trash_rx.is_none()
+                                    && !self.is_streaming_scan(),
                                 egui::Button::new(delete_label),
                             )
                             .clicked()
@@ -1861,51 +2108,41 @@ impl App {
                 });
             });
 
-        if self.stats.is_none() && self.pending_scan_result.is_none() {
-            self.status_bar(ctx);
+        if self.stats.is_none() && self.pending_scan_result.is_none() && self.job.is_none() {
+            self.status_bar(ui);
             egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(BG))
-                .show(ctx, |ui| {
+                .frame(egui::Frame::new().fill(BG).inner_margin(12.0))
+                .show(ui, |ui| {
                     self.canvas_rect = Some(ui.max_rect());
                     ui.vertical_centered(|ui| {
                         ui.add_space((ui.available_height() * 0.32).max(32.0));
-                        let heading = if self.job.is_some() {
-                            "扫描中…"
-                        } else {
-                            "扫描已停止"
-                        };
-                        ui.label(RichText::new(heading).size(30.0).strong());
+                        ui.label(RichText::new("扫描已停止").size(30.0).strong());
                         ui.add_space(20.0);
-                        if self.job.is_none() && ui.button("重新扫描").clicked() {
+                        if ui.button("重试").clicked() {
                             self.start();
                         }
                     });
                 });
-            if let Some(mode) = next_mode {
-                self.set_mode(mode, ctx);
-            }
-            self.overlays(ctx);
+            self.overlays(&ctx);
             return;
         }
 
-        self.status_bar(ctx);
+        self.status_bar(ui);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(12.0))
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 let viewport = ui.available_size().max(Vec2::splat(1.0));
                 let key = ViewportKey::new(viewport, ctx.pixels_per_point());
                 let (canvas, response) = ui.allocate_exact_size(viewport, Sense::click());
                 self.canvas_rect = Some(canvas);
 
                 if let Some(scan_data) = self.pending_scan_result.take() {
-                    self.submit_scan_result(scan_data, key, ctx);
+                    self.submit_scan_result(scan_data, key, &ctx);
                 }
-                if let Some(mode) = next_mode {
-                    self.set_mode(mode, ctx);
-                }
-                self.handle_resize(key, ctx);
+                self.handle_resize(key, &ctx);
 
-                if self.stats.as_ref().is_some_and(|s| s.total_files == 0)
+                if self.job.is_none()
+                    && self.stats.as_ref().is_some_and(|s| s.total_files == 0)
                     && self
                         .ui_scene
                         .as_ref()
@@ -1983,7 +2220,7 @@ impl App {
                         }
                         show_tile_tooltip(&response, tile);
                     }
-                } else {
+                } else if self.job.is_none() {
                     painter.text(
                         canvas.center(),
                         egui::Align2::CENTER_CENTER,
@@ -2003,7 +2240,7 @@ impl App {
         if let Some(id) = trash {
             self.trash_selected(id);
         }
-        self.overlays(ctx);
+        self.overlays(&ctx);
     }
 }
 
@@ -2247,8 +2484,8 @@ fn add_shaded_quad(mesh: &mut egui::Mesh, rect: Rect, base: Color32, alpha_mul: 
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.ui(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.ui_root(ui);
     }
 }
 
@@ -2397,7 +2634,8 @@ mod tests {
     }
 
     fn run_frame(app: &mut App, ctx: &egui::Context, raw: egui::RawInput) {
-        let _ = ctx.run(raw, |ctx| app.ui(ctx));
+        let mut output = ctx.run_ui(raw, |ui| app.ui_root(ui));
+        output.textures_delta.clear();
     }
 
     fn settle(app: &mut App, ctx: &egui::Context) {
@@ -2430,8 +2668,7 @@ mod tests {
     }
 
     #[test]
-    fn default_view_is_hybrid_and_folder_size_uses_folder_label() {
-        assert_eq!(App::default().mode, ViewMode::Hybrid);
+    fn folder_size_uses_folder_label() {
         assert_eq!(tooltip_size(42, true), "文件夹 42 B");
         assert_eq!(tooltip_size(42, false), "42 B");
     }
@@ -2442,7 +2679,14 @@ mod tests {
         configure(&ctx);
         let mut app = App::default();
         app.access = permission::Access::Granted;
-        app.mode = ViewMode::Files;
+        run_frame(
+            &mut app,
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0))),
+                ..Default::default()
+            },
+        );
         app.pending_scan_result = Some(snapshot());
         settle(&mut app, &ctx);
 
@@ -2474,20 +2718,15 @@ mod tests {
     }
 
     #[test]
-    fn mode_switch_and_same_root_rescan_work_incrementally() {
+    fn same_root_rescan_reconciles_incrementally() {
         let ctx = egui::Context::default();
         configure(&ctx);
         let mut app = App::default();
         app.access = permission::Access::Granted;
         app.pending_scan_result = Some(snapshot());
         settle(&mut app, &ctx);
-        // Hybrid mode: 2 leaf folders (/disk/a, /disk/b).
+        // Hybrid view: 2 leaf folders (/disk/a, /disk/b).
         assert_eq!(app.ui_scene.as_ref().unwrap().tiles.len(), 2);
-
-        // Switch to Files mode -> 3 individual file tiles without rescanning.
-        app.set_mode(ViewMode::Files, &ctx);
-        settle(&mut app, &ctx);
-        assert_eq!(app.ui_scene.as_ref().unwrap().tiles.len(), 3);
 
         // Same-root rescan with 1 file removed keeps same texture handle!
         let tex_before = app.ui_scene.as_ref().unwrap().texture.id();
@@ -2560,7 +2799,14 @@ mod tests {
         configure(&ctx);
         let mut app = App::default();
         app.access = permission::Access::Granted;
-        app.mode = ViewMode::Files;
+        run_frame(
+            &mut app,
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0))),
+                ..Default::default()
+            },
+        );
         app.pending_scan_result = Some(scanned);
         settle(&mut app, &ctx);
 
@@ -2641,5 +2887,152 @@ mod tests {
         app.reset_demo();
         settle(&mut app, &ctx);
         assert_eq!(app.stats.as_ref().unwrap().total_files, initial_files);
+    }
+
+    #[test]
+    fn initial_scan_streams_progressively_and_preserves_texture_across_batches() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut app = App::default();
+        app.access = permission::Access::Granted;
+        run_frame(
+            &mut app,
+            &ctx,
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 600.0))),
+                ..Default::default()
+            },
+        );
+
+        let (stream_tx, stream_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        app.job = Some(ScanJob {
+            cancel: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(Mutex::new(scan::ScanProgress::default())),
+            kind: ScanJobKind::Streaming {
+                stream_rx,
+                done_rx,
+                pending_start: None,
+                pending_batch: scan::ScanBatch::default(),
+                stream_started_on_worker: false,
+                finished_received: false,
+                finish_dispatched: false,
+                done_ok: false,
+            },
+        });
+
+        let root = PathBuf::from("/stream-test");
+        let root_id = scan::FileIdentity {
+            device: 1,
+            inode: 1,
+        };
+        stream_tx
+            .send(scan::ScanStreamEvent::Started {
+                root: root.clone(),
+                real_root: root.clone(),
+                root_identity: root_id,
+            })
+            .unwrap();
+
+        // Batch 1 arrives while scan is still running -> first live frame appears!
+        stream_tx
+            .send(scan::ScanStreamEvent::Batch(scan::ScanBatch {
+                directories: vec![
+                    scan::DirectoryFact {
+                        path: root.clone(),
+                        identity: root_id,
+                        enumeration_complete: true,
+                        has_subdirectories: true,
+                        excluded: false,
+                    },
+                    scan::DirectoryFact {
+                        path: root.join("a"),
+                        identity: scan::FileIdentity {
+                            device: 1,
+                            inode: 2,
+                        },
+                        enumeration_complete: true,
+                        has_subdirectories: false,
+                        excluded: false,
+                    },
+                ],
+                files: vec![scan::FileEntry {
+                    path: root.join("a/f1"),
+                    parent: Arc::from(root.join("a").as_path()),
+                    size: 1000,
+                    identity: scan::FileIdentity {
+                        device: 1,
+                        inode: 10,
+                    },
+                    parent_identity: scan::FileIdentity {
+                        device: 1,
+                        inode: 2,
+                    },
+                    parent_is_leaf: true,
+                    can_trash: true,
+                }],
+                errors: Vec::new(),
+                skipped: 0,
+                elapsed: Duration::from_millis(200),
+            }))
+            .unwrap();
+
+        settle(&mut app, &ctx);
+        assert!(app.job.is_some(), "scan job still running during streaming");
+        assert_eq!(app.stats.as_ref().unwrap().total_files, 1);
+        assert_eq!(app.stats.as_ref().unwrap().total_bytes, 1000);
+        let tex_id = app.ui_scene.as_ref().unwrap().texture.id();
+
+        // Final batch arrives -> incrementally updates same texture with smooth animation!
+        stream_tx
+            .send(scan::ScanStreamEvent::Finished(scan::ScanBatch {
+                directories: vec![scan::DirectoryFact {
+                    path: root.join("b"),
+                    identity: scan::FileIdentity {
+                        device: 1,
+                        inode: 3,
+                    },
+                    enumeration_complete: true,
+                    has_subdirectories: false,
+                    excluded: false,
+                }],
+                files: vec![scan::FileEntry {
+                    path: root.join("b/g1"),
+                    parent: Arc::from(root.join("b").as_path()),
+                    size: 3000,
+                    identity: scan::FileIdentity {
+                        device: 1,
+                        inode: 11,
+                    },
+                    parent_identity: scan::FileIdentity {
+                        device: 1,
+                        inode: 3,
+                    },
+                    parent_is_leaf: true,
+                    can_trash: true,
+                }],
+                errors: Vec::new(),
+                skipped: 0,
+                elapsed: Duration::from_millis(450),
+            }))
+            .unwrap();
+        done_tx.send(Ok(())).unwrap();
+
+        settle(&mut app, &ctx);
+        assert!(app.job.is_none(), "scan job cleared after final batch");
+        assert_eq!(app.stats.as_ref().unwrap().total_files, 2);
+        assert_eq!(app.stats.as_ref().unwrap().total_bytes, 4000);
+        assert_eq!(app.ui_scene.as_ref().unwrap().texture.id(), tex_id);
+        assert!(!app.ui_scene.as_ref().unwrap().transitions.is_empty());
+
+        // Subsequent rescan on an already-loaded scene uses non-streaming Full mode.
+        app.launch_scan(&ctx);
+        assert!(
+            app.job.as_ref().is_some_and(|j| !j.is_streaming()),
+            "rescan must NOT stream over an existing map"
+        );
+        if let Some(job) = app.job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
     }
 }
