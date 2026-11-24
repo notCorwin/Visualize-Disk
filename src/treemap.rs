@@ -512,18 +512,7 @@ fn candidate_split_aspect(rect: Rect, existing_w: u64, added_w: u64) -> f64 {
     rect_aspect(existing_r).max(rect_aspect(new_r))
 }
 
-#[cfg(test)]
 pub fn rect_aspect(r: Rect) -> f64 {
-    let w = r.w as f64;
-    let h = r.h as f64;
-    if w <= 1e-6 || h <= 1e-6 {
-        return f64::INFINITY;
-    }
-    (w / h).max(h / w)
-}
-
-#[cfg(not(test))]
-fn rect_aspect(r: Rect) -> f64 {
     let w = r.w as f64;
     let h = r.h as f64;
     if w <= 1e-6 || h <= 1e-6 {

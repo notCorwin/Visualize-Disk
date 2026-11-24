@@ -11,7 +11,7 @@ use crate::{
     file_actions,
     render::{self, LIGHT_REACH, Platform, RasterPatch, RenderEntry},
     scan::{self, DirectorySnapshot, FileIdentity, ScanResult},
-    treemap::{Rect, SplitTree, SyncStatus},
+    treemap::{self, Rect, SplitTree, SyncEntry, SyncStatus},
 };
 use eframe::egui::Color32;
 use std::{
@@ -1139,12 +1139,39 @@ impl LayoutTree {
     }
 
     /// Incrementally update the layout tree for `dirty_dirs` while preserving
-    /// exact global area proportions AND persistent split-tree spatial order.
+    /// exact global area proportions AND strict persistent split-tree spatial order.
     pub fn apply_dirty(
         &mut self,
         scene: &SceneTree,
         dirty_dirs: &[usize],
         pixel_size: f32,
+        token: &AtomicU64,
+        generation: u64,
+    ) -> Option<LayoutDiff> {
+        self.apply_dirty_inner(scene, dirty_dirs, pixel_size, false, token, generation)
+    }
+
+    /// Initial streaming scan update: maintains near-square Squarified aspect
+    /// ratios continuously while directories grow 100x–10,000x during cold scan,
+    /// without a jarring full-tree rebuild when the scan finishes. Once scanning
+    /// completes, all subsequent mutations use `apply_dirty` (strictly locked order).
+    pub fn apply_dirty_streaming(
+        &mut self,
+        scene: &SceneTree,
+        dirty_dirs: &[usize],
+        pixel_size: f32,
+        token: &AtomicU64,
+        generation: u64,
+    ) -> Option<LayoutDiff> {
+        self.apply_dirty_inner(scene, dirty_dirs, pixel_size, true, token, generation)
+    }
+
+    fn apply_dirty_inner(
+        &mut self,
+        scene: &SceneTree,
+        dirty_dirs: &[usize],
+        pixel_size: f32,
+        allow_streaming_resquarify: bool,
         token: &AtomicU64,
         generation: u64,
     ) -> Option<LayoutDiff> {
@@ -1508,6 +1535,53 @@ impl LayoutTree {
                 token,
                 generation,
             )?;
+
+            // During the initial cold streaming scan ONLY, keep each growing
+            // container continuously Squarified using area-weighted average
+            // aspect ratio (with hysteresis). Big visible blocks cannot be
+            // masked by a 2px corner sliver, while already-square containers
+            // (weighted avg <= 1.45 or within 12% of optimal) stay locked so
+            // scan completion never jumps.
+            let entries = if allow_streaming_resquarify
+                && (is_dirty || outer_moved)
+                && weights.len() > 1
+                && render::valid(eval_new_content)
+            {
+                let old_wa = weighted_aspect(
+                    entries
+                        .iter()
+                        .filter(|e| e.status != SyncStatus::Removed)
+                        .map(|e| e.to),
+                );
+                if old_wa > 1.45 {
+                    let candidate =
+                        SplitTree::build_with_cancel(&weights, eval_new_content, token, generation)?;
+                    let cand_rects = candidate.evaluate(eval_new_content);
+                    let new_wa = weighted_aspect(cand_rects.iter().map(|&(_, r)| r));
+                    if new_wa < old_wa * 0.88 {
+                        let new_map: HashMap<SlotKey, Rect> = cand_rects.into_iter().collect();
+                        existing.split_tree = candidate;
+                        entries
+                            .into_iter()
+                            .map(|mut e| {
+                                if let Some(&new_to) = new_map.get(&e.key) {
+                                    e.to = new_to;
+                                    if e.status == SyncStatus::Added {
+                                        e.from = center_rect(new_to);
+                                    }
+                                }
+                                e
+                            })
+                            .collect::<Vec<SyncEntry<SlotKey>>>()
+                    } else {
+                        entries
+                    }
+                } else {
+                    entries
+                }
+            } else {
+                entries
+            };
 
             let mut laid_tiles = Vec::new();
             let mut laid_children = Vec::new();
@@ -2004,6 +2078,19 @@ fn bounds_within_tol(a: Rect, b: Rect, tol: f32) -> bool {
         && (a.y - b.y).abs() <= tol
         && ((a.x + a.w) - (b.x + b.w)).abs() <= tol
         && ((a.y + a.h) - (b.y + b.h)).abs() <= tol
+}
+
+fn weighted_aspect(rects: impl Iterator<Item = Rect>) -> f64 {
+    let mut sum_wa = 0.0f64;
+    let mut sum_a = 0.0f64;
+    for r in rects {
+        let area = (r.w as f64) * (r.h as f64);
+        if area > 0.0 {
+            sum_wa += area * treemap::rect_aspect(r);
+            sum_a += area;
+        }
+    }
+    if sum_a > 0.0 { sum_wa / sum_a } else { 1.0 }
 }
 
 fn rects_intersect(a: Rect, b: Rect) -> bool {
@@ -2575,6 +2662,145 @@ mod tests {
                 let exp = expected.owners[y * size[0] + x];
                 let exp = (exp != render::NONE).then_some(exp);
                 assert_eq!(got, exp, "owner mismatch at ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_scan_stays_squarish_and_settles_without_final_scramble() {
+        let root = PathBuf::from("/disk");
+        let root_id = FileIdentity {
+            device: 1,
+            inode: 1,
+        };
+        let mut scene = SceneTree::empty_for_stream(root.clone(), root.clone(), root_id);
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1600.0,
+            h: 900.0,
+        };
+        let token = AtomicU64::new(1);
+
+        // Batch 1: early discovery where dir-0 starts large and dir-2 starts tiny.
+        let make_batch = |batch_idx: u64, dirs_and_sizes: &[(&str, u64, u64)]| -> scan::ScanBatch {
+            let mut directories = Vec::new();
+            let mut files = Vec::new();
+            if batch_idx == 0 {
+                directories.push(scan::DirectoryFact {
+                    path: root.clone(),
+                    identity: root_id,
+                    enumeration_complete: true,
+                    has_subdirectories: true,
+                    excluded: false,
+                });
+            }
+            for &(name, dir_ino, size) in dirs_and_sizes {
+                let dpath = root.join(name);
+                let did = FileIdentity {
+                    device: 1,
+                    inode: dir_ino,
+                };
+                directories.push(scan::DirectoryFact {
+                    path: dpath.clone(),
+                    identity: did,
+                    enumeration_complete: true,
+                    has_subdirectories: false,
+                    excluded: false,
+                });
+                files.push(scan::FileEntry {
+                    path: dpath.join(format!("b{batch_idx}.bin")),
+                    parent: Arc::from(dpath.as_path()),
+                    size,
+                    identity: FileIdentity {
+                        device: 1,
+                        inode: batch_idx * 1000 + dir_ino,
+                    },
+                    parent_identity: did,
+                    parent_is_leaf: true,
+                    can_trash: true,
+                });
+            }
+            scan::ScanBatch {
+                directories,
+                files,
+                errors: Vec::new(),
+                skipped: 0,
+                elapsed: Duration::from_millis(batch_idx * 200),
+            }
+        };
+
+        let _ = scene.apply_stream_batch(make_batch(
+            0,
+            &[("d0", 10, 50_000), ("d1", 11, 10_000), ("d2", 12, 5_000)],
+        ));
+        let mut layout = LayoutTree::build(&scene, bounds, 1.0, &token, 1).unwrap();
+
+        // Simulate 15 streaming batches where multiple dirs grow at different
+        // rates (d2 and d5 become large, 15 new dirs arrive mid-scan).
+        for b in 1..=15u64 {
+            let mut batch_items = vec![
+                ("d0", 10, 120_000),
+                ("d1", 11, 80_000),
+                ("d2", 12, 160_000 * b.min(8)),
+            ];
+            if b >= 4 {
+                batch_items.push(("d5", 15, 220_000));
+            }
+            let dynamic_name = format!("d{}", b + 2);
+            let leaked_name: &str = &dynamic_name;
+            batch_items.push((leaked_name, 12 + b, 90_000 + (b * 37_000) % 240_000));
+            let dirty = scene.apply_stream_batch(make_batch(b, &batch_items));
+            let _ = layout
+                .apply_dirty_streaming(&scene, &dirty, 1.0, &token, 1)
+                .unwrap();
+        }
+
+        // Snapshot positions before final ~5% batch.
+        let before_final: HashMap<PathBuf, Rect> = layout
+            .collect_visible_tiles(&scene)
+            .into_values()
+            .map(|t| (t.path, t.rect))
+            .collect();
+
+        // Final small batch (last ~5% of scan): layout is already squarish -> zero scramble!
+        let dirty = scene.apply_stream_batch(make_batch(16, &[("d2", 12, 100_000)]));
+        let _ = layout
+            .apply_dirty_streaming(&scene, &dirty, 1.0, &token, 1)
+            .unwrap();
+
+        let after_final: HashMap<PathBuf, Rect> = layout
+            .collect_visible_tiles(&scene)
+            .into_values()
+            .map(|t| (t.path, t.rect))
+            .collect();
+
+        let fresh_opt = LayoutTree::build(&scene, bounds, 1.0, &token, 1)
+            .unwrap()
+            .collect_visible_tiles(&scene);
+        let fresh_wa = weighted_aspect(fresh_opt.values().map(|t| t.rect));
+        let final_wa = weighted_aspect(after_final.values().copied());
+        assert!(
+            final_wa < 1.55 && final_wa <= fresh_wa * 1.15,
+            "expected near-optimal squarish layout after streaming (got {final_wa:.2}, fresh opt {fresh_wa:.2})"
+        );
+        // Verify zero horizontal/vertical order flip on the final batch!
+        for (p1, &b1) in &before_final {
+            for (p2, &b2) in &before_final {
+                if p1 == p2 {
+                    continue;
+                }
+                let (a1, a2) = (after_final[p1], after_final[p2]);
+                let was_left = b1.x + b1.w <= b2.x + 1e-2;
+                let was_above = b1.y + b1.h <= b2.y + 1e-2;
+                let was_right = b2.x + b2.w <= b1.x + 1e-2;
+                let was_below = b2.y + b2.h <= b1.y + 1e-2;
+                if was_left && !was_above && !was_below {
+                    assert!(a1.x + a1.w <= a2.x + 1e-1);
+                }
+                if was_above && !was_left && !was_right {
+                    assert!(a1.y + a1.h <= a2.y + 1e-1);
+                }
             }
         }
     }

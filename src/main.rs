@@ -606,7 +606,38 @@ impl SceneWorker {
 
                         if let Some(l) = layout_tree.as_mut() {
                             if !dirty.is_empty() {
-                                emit_dirty(s, l, &dirty, generation, physical_size, &evt_tx);
+                                let px = render::logical_pixel_size(l.bounds, physical_size);
+                                let Some(diff) = l.apply_dirty_streaming(
+                                    s,
+                                    &dirty,
+                                    px,
+                                    &worker_token,
+                                    generation,
+                                ) else {
+                                    continue;
+                                };
+                                let patches = if diff.dirty_rects.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    let Some(patches) = l.raster_dirty(
+                                        &diff.dirty_rects,
+                                        physical_size,
+                                        &worker_token,
+                                        generation,
+                                    ) else {
+                                        continue;
+                                    };
+                                    patches
+                                };
+                                let _ = evt_tx.send(WorkerEvent::Patch {
+                                    generation,
+                                    patches,
+                                    removed_ids: diff.removed_ids,
+                                    upserted_tiles: diff.upserted_tiles,
+                                    transitions: diff.transitions,
+                                    stats: make_stats(s),
+                                });
+                                wake();
                             } else if !finished {
                                 emit_idle(generation, &evt_tx);
                             }
