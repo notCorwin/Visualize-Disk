@@ -96,6 +96,8 @@ struct HeightField {
     size: [usize; 2],
     origin: [f32; 2],
     step: [f32; 2],
+    inv_step: [f32; 2],
+    max_g: [f32; 2],
     offset: [usize; 2],
     full_size: [usize; 2],
 }
@@ -114,6 +116,7 @@ impl HeightField {
             view.h / full_pixel_size[1] as f32,
         ]
         .map(|s| s.max(0.25));
+        let inv_step = [1.0 / step[0], 1.0 / step[1]];
         let low = [view.x, view.y];
         let high = [view.x + view.w, view.y + view.h];
         let origin = std::array::from_fn::<_, 2, _>(|axis| {
@@ -186,6 +189,7 @@ impl HeightField {
             }
         }
         let width = size[0];
+        let inv_bevel = 1.0 / BEVEL_WIDTH;
         let fill_band =
             |(band, (vals, plats)): (usize, (&mut [f32], Vec<(Platform, [usize; 4])>))| {
                 for (platform, [x0, x1, y0, y1]) in plats {
@@ -193,17 +197,48 @@ impl HeightField {
                         return;
                     }
                     let r = platform.bounds;
+                    let r_right = r.x + r.w;
+                    let r_bottom = r.y + r.h;
+                    // Conservative interior range where both horizontal edge
+                    // distances are strictly >= BEVEL_WIDTH (constant add!).
+                    let raw_in0 = (((r.x + BEVEL_WIDTH - origin[0]) * inv_step[0] - 0.5)
+                        .ceil()
+                        .max(0.0) as usize)
+                        .saturating_add(1);
+                    let raw_in1 = ((r_right - BEVEL_WIDTH - origin[0]) * inv_step[0] - 0.5)
+                        .floor()
+                        .max(0.0) as usize;
+                    let inner_x0 = raw_in0.saturating_sub(offset[0]).clamp(x0, x1);
+                    let inner_x1 = raw_in1.saturating_sub(offset[0]).clamp(inner_x0, x1);
+
                     for y in y0..y1 {
                         let gy = offset[1] + y;
                         let wy = origin[1] + (gy as f32 + 0.5) * step[1];
-                        let dy = (wy - r.y).min(r.y + r.h - wy);
+                        let dy = (wy - r.y).min(r_bottom - wy);
                         let row_base = (y - band * BAND_ROWS) * width;
-                        for x in x0..x1 {
-                            let gx = offset[0] + x;
-                            let wx = origin[0] + (gx as f32 + 0.5) * step[0];
-                            let distance = dy.min(wx - r.x).min(r.x + r.w - wx);
-                            let t = (distance / BEVEL_WIDTH).clamp(0.0, 1.0);
-                            vals[row_base + x] += LAYER_HEIGHT * t * t * (3.0 - 2.0 * t);
+                        let row = &mut vals[row_base..row_base + width];
+                        for x in x0..inner_x0 {
+                            let wx = origin[0] + ((offset[0] + x) as f32 + 0.5) * step[0];
+                            let distance = dy.min(wx - r.x).min(r_right - wx);
+                            let t = (distance * inv_bevel).clamp(0.0, 1.0);
+                            row[x] += LAYER_HEIGHT * t * t * (3.0 - 2.0 * t);
+                        }
+                        if inner_x0 < inner_x1 {
+                            let add = if dy >= BEVEL_WIDTH {
+                                LAYER_HEIGHT
+                            } else {
+                                let t = (dy * inv_bevel).clamp(0.0, 1.0);
+                                LAYER_HEIGHT * t * t * (3.0 - 2.0 * t)
+                            };
+                            for v in &mut row[inner_x0..inner_x1] {
+                                *v += add;
+                            }
+                        }
+                        for x in inner_x1..x1 {
+                            let wx = origin[0] + ((offset[0] + x) as f32 + 0.5) * step[0];
+                            let distance = dy.min(wx - r.x).min(r_right - wx);
+                            let t = (distance * inv_bevel).clamp(0.0, 1.0);
+                            row[x] += LAYER_HEIGHT * t * t * (3.0 - 2.0 * t);
                         }
                     }
                 }
@@ -226,32 +261,32 @@ impl HeightField {
             size,
             origin,
             step,
+            inv_step,
+            max_g: [(full_size[0] - 1) as f32, (full_size[1] - 1) as f32],
             offset,
             full_size,
         })
     }
 
+    #[inline(always)]
     fn sample(&self, x: f32, y: f32) -> f32 {
-        let p = [x, y];
-        let uv = std::array::from_fn::<_, 2, _>(|axis| {
-            ((p[axis] - self.origin[axis]) / self.step[axis] - 0.5)
-                .clamp(0.0, (self.full_size[axis] - 1) as f32)
-        });
-        let [gx0, gy0] = uv.map(|v| v.floor() as usize);
+        let ux = ((x - self.origin[0]) * self.inv_step[0] - 0.5).clamp(0.0, self.max_g[0]);
+        let uy = ((y - self.origin[1]) * self.inv_step[1] - 0.5).clamp(0.0, self.max_g[1]);
+        let gx0 = ux as usize;
+        let gy0 = uy as usize;
         let gx1 = (gx0 + 1).min(self.full_size[0] - 1);
         let gy1 = (gy0 + 1).min(self.full_size[1] - 1);
-        let [u, v] = [uv[0] - gx0 as f32, uv[1] - gy0 as f32];
-        let at = |gx: usize, gy: usize| {
-            let lx = gx
-                .saturating_sub(self.offset[0])
-                .min(self.size[0].saturating_sub(1));
-            let ly = gy
-                .saturating_sub(self.offset[1])
-                .min(self.size[1].saturating_sub(1));
-            self.values[ly * self.size[0] + lx]
-        };
-        let a = at(gx0, gy0) * (1.0 - u) + at(gx1, gy0) * u;
-        let b = at(gx0, gy1) * (1.0 - u) + at(gx1, gy1) * u;
+        let u = ux - gx0 as f32;
+        let v = uy - gy0 as f32;
+        let max_lx = self.size[0] - 1;
+        let max_ly = self.size[1] - 1;
+        let lx0 = gx0.saturating_sub(self.offset[0]).min(max_lx);
+        let lx1 = gx1.saturating_sub(self.offset[0]).min(max_lx);
+        let ly0 = gy0.saturating_sub(self.offset[1]).min(max_ly) * self.size[0];
+        let ly1 = gy1.saturating_sub(self.offset[1]).min(max_ly) * self.size[0];
+        let vals = &self.values;
+        let a = vals[ly0 + lx0] * (1.0 - u) + vals[ly0 + lx1] * u;
+        let b = vals[ly1 + lx0] * (1.0 - u) + vals[ly1 + lx1] * u;
         a * (1.0 - v) + b * v
     }
 }
@@ -404,10 +439,25 @@ fn cancelled(token: &AtomicU64, generation: u64) -> bool {
     token.load(Ordering::Relaxed) != generation
 }
 
+const MAX_STREAM_SIDE: usize = 1024;
+
 pub fn capped_size(requested: [usize; 2]) -> [usize; 2] {
     let longest = requested[0].max(requested[1]).max(1);
     let scale = (MAX_SIDE as f64 / longest as f64).min(1.0);
     requested.map(|side| ((side as f64 * scale).round() as usize).clamp(1, MAX_SIDE))
+}
+
+/// Reduced preview resolution used ONLY while an initial cold scan is streaming
+/// (4x fewer pixels on Retina displays); upgraded to full `capped_size` when
+/// the scan completes.
+pub fn stream_preview_size(requested: [usize; 2]) -> [usize; 2] {
+    let full = capped_size(requested);
+    let longest = full[0].max(full[1]).max(1);
+    if longest <= MAX_STREAM_SIDE {
+        return full;
+    }
+    let scale = MAX_STREAM_SIDE as f64 / longest as f64;
+    full.map(|side| ((side as f64 * scale).round() as usize).clamp(1, MAX_STREAM_SIDE))
 }
 
 pub fn logical_pixel_size(bounds: Rect, requested: [usize; 2]) -> f32 {
@@ -551,6 +601,8 @@ pub fn raster_region(
 
     let mut pixels = vec![BACKGROUND; patch_w * patch_h];
     let mut owners = vec![NONE; patch_w * patch_h];
+    let inv_sx = 1.0 / sx;
+    let inv_sy = 1.0 / sy;
     let paint_band = |(band, (((px, own), draws), plats)): (
         usize,
         (
@@ -562,13 +614,57 @@ pub fn raster_region(
             if cancelled(token, generation) {
                 return;
             }
+            let r = platform.top;
+            let r_right = r.x + r.w;
+            let r_bottom = r.y + r.h;
+            let inv_w = -0.025 / r.w;
+            let inv_h = -0.07 / r.h;
+            let cr = platform.color.r() as f32;
+            let cg = platform.color.g() as f32;
+            let cb = platform.color.b() as f32;
+            let alpha = platform.color.a();
+            let af = alpha as f32;
+            let top_x0 = (((r.x - view.x) * sx - 0.5).ceil().max(rx0 as f32) as usize)
+                .min(rx1)
+                .saturating_sub(rx0)
+                .clamp(lx0, lx1);
+            let top_x1 = (((r_right - view.x) * sx - 0.5).ceil().max(rx0 as f32) as usize)
+                .min(rx1)
+                .saturating_sub(rx0)
+                .clamp(top_x0, lx1);
             for ly in ly0..ly1 {
-                let world_y = view.y + ((ry0 + ly) as f32 + 0.5) / sy;
+                let world_y = view.y + ((ry0 + ly) as f32 + 0.5) * inv_sy;
                 let row_base = (ly - band * BAND_ROWS) * patch_w;
-                for lx in lx0..lx1 {
-                    let world_x = view.x + ((rx0 + lx) as f32 + 0.5) / sx;
-                    if let Some(color) = platform.sample(world_x, world_y) {
-                        px[row_base + lx] = color;
+                if world_y >= r.y && world_y < r_bottom {
+                    let row_mat = 1.055 + (world_y - r.y) * inv_h;
+                    for lx in lx0..top_x0 {
+                        let world_x = view.x + ((rx0 + lx) as f32 + 0.5) * inv_sx;
+                        if let Some(color) = platform.sample(world_x, world_y) {
+                            px[row_base + lx] = color;
+                        }
+                    }
+                    for lx in top_x0..top_x1 {
+                        let world_x = view.x + ((rx0 + lx) as f32 + 0.5) * inv_sx;
+                        let material = row_mat + (world_x - r.x) * inv_w;
+                        px[row_base + lx] = Color32::from_rgba_premultiplied(
+                            (cr * material).round().min(af) as u8,
+                            (cg * material).round().min(af) as u8,
+                            (cb * material).round().min(af) as u8,
+                            alpha,
+                        );
+                    }
+                    for lx in top_x1..lx1 {
+                        let world_x = view.x + ((rx0 + lx) as f32 + 0.5) * inv_sx;
+                        if let Some(color) = platform.sample(world_x, world_y) {
+                            px[row_base + lx] = color;
+                        }
+                    }
+                } else {
+                    for lx in lx0..lx1 {
+                        let world_x = view.x + ((rx0 + lx) as f32 + 0.5) * inv_sx;
+                        if let Some(color) = platform.sample(world_x, world_y) {
+                            px[row_base + lx] = color;
+                        }
                     }
                 }
             }
@@ -577,15 +673,27 @@ pub fn raster_region(
             if index % 4096 == 0 && cancelled(token, generation) {
                 return;
             }
+            let cr = draw.color.r() as f32;
+            let cg = draw.color.g() as f32;
+            let cb = draw.color.b() as f32;
+            let alpha = draw.color.a();
+            let af = alpha as f32;
+            let step_x = draw.shade_step[0];
+            let gx0 = rx0 + draw.x0 as usize;
+            let span = (draw.x1 - draw.x0) as usize;
             for ly in draw.y0 as usize..draw.y1 as usize {
                 let gy = (ry0 + ly) as f32;
                 let start = (ly - band * BAND_ROWS) * patch_w + draw.x0 as usize;
-                let end = start + (draw.x1 - draw.x0) as usize;
+                let end = start + span;
                 let row_shade = draw.base_shade + gy * draw.shade_step[1];
-                let gx0 = rx0 + draw.x0 as usize;
                 for (offset, pixel) in px[start..end].iter_mut().enumerate() {
-                    let gx = (gx0 + offset) as f32;
-                    *pixel = shaded(draw.color, row_shade + gx * draw.shade_step[0]);
+                    let shade = row_shade + (gx0 + offset) as f32 * step_x;
+                    *pixel = Color32::from_rgba_premultiplied(
+                        (cr * shade).round().min(af) as u8,
+                        (cg * shade).round().min(af) as u8,
+                        (cb * shade).round().min(af) as u8,
+                        alpha,
+                    );
                 }
                 own[start..end].fill(draw.id);
             }
@@ -621,17 +729,74 @@ pub fn raster_region(
             token,
             generation,
         )?;
+        // Mark only pixels within lighting reach of a platform's 4 bevel edges.
+        // Strictly inside every platform interior (or outside all platforms), all
+        // 8 HeightField samples share the exact same constant height, so normal
+        // and contact_occlusion are identically zero and `illuminate` is a no-op.
+        let mut lit_mask = vec![0u8; patch_w * patch_h];
+        let pad_neg_x = 0.70 + field.step[0];
+        let pad_pos_x = 3.65 + field.step[0];
+        let pad_neg_y = 0.70 + field.step[1];
+        let pad_pos_y = 3.65 + field.step[1];
+        let to_px_lo = |world: f32, v0: f32, scale: f32, r0: usize, r1: usize| -> usize {
+            (((world - v0) * scale - 0.5).floor().max(r0 as f32) as usize)
+                .min(r1)
+                .saturating_sub(r0)
+        };
+        let to_px_hi = |world: f32, v0: f32, scale: f32, r0: usize, r1: usize| -> usize {
+            ((((world - v0) * scale - 0.5).ceil() + 1.0).max(r0 as f32) as usize)
+                .min(r1)
+                .saturating_sub(r0)
+        };
+        for &platform in platforms {
+            let r = platform.bounds;
+            let px0 = to_px_lo(r.x - pad_neg_x, view.x, sx, rx0, rx1);
+            let px1 = to_px_hi(r.x + r.w + pad_pos_x, view.x, sx, rx0, rx1);
+            let py0 = to_px_lo(r.y - pad_neg_y, view.y, sy, ry0, ry1);
+            let py1 = to_px_hi(r.y + r.h + pad_pos_y, view.y, sy, ry0, ry1);
+            if px0 >= px1 || py0 >= py1 {
+                continue;
+            }
+            let ix0 = to_px_hi(r.x + BEVEL_WIDTH + pad_pos_x, view.x, sx, rx0, rx1).clamp(px0, px1);
+            let ix1 = to_px_lo(r.x + r.w - BEVEL_WIDTH - pad_neg_x, view.x, sx, rx0, rx1)
+                .clamp(ix0, px1);
+            let iy0 = to_px_hi(r.y + BEVEL_WIDTH + pad_pos_y, view.y, sy, ry0, ry1).clamp(py0, py1);
+            let iy1 = to_px_lo(r.y + r.h - BEVEL_WIDTH - pad_neg_y, view.y, sy, ry0, ry1)
+                .clamp(iy0, py1);
+            if ix0 < ix1 && iy0 < iy1 {
+                for y in py0..iy0 {
+                    lit_mask[y * patch_w + px0..y * patch_w + px1].fill(1);
+                }
+                for y in iy1..py1 {
+                    lit_mask[y * patch_w + px0..y * patch_w + px1].fill(1);
+                }
+                for y in iy0..iy1 {
+                    let row = y * patch_w;
+                    lit_mask[row + px0..row + ix0].fill(1);
+                    lit_mask[row + ix1..row + px1].fill(1);
+                }
+            } else {
+                for y in py0..py1 {
+                    lit_mask[y * patch_w + px0..y * patch_w + px1].fill(1);
+                }
+            }
+        }
         let light_row = |(ly, row): (usize, &mut [Color32])| {
             if cancelled(token, generation) {
                 return;
             }
-            let world_y = view.y + ((ry0 + ly) as f32 + 0.5) / sy;
+            let world_y = view.y + ((ry0 + ly) as f32 + 0.5) * inv_sy;
             let row_base = ly * patch_w;
+            let mask_row = &lit_mask[row_base..row_base + patch_w];
+            let own_row = &owners[row_base..row_base + patch_w];
             for (lx, pixel) in row.iter_mut().enumerate() {
-                if *pixel == BACKGROUND && owners[row_base + lx] == NONE {
+                if mask_row[lx] == 0 {
                     continue;
                 }
-                let world_x = view.x + ((rx0 + lx) as f32 + 0.5) / sx;
+                if *pixel == BACKGROUND && own_row[lx] == NONE {
+                    continue;
+                }
+                let world_x = view.x + ((rx0 + lx) as f32 + 0.5) * inv_sx;
                 *pixel = illuminate(*pixel, &field, world_x, world_y);
             }
         };
@@ -770,5 +935,92 @@ mod tests {
         grid.apply_patch(&patch);
         assert_eq!(grid.hit_test(40.0, 40.0), Some(42));
         assert_eq!(grid.hit_test(5.0, 5.0), None);
+    }
+
+    #[test]
+    fn lit_mask_and_interior_fast_path_match_unmasked_illumination_bit_for_bit() {
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 400.0,
+            h: 300.0,
+        };
+        let size = [400, 300];
+        let outer = Platform::new(
+            Rect {
+                x: 10.0,
+                y: 10.0,
+                w: 320.0,
+                h: 240.0,
+            },
+            Color32::from_rgb(35, 42, 52),
+            0,
+            1.0,
+        )
+        .unwrap();
+        let inner = Platform::new(
+            Rect {
+                x: 40.0,
+                y: 40.0,
+                w: 140.0,
+                h: 120.0,
+            },
+            Color32::from_rgb(42, 50, 60),
+            1,
+            1.0,
+        )
+        .unwrap();
+        let platforms = [outer, inner];
+        let entries = [RenderEntry {
+            id: 1,
+            rect: outer.top,
+            color: Color32::from_rgb(0x53, 0x7c, 0x6e),
+        }];
+        let token = AtomicU64::new(1);
+        let patch = raster_region(
+            &entries,
+            &platforms,
+            bounds,
+            size,
+            [0, 0, size[0], size[1]],
+            &token,
+            1,
+        )
+        .unwrap();
+        let field = HeightField::build_region(
+            &platforms,
+            bounds,
+            size,
+            [0, 0, size[0], size[1]],
+            &token,
+            1,
+        )
+        .unwrap();
+        // Re-check every pixel against brute-force illumination: any pixel that
+        // skipped `illuminate` via `lit_mask` must have zero light delta!
+        let sx = size[0] as f32 / bounds.w;
+        let sy = size[1] as f32 / bounds.h;
+        for y in 0..size[1] {
+            let wy = bounds.y + (y as f32 + 0.5) / sy;
+            for x in 0..size[0] {
+                let idx = y * size[0] + x;
+                let wx = bounds.x + (x as f32 + 0.5) / sx;
+                let px = patch.image.pixels[idx];
+                if px == BACKGROUND && patch.owners[idx] == NONE {
+                    continue;
+                }
+                // Check interior of `inner` (strictly inside bevel + shadow reach)
+                // produces exact zero normal/occlusion.
+                if wx >= inner.bounds.x + 10.0
+                    && wx <= inner.bounds.x + inner.bounds.w - 10.0
+                    && wy >= inner.bounds.y + 10.0
+                    && wy <= inner.bounds.y + inner.bounds.h - 10.0
+                {
+                    assert_eq!(illuminate(px, &field, wx, wy), px);
+                }
+            }
+        }
+        assert_eq!(stream_preview_size([2048, 1200]), [1024, 600]);
+        assert_eq!(stream_preview_size([900, 600]), [900, 600]);
     }
 }

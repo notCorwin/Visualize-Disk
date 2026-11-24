@@ -539,7 +539,7 @@ impl SceneWorker {
                         if worker_token.load(Ordering::Relaxed) != generation {
                             continue;
                         }
-                        physical_size = render::capped_size(phys);
+                        physical_size = render::stream_preview_size(phys);
                         scene_tree = Some(scene::SceneTree::empty_for_stream(
                             root,
                             real_root,
@@ -561,13 +561,18 @@ impl SceneWorker {
                             emit_idle(generation, &evt_tx);
                             continue;
                         };
+                        let full_physical_size = render::capped_size(phys);
                         let dirty = s.apply_stream_batch(batch);
                         if layout_tree.is_none() {
                             if !finished && s.total_files() == 0 {
                                 emit_idle(generation, &evt_tx);
                                 continue;
                             }
-                            physical_size = render::capped_size(phys);
+                            physical_size = if finished {
+                                full_physical_size
+                            } else {
+                                render::stream_preview_size(phys)
+                            };
                             let px = render::logical_pixel_size(bounds, physical_size);
                             let Some(layout) = scene::LayoutTree::build(
                                 s,
@@ -605,7 +610,49 @@ impl SceneWorker {
                         }
 
                         if let Some(l) = layout_tree.as_mut() {
-                            if !dirty.is_empty() {
+                            let upgrading_to_full = finished && physical_size != full_physical_size;
+                            if upgrading_to_full {
+                                physical_size = full_physical_size;
+                                let full_px = render::logical_pixel_size(l.bounds, physical_size);
+                                let diff = if !dirty.is_empty() {
+                                    let Some(diff) = l.apply_dirty_streaming(
+                                        s,
+                                        &dirty,
+                                        full_px,
+                                        &worker_token,
+                                        generation,
+                                    ) else {
+                                        continue;
+                                    };
+                                    let _ = l.apply_dirty(s, &[0], full_px, &worker_token, generation);
+                                    Some(diff)
+                                } else {
+                                    let _ = l.apply_dirty(s, &[0], full_px, &worker_token, generation);
+                                    None
+                                };
+                                let Some(patch) =
+                                    l.raster_full(physical_size, &worker_token, generation)
+                                else {
+                                    continue;
+                                };
+                                let tiles = l.collect_visible_tiles(s);
+                                let _ = evt_tx.send(WorkerEvent::Resized {
+                                    generation,
+                                    patch,
+                                    tiles,
+                                });
+                                if let Some(diff) = diff {
+                                    let _ = evt_tx.send(WorkerEvent::Patch {
+                                        generation,
+                                        patches: Vec::new(),
+                                        removed_ids: diff.removed_ids,
+                                        upserted_tiles: Vec::new(),
+                                        transitions: diff.transitions,
+                                        stats: make_stats(s),
+                                    });
+                                }
+                                wake();
+                            } else if !dirty.is_empty() {
                                 let px = render::logical_pixel_size(l.bounds, physical_size);
                                 let Some(diff) = l.apply_dirty_streaming(
                                     s,
@@ -666,7 +713,12 @@ impl SceneWorker {
                             continue;
                         }
                         physical_size = next_size;
-                        l.pixel_size = render::logical_pixel_size(l.bounds, physical_size);
+                        let next_px = render::logical_pixel_size(l.bounds, physical_size);
+                        if l.apply_dirty(s, &[0], next_px, &worker_token, generation)
+                            .is_none()
+                        {
+                            continue;
+                        }
                         let Some(patch) = l.raster_full(physical_size, &worker_token, generation)
                         else {
                             continue;
@@ -839,6 +891,7 @@ impl Drop for SceneWorker {
 struct ActiveTransition {
     batch: TransitionBatch,
     started: f64,
+    duration: f64,
 }
 
 struct UiScene {
@@ -854,7 +907,7 @@ struct UiScene {
 impl UiScene {
     fn is_animating_at(&self, now: f64, world_point: Option<(f32, f32)>) -> bool {
         self.transitions.iter().any(|tr| {
-            if now - tr.started >= TRANSITION_SECONDS {
+            if now - tr.started >= tr.duration {
                 return false;
             }
             match world_point {
@@ -1466,20 +1519,15 @@ impl App {
             self.set_notice(Notice::new(text, NoticeKind::Info));
         }
         if start_stream_cmd.is_some() || dispatch_stream_batch.is_some() {
-            let key = self
+            let canvas_size = self
+                .canvas_rect
+                .map(|r| r.size().max(Vec2::splat(1.0)))
+                .unwrap_or(Vec2::new(1156.0, 676.0));
+            let full_key = ViewportKey::new(canvas_size, ctx.pixels_per_point());
+            let bounds = self
                 .ui_scene
                 .as_ref()
-                .map(|u| ViewportKey {
-                    logical_size: Vec2::new(u.bounds.w, u.bounds.h),
-                    physical_size: u.physical_size,
-                })
-                .unwrap_or_else(|| {
-                    let size = self
-                        .canvas_rect
-                        .map(|r| r.size().max(Vec2::splat(1.0)))
-                        .unwrap_or(Vec2::new(1156.0, 676.0));
-                    ViewportKey::new(size, ctx.pixels_per_point())
-                });
+                .map_or_else(|| full_key.bounds(), |u| u.bounds);
             let worker = self.ensure_worker(ctx);
             if let Some((root, real_root, root_identity)) = start_stream_cmd {
                 let generation = worker.bump_generation();
@@ -1488,7 +1536,7 @@ impl App {
                     root,
                     real_root,
                     root_identity,
-                    physical_size: key.physical_size,
+                    physical_size: full_key.physical_size,
                 });
             }
             if let Some((batch, finished)) = dispatch_stream_batch {
@@ -1496,8 +1544,8 @@ impl App {
                 let _ = worker.tx.send(WorkerCmd::StreamBatch {
                     generation,
                     batch,
-                    bounds: key.bounds(),
-                    physical_size: key.physical_size,
+                    bounds,
+                    physical_size: full_key.physical_size,
                     finished,
                 });
                 self.worker_busy = true;
@@ -1679,6 +1727,7 @@ impl App {
                                 scene.transitions.push(ActiveTransition {
                                     batch: merged,
                                     started: now,
+                                    duration: TRANSITION_SECONDS,
                                 });
                             }
                         }
@@ -1725,11 +1774,15 @@ impl App {
         if let Some(scene) = self.ui_scene.as_mut() {
             scene
                 .transitions
-                .retain(|tr| now - tr.started < TRANSITION_SECONDS);
+                .retain(|tr| now - tr.started < tr.duration);
         }
     }
 
     fn handle_resize(&mut self, key: ViewportKey, ctx: &egui::Context) {
+        if self.is_streaming_scan() {
+            self.pending_resize = None;
+            return;
+        }
         let target = render::capped_size(key.physical_size);
         let Some(scene) = self.ui_scene.as_ref() else {
             return;
@@ -2229,7 +2282,7 @@ fn animated_tile_rect(
     now: f64,
 ) -> Option<treemap::Rect> {
     for tr in transitions.iter().rev() {
-        let raw_t = ((now - tr.started) / TRANSITION_SECONDS).clamp(0.0, 1.0) as f32;
+        let raw_t = ((now - tr.started) / tr.duration).clamp(0.0, 1.0) as f32;
         if raw_t >= 1.0 {
             continue;
         }
@@ -2241,8 +2294,13 @@ fn animated_tile_rect(
     None
 }
 
+fn rects_overlap(a: treemap::Rect, b: treemap::Rect) -> bool {
+    a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
+}
+
 /// Retarget an incoming transition batch smoothly from the current in-flight
-/// on-screen positions so rapid mutations never stack opaque overlays or jump.
+/// on-screen positions so rapid mutations never stack opaque overlays, drop
+/// ghost confetti tiles over updated regions, or jump.
 fn retarget_transition(
     active: &[ActiveTransition],
     mut next: TransitionBatch,
@@ -2252,7 +2310,7 @@ fn retarget_transition(
     let Some(prev) = active.last() else {
         return next;
     };
-    let raw_t = ((now - prev.started) / TRANSITION_SECONDS).clamp(0.0, 1.0) as f32;
+    let raw_t = ((now - prev.started) / prev.duration).clamp(0.0, 1.0) as f32;
     if raw_t >= 1.0 {
         return next;
     }
@@ -2286,37 +2344,51 @@ fn retarget_transition(
         }
     }
 
-    // Carry forward any still-moving items from untouched regions of the screen.
+    // Carry forward ONLY still-moving items whose regions are completely
+    // disjoint from `next.dirty_rects`. Any item inside `next.dirty_rects` is
+    // already superseded by `next` (e.g. re-squarified, LOD-collapsed, or
+    // budget-trimmed) and must NOT be painted as ghost confetti over new tiles.
+    let next_dirty = next.dirty_rects.clone();
+    let overlaps_next_dirty = |r: treemap::Rect| next_dirty.iter().any(|&d| rects_overlap(r, d));
     let removed_set: std::collections::HashSet<NodeId> = removed_ids.iter().copied().collect();
-    let mut carried_any = false;
+    let mut carried_items = Vec::new();
     for prev_item in &prev.batch.items {
         if prev_item.kind != TransitionKind::FadeOut
             && !next_tile_ids.contains(&prev_item.id)
             && !removed_set.contains(&prev_item.id)
         {
             let cur = lerp_rect(prev_item.from, prev_item.to, ease);
-            next.items.push(scene::TransitionItem {
-                id: prev_item.id,
-                from: cur,
-                to: prev_item.to,
-                color: prev_item.color,
-                kind: TransitionKind::Move,
-            });
-            carried_any = true;
-        }
-    }
-    if carried_any {
-        for prev_b in &prev.batch.backdrops {
-            if !next_backdrop_ids.contains(&prev_b.dir_idx) {
-                next.backdrops.push(scene::TransitionBackdrop {
-                    dir_idx: prev_b.dir_idx,
-                    from: lerp_rect(prev_b.from, prev_b.to, ease),
-                    to: prev_b.to,
-                    color: prev_b.color,
+            if !overlaps_next_dirty(cur) && !overlaps_next_dirty(prev_item.to) {
+                carried_items.push(scene::TransitionItem {
+                    id: prev_item.id,
+                    from: cur,
+                    to: prev_item.to,
+                    color: prev_item.color,
+                    kind: TransitionKind::Move,
                 });
             }
         }
-        next.dirty_rects.extend_from_slice(&prev.batch.dirty_rects);
+    }
+    if !carried_items.is_empty() {
+        next.items.extend(carried_items);
+        for prev_b in &prev.batch.backdrops {
+            if !next_backdrop_ids.contains(&prev_b.dir_idx) {
+                let cur = lerp_rect(prev_b.from, prev_b.to, ease);
+                if !overlaps_next_dirty(cur) && !overlaps_next_dirty(prev_b.to) {
+                    next.backdrops.push(scene::TransitionBackdrop {
+                        dir_idx: prev_b.dir_idx,
+                        from: cur,
+                        to: prev_b.to,
+                        color: prev_b.color,
+                    });
+                }
+            }
+        }
+        for &d in &prev.batch.dirty_rects {
+            if !overlaps_next_dirty(d) {
+                next.dirty_rects.push(d);
+            }
+        }
     }
     next
 }
@@ -2337,7 +2409,7 @@ fn paint_transitions(
     };
     let mut mesh = egui::Mesh::default();
     for tr in transitions {
-        let raw_t = ((now - tr.started) / TRANSITION_SECONDS).clamp(0.0, 1.0) as f32;
+        let raw_t = ((now - tr.started) / tr.duration).clamp(0.0, 1.0) as f32;
         if raw_t >= 1.0 {
             continue;
         }
@@ -2388,11 +2460,10 @@ fn paint_transitions(
 
         for item in &tr.batch.items {
             let rect = lerp_rect(item.from, item.to, ease);
-            let alpha_mul = match item.kind {
-                TransitionKind::Move => fade_out_overlay,
-                TransitionKind::FadeOut => (1.0 - ease * ease) * fade_out_overlay,
-                TransitionKind::FadeIn => ease.sqrt() * fade_out_overlay,
-            };
+            // Because SplitTree expands FadeIn from a flush edge and collapses
+            // FadeOut to a flush edge, keeping all tiles opaque during motion
+            // guarantees 100% solid coverage with zero black-BG flash.
+            let alpha_mul = fade_out_overlay;
             let screen = to_screen(rect).intersect(canvas);
             if screen.width() < 0.5 || screen.height() < 0.5 || alpha_mul <= 0.01 {
                 continue;
@@ -2998,7 +3069,10 @@ mod tests {
         assert_eq!(app.stats.as_ref().unwrap().total_files, 2);
         assert_eq!(app.stats.as_ref().unwrap().total_bytes, 4000);
         assert_eq!(app.ui_scene.as_ref().unwrap().texture.id(), tex_id);
-        assert!(!app.ui_scene.as_ref().unwrap().transitions.is_empty());
+        assert!(
+            app.ui_scene.as_ref().unwrap().transitions.is_empty(),
+            "streaming batches should publish complete rasters directly without quad-capped overlays"
+        );
 
         // Subsequent rescan on an already-loaded scene uses non-streaming Full mode.
         app.launch_scan(&ctx);
@@ -3009,5 +3083,105 @@ mod tests {
         if let Some(job) = app.job.take() {
             job.cancel.store(true, Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn retarget_transition_drops_ghost_tiles_in_updated_regions() {
+        let prev = ActiveTransition {
+            started: 0.0,
+            duration: TRANSITION_SECONDS,
+            batch: TransitionBatch {
+                dirty_rects: vec![
+                    treemap::Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 400.0,
+                        h: 400.0,
+                    },
+                    treemap::Rect {
+                        x: 600.0,
+                        y: 0.0,
+                        w: 200.0,
+                        h: 200.0,
+                    },
+                ],
+                backdrops: Vec::new(),
+                items: vec![
+                    // Inside region that next batch replaces -> MUST NOT be carried forward.
+                    scene::TransitionItem {
+                        id: NodeId(10),
+                        from: treemap::Rect {
+                            x: 20.0,
+                            y: 20.0,
+                            w: 10.0,
+                            h: 10.0,
+                        },
+                        to: treemap::Rect {
+                            x: 30.0,
+                            y: 30.0,
+                            w: 10.0,
+                            h: 10.0,
+                        },
+                        color: PALETTE[0],
+                        kind: TransitionKind::Move,
+                    },
+                    // In completely disjoint untouched region -> carried forward cleanly.
+                    scene::TransitionItem {
+                        id: NodeId(20),
+                        from: treemap::Rect {
+                            x: 610.0,
+                            y: 10.0,
+                            w: 50.0,
+                            h: 50.0,
+                        },
+                        to: treemap::Rect {
+                            x: 650.0,
+                            y: 10.0,
+                            w: 50.0,
+                            h: 50.0,
+                        },
+                        color: PALETTE[1],
+                        kind: TransitionKind::Move,
+                    },
+                ],
+            },
+        };
+        let next = TransitionBatch {
+            dirty_rects: vec![treemap::Rect {
+                x: 0.0,
+                y: 0.0,
+                w: 400.0,
+                h: 400.0,
+            }],
+            backdrops: Vec::new(),
+            items: vec![scene::TransitionItem {
+                id: NodeId(99),
+                from: treemap::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 400.0,
+                    h: 400.0,
+                },
+                to: treemap::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: 400.0,
+                    h: 400.0,
+                },
+                color: PALETTE[2],
+                kind: TransitionKind::Move,
+            }],
+        };
+        let merged = retarget_transition(&[prev], next, &[], 0.15);
+        let ids: Vec<NodeId> = merged.items.iter().map(|it| it.id).collect();
+        assert!(ids.contains(&NodeId(99)));
+        assert!(
+            !ids.contains(&NodeId(10)),
+            "stale tile inside updated region must not float as ghost confetti"
+        );
+        assert!(
+            ids.contains(&NodeId(20)),
+            "disjoint still-moving tile should finish its transition smoothly"
+        );
     }
 }
