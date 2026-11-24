@@ -11,7 +11,7 @@ use crate::{
     file_actions,
     render::{self, LIGHT_REACH, Platform, RasterPatch, RenderEntry},
     scan::{self, DirectorySnapshot, FileIdentity, ScanResult},
-    treemap::{self, Rect, SplitTree, SyncEntry, SyncStatus},
+    treemap::{Rect, SplitTree, SyncStatus},
 };
 use eframe::egui::Color32;
 use std::{
@@ -1148,147 +1148,6 @@ impl LayoutTree {
         token: &AtomicU64,
         generation: u64,
     ) -> Option<LayoutDiff> {
-        self.apply_dirty_inner(scene, dirty_dirs, pixel_size, false, token, generation)
-    }
-
-    /// Streaming initial-scan update: keeps exact proportions and allows any
-    /// directory that grew into stretched strips mid-scan to re-squarify cleanly.
-    pub fn apply_dirty_streaming(
-        &mut self,
-        scene: &SceneTree,
-        dirty_dirs: &[usize],
-        pixel_size: f32,
-        token: &AtomicU64,
-        generation: u64,
-    ) -> Option<LayoutDiff> {
-        self.apply_dirty_inner(scene, dirty_dirs, pixel_size, true, token, generation)
-    }
-
-    /// Settle a live-streamed initial scan into an optimal Squarified layout
-    /// with a smooth one-shot transition from the last streamed frame.
-    pub fn rebalance_after_stream(
-        &mut self,
-        scene: &SceneTree,
-        pixel_size: f32,
-        token: &AtomicU64,
-        generation: u64,
-    ) -> Option<LayoutDiff> {
-        let min_dim = pixel_size.max(0.5);
-        let mut before_tiles: HashMap<NodeId, (Rect, Color32)> = HashMap::new();
-        let mut before_backdrops: HashMap<usize, (Rect, Color32)> = HashMap::new();
-        for (&dir_idx, layout) in &self.dirs {
-            if let Some(p) = layout.platform {
-                before_backdrops.insert(dir_idx, (layout.bounds, p.color));
-            }
-            for t in &layout.tiles {
-                if t.rect.w >= min_dim && t.rect.h >= min_dim {
-                    before_tiles.insert(t.id, (t.rect, t.color));
-                }
-            }
-        }
-
-        let next = Self::build(scene, self.bounds, pixel_size, token, generation)?;
-
-        let mut backdrops: Vec<(u8, TransitionBackdrop)> = Vec::new();
-        let mut transitions: Vec<TransitionItem> = Vec::new();
-        let mut after_ids: HashSet<NodeId> = HashSet::new();
-        let mut upserted_tiles: Vec<TileInfo> = Vec::new();
-        let visible_min = pixel_size * 0.25;
-
-        for (&dir_idx, layout) in &next.dirs {
-            if let Some(p) = layout.platform {
-                let from = before_backdrops
-                    .get(&dir_idx)
-                    .map_or(layout.bounds, |&(r, _)| r);
-                backdrops.push((
-                    layout.depth,
-                    TransitionBackdrop {
-                        dir_idx,
-                        from,
-                        to: layout.bounds,
-                        color: p.color,
-                    },
-                ));
-            }
-            for t in &layout.tiles {
-                after_ids.insert(t.id);
-                if t.rect.w >= visible_min
-                    && t.rect.h >= visible_min
-                    && let Some(info) = scene.tile_info(t.id, t.rect)
-                {
-                    upserted_tiles.push(info);
-                }
-                if t.rect.w >= min_dim && t.rect.h >= min_dim {
-                    if let Some(&(from, _)) = before_tiles.get(&t.id) {
-                        transitions.push(TransitionItem {
-                            id: t.id,
-                            from,
-                            to: t.rect,
-                            color: t.color,
-                            kind: TransitionKind::Move,
-                        });
-                    } else {
-                        transitions.push(TransitionItem {
-                            id: t.id,
-                            from: center_rect(t.rect),
-                            to: t.rect,
-                            color: t.color,
-                            kind: TransitionKind::FadeIn,
-                        });
-                    }
-                }
-            }
-        }
-
-        let mut removed_ids = Vec::new();
-        for (&id, &(from, color)) in &before_tiles {
-            if !after_ids.contains(&id) {
-                removed_ids.push(id);
-                transitions.push(TransitionItem {
-                    id,
-                    from,
-                    to: center_rect(from),
-                    color,
-                    kind: TransitionKind::FadeOut,
-                });
-            }
-        }
-
-        if transitions.len() > MAX_ANIMATED_TILES {
-            transitions.sort_unstable_by(|a, b| {
-                let area_a = (a.from.w * a.from.h).max(a.to.w * a.to.h);
-                let area_b = (b.from.w * b.from.h).max(b.to.w * b.to.h);
-                area_b.total_cmp(&area_a)
-            });
-            transitions.truncate(MAX_ANIMATED_TILES);
-        }
-        backdrops.sort_by_key(|(depth, _)| *depth);
-        if backdrops.len() > MAX_ANIMATED_BACKDROPS {
-            backdrops.truncate(MAX_ANIMATED_BACKDROPS);
-        }
-
-        *self = next;
-        Some(LayoutDiff {
-            dirty_rects: vec![self.bounds],
-            removed_ids,
-            upserted_tiles,
-            transitions: TransitionBatch {
-                dirty_rects: vec![self.bounds],
-                backdrops: backdrops.into_iter().map(|(_, b)| b).collect(),
-                items: transitions,
-            },
-        })
-    }
-
-    fn apply_dirty_inner(
-        &mut self,
-        scene: &SceneTree,
-        dirty_dirs: &[usize],
-        pixel_size: f32,
-        allow_streaming_resquarify: bool,
-        token: &AtomicU64,
-        generation: u64,
-    ) -> Option<LayoutDiff> {
         self.pixel_size = pixel_size;
         if dirty_dirs.is_empty() {
             return Some(LayoutDiff {
@@ -1649,54 +1508,6 @@ impl LayoutTree {
                 token,
                 generation,
             )?;
-
-            // During live initial-scan streaming, early batches can grow 100x+
-            // and turn locked splits into stretched strips. If this container's
-            // worst visible child aspect exceeds 3.5 and a fresh Squarified split
-            // materially improves it, re-squarify this container cleanly.
-            let entries = if allow_streaming_resquarify
-                && is_dirty
-                && weights.len() > 1
-                && render::valid(eval_new_content)
-            {
-                let old_worst = entries
-                    .iter()
-                    .filter(|e| e.status != SyncStatus::Removed && e.to.w >= min_dim && e.to.h >= min_dim)
-                    .map(|e| treemap::rect_aspect(e.to))
-                    .fold(1.0f64, f64::max);
-                if old_worst > 3.5 {
-                    let candidate =
-                        SplitTree::build_with_cancel(&weights, eval_new_content, token, generation)?;
-                    let cand_rects = candidate.evaluate(eval_new_content);
-                    let new_worst = cand_rects
-                        .iter()
-                        .filter(|(_, r)| r.w >= min_dim && r.h >= min_dim)
-                        .map(|(_, r)| treemap::rect_aspect(*r))
-                        .fold(1.0f64, f64::max);
-                    if new_worst < old_worst * 0.85 {
-                        let new_map: HashMap<SlotKey, Rect> = cand_rects.into_iter().collect();
-                        existing.split_tree = candidate;
-                        entries
-                            .into_iter()
-                            .map(|mut e| {
-                                if let Some(&new_to) = new_map.get(&e.key) {
-                                    e.to = new_to;
-                                    if e.status == SyncStatus::Added {
-                                        e.from = center_rect(new_to);
-                                    }
-                                }
-                                e
-                            })
-                            .collect::<Vec<SyncEntry<SlotKey>>>()
-                    } else {
-                        entries
-                    }
-                } else {
-                    entries
-                }
-            } else {
-                entries
-            };
 
             let mut laid_tiles = Vec::new();
             let mut laid_children = Vec::new();

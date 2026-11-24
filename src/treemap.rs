@@ -287,36 +287,56 @@ impl<K: Copy + Eq + Hash + Send> SplitTree<K> {
         let mut before_weights: Vec<u64> = self.nodes.iter().map(|n| n.weight).collect();
 
         // Splice newly added items along the right-most spine at the depth that
-        // gives the new subtree the squarest aspect ratio, with `before_weight = 0`
-        // so existing items keep their exact `before` geometry and new items slide
-        // cleanly out from an edge without reordering anything.
+        // gives the post-insertion rectangle the squarest aspect ratio, with
+        // `before_weight = 0` so existing items keep their exact `before`
+        // geometry and never reorder or flip axes.
         if !added.is_empty() {
             let added_total: u64 = added
                 .iter()
                 .map(|(_, w)| *w)
                 .fold(0u64, u64::saturating_add);
             let mut cur = self.root.unwrap() as usize;
-            let mut cur_rect = old_bounds;
+            let mut cur_post_rect = new_bounds;
             while let SplitKind::Branch { axis, left, right } = self.nodes[cur].kind {
                 let lw = before_weights[left as usize];
                 let rw = before_weights[right as usize];
-                let (_, right_rect) = split_rect_by_weights(cur_rect, axis, lw, rw);
-                let aspect_here = candidate_split_aspect(cur_rect, before_weights[cur], added_total);
-                let aspect_deeper = candidate_split_aspect(right_rect, rw, added_total);
-                if aspect_deeper >= aspect_here {
+                // Compare splitting HERE vs descending into `right` using the
+                // exact post-insertion rects of BOTH `right` and `added`.
+                let here_axis = if cur_post_rect.w >= cur_post_rect.h {
+                    SplitAxis::Vertical
+                } else {
+                    SplitAxis::Horizontal
+                };
+                let (existing_if_here, new_if_here) = split_rect_by_weights(
+                    cur_post_rect,
+                    here_axis,
+                    before_weights[cur],
+                    added_total,
+                );
+                let (_, right_if_here) = split_rect_by_weights(existing_if_here, axis, lw, rw);
+                let worst_here = rect_aspect(right_if_here).max(rect_aspect(new_if_here));
+
+                let (_, post_right_rect) = split_rect_by_weights(
+                    cur_post_rect,
+                    axis,
+                    lw,
+                    rw.saturating_add(added_total),
+                );
+                let worst_deeper = candidate_split_aspect(post_right_rect, rw, added_total);
+                if worst_deeper >= worst_here {
                     break;
                 }
                 cur = right as usize;
-                cur_rect = right_rect;
+                cur_post_rect = post_right_rect;
             }
 
-            let axis = if cur_rect.w >= cur_rect.h {
+            let axis = if cur_post_rect.w >= cur_post_rect.h {
                 SplitAxis::Vertical
             } else {
                 SplitAxis::Horizontal
             };
             let (_, prospective_rect) =
-                split_rect_by_weights(cur_rect, axis, before_weights[cur], added_total);
+                split_rect_by_weights(cur_post_rect, axis, before_weights[cur], added_total);
             let sub = Self::build_inner(&added, prospective_rect, token)?;
             let sub_root = sub.root.expect("non-empty added list must build a root");
 
@@ -488,11 +508,22 @@ fn candidate_split_aspect(rect: Rect, existing_w: u64, added_w: u64) -> f64 {
     } else {
         SplitAxis::Horizontal
     };
-    let (_, new_r) = split_rect_by_weights(rect, axis, existing_w, added_w);
-    rect_aspect(new_r)
+    let (existing_r, new_r) = split_rect_by_weights(rect, axis, existing_w, added_w);
+    rect_aspect(existing_r).max(rect_aspect(new_r))
 }
 
+#[cfg(test)]
 pub fn rect_aspect(r: Rect) -> f64 {
+    let w = r.w as f64;
+    let h = r.h as f64;
+    if w <= 1e-6 || h <= 1e-6 {
+        return f64::INFINITY;
+    }
+    (w / h).max(h / w)
+}
+
+#[cfg(not(test))]
+fn rect_aspect(r: Rect) -> f64 {
     let w = r.w as f64;
     let h = r.h as f64;
     if w <= 1e-6 || h <= 1e-6 {
@@ -1228,6 +1259,38 @@ mod tests {
         assert!(
             avg_aspect <= 1.85,
             "expected squarified avg aspect <= 1.85, got {avg_aspect}"
+        );
+    }
+
+    #[test]
+    fn post_insertion_spine_descent_rescues_small_siblings_without_reordering() {
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1000.0,
+            h: 1000.0,
+        };
+        // Initial layout: one huge left item (100) and one tiny right item (5).
+        let mut tree = SplitTree::build(&[(0u32, 100), (1, 5)], bounds);
+        let before: HashMap<u32, Rect> = tree.evaluate(bounds).into_iter().collect();
+        // Item 1 starts skinny (~21:1). Now a 50-unit item 2 arrives!
+        let entries = tree.sync(&[(0, 100), (1, 5), (2, 50)], bounds, bounds);
+        let after: HashMap<u32, Rect> = entries.iter().map(|e| (e.key, e.to)).collect();
+
+        // Item 0 MUST remain strictly left of item 1 (strict order preservation!).
+        assert!(before[&0].x + before[&0].w <= before[&1].x + 1e-2);
+        assert!(after[&0].x + after[&0].w <= after[&1].x + 1e-2);
+        // Descending into the expanded right column stacks item 2 perpendicularly
+        // with item 1, rescuing item 1 from ~31:1 down to ~4:1!
+        assert!(
+            rect_aspect(after[&1]) < 5.0,
+            "expected item 1 to be rescued below 5:1, got {}",
+            rect_aspect(after[&1])
+        );
+        assert!(
+            rect_aspect(after[&2]) < 3.0,
+            "expected item 2 to be squarish (<3:1), got {}",
+            rect_aspect(after[&2])
         );
     }
 }

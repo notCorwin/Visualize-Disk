@@ -605,65 +605,9 @@ impl SceneWorker {
                         }
 
                         if let Some(l) = layout_tree.as_mut() {
-                            if finished {
-                                let px = render::logical_pixel_size(l.bounds, physical_size);
-                                let Some(diff) = l.rebalance_after_stream(
-                                    s,
-                                    px,
-                                    &worker_token,
-                                    generation,
-                                ) else {
-                                    continue;
-                                };
-                                let Some(patches) = l.raster_dirty(
-                                    &diff.dirty_rects,
-                                    physical_size,
-                                    &worker_token,
-                                    generation,
-                                ) else {
-                                    continue;
-                                };
-                                let _ = evt_tx.send(WorkerEvent::Patch {
-                                    generation,
-                                    patches,
-                                    removed_ids: diff.removed_ids,
-                                    upserted_tiles: diff.upserted_tiles,
-                                    transitions: diff.transitions,
-                                    stats: make_stats(s),
-                                });
-                            } else if !dirty.is_empty() {
-                                let px = render::logical_pixel_size(l.bounds, physical_size);
-                                let Some(diff) = l.apply_dirty_streaming(
-                                    s,
-                                    &dirty,
-                                    px,
-                                    &worker_token,
-                                    generation,
-                                ) else {
-                                    continue;
-                                };
-                                if diff.dirty_rects.is_empty() {
-                                    emit_idle(generation, &evt_tx);
-                                } else {
-                                    let Some(patches) = l.raster_dirty(
-                                        &diff.dirty_rects,
-                                        physical_size,
-                                        &worker_token,
-                                        generation,
-                                    ) else {
-                                        continue;
-                                    };
-                                    let _ = evt_tx.send(WorkerEvent::Patch {
-                                        generation,
-                                        patches,
-                                        removed_ids: diff.removed_ids,
-                                        upserted_tiles: diff.upserted_tiles,
-                                        transitions: diff.transitions,
-                                        stats: make_stats(s),
-                                    });
-                                    wake();
-                                }
-                            } else {
+                            if !dirty.is_empty() {
+                                emit_dirty(s, l, &dirty, generation, physical_size, &evt_tx);
+                            } else if !finished {
                                 emit_idle(generation, &evt_tx);
                             }
                         }
