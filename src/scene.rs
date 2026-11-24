@@ -1,16 +1,17 @@
-//! Single, closed persistent scene tree and incremental layout engine.
+//! Single, closed persistent scene tree and stable incremental layout engine.
 //!
 //! Invariant: `LayoutTree` always holds the scan root container with the full
-//! canvas bounds. Every filesystem mutation (delete, add, resize, directory
-//! collapse/expand, rescan diff, or FSEvents batch) walks up from dirty
-//! directories to the nearest active container with fixed bounds (at worst root)
-//! and executes the exact same `layout_subtree` function. There is no separate
-//! full-map rebuild path and no fallback.
+//! canvas bounds and a persistent binary space-partitioning `SplitTree` per
+//! directory. Every filesystem mutation (delete, add, resize, directory
+//! collapse/expand, rescan diff, or FSEvents batch) propagates exact byte
+//! weights up to root and re-evaluates through the SAME split trees so:
+//! 1. Every file and folder reflects its true proportion of the total size.
+//! 2. Surviving items never reorder or flip orientation, preserving spatial memory.
 use crate::{
     file_actions,
     render::{self, LIGHT_REACH, Platform, RasterPatch, RenderEntry},
     scan::{self, DirectorySnapshot, FileIdentity, ScanResult},
-    treemap::{self, Rect},
+    treemap::{Rect, SplitTree, SyncStatus},
 };
 use eframe::egui::Color32;
 use std::{
@@ -51,7 +52,16 @@ pub enum TransitionKind {
 }
 
 #[derive(Clone, Copy, Debug)]
+pub struct TransitionBackdrop {
+    pub dir_idx: usize,
+    pub from: Rect,
+    pub to: Rect,
+    pub color: Color32,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct TransitionItem {
+    pub id: NodeId,
     pub from: Rect,
     pub to: Rect,
     pub color: Color32,
@@ -61,10 +71,12 @@ pub struct TransitionItem {
 #[derive(Clone, Debug)]
 pub struct TransitionBatch {
     pub dirty_rects: Vec<Rect>,
+    pub backdrops: Vec<TransitionBackdrop>,
     pub items: Vec<TransitionItem>,
 }
 
-const MAX_ANIMATED_TILES: usize = 1024;
+const MAX_ANIMATED_TILES: usize = 4096;
+const MAX_ANIMATED_BACKDROPS: usize = 2048;
 
 #[derive(Clone, Debug)]
 struct FileNode {
@@ -854,8 +866,23 @@ impl SceneTree {
     }
 }
 
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum SlotKey {
+    File(NodeId),
+    SelfFiles,
+    Subdir(u32),
+}
+
+#[derive(Clone, Copy)]
+enum VisualItem {
+    File(NodeId, Color32),
+    FolderTile(NodeId, Color32),
+    SubdirContainer(usize),
+}
+
 #[derive(Clone, Copy, Debug)]
 struct LaidOutTile {
+    key: SlotKey,
     id: NodeId,
     rect: Rect,
     color: Color32,
@@ -866,6 +893,7 @@ struct DirLayout {
     bounds: Rect,
     platform: Option<Platform>,
     depth: u8,
+    split_tree: SplitTree<SlotKey>,
     tiles: Vec<LaidOutTile>,
     children: Vec<(usize, Rect)>,
 }
@@ -886,8 +914,7 @@ pub struct LayoutTree {
 }
 
 impl LayoutTree {
-    /// Build the initial layout tree for `mode`. Uses the exact same
-    /// `layout_subtree` routine as every incremental update.
+    /// Build the initial layout tree for `mode`.
     pub fn build(
         scene: &SceneTree,
         mode: ViewMode,
@@ -902,16 +929,97 @@ impl LayoutTree {
             pixel_size,
             dirs: HashMap::new(),
         };
-        if !tree.layout_subtree(scene, 0, bounds, 0, token, generation) {
+        if !tree.build_subtree(scene, 0, bounds, 0, token, generation) {
             return None;
         }
         Some(tree)
     }
 
-    /// Incrementally update ONLY the affected subtrees for `dirty_dirs`.
-    /// Mathematically closed: because root (0) always owns `self.bounds`, every
-    /// mutation resolves to one or more disjoint fixed-bounds containers with
-    /// zero fallback paths.
+    fn build_subtree(
+        &mut self,
+        scene: &SceneTree,
+        root_idx: usize,
+        root_bounds: Rect,
+        root_depth: u8,
+        token: &AtomicU64,
+        generation: u64,
+    ) -> bool {
+        let mut queue = VecDeque::new();
+        queue.push_back((root_idx, root_bounds, root_depth));
+
+        while let Some((dir_idx, bounds, depth)) = queue.pop_front() {
+            if token.load(Ordering::Relaxed) != generation {
+                return false;
+            }
+            if scene.dirs.get(dir_idx).and_then(|d| d.as_ref()).is_none() {
+                if dir_idx == 0 {
+                    self.dirs.insert(
+                        0,
+                        DirLayout {
+                            bounds,
+                            platform: None,
+                            depth: 0,
+                            split_tree: SplitTree::empty(),
+                            tiles: Vec::new(),
+                            children: Vec::new(),
+                        },
+                    );
+                }
+                continue;
+            }
+
+            let items = collect_dir_items(scene, dir_idx, self.mode);
+            let (platform, content, next_depth) =
+                compute_platform(dir_idx, bounds, depth, self.pixel_size, &items);
+
+            let mut laid_tiles = Vec::new();
+            let mut laid_children = Vec::new();
+            let split_tree = if !items.is_empty() && render::valid(content) {
+                let weights: Vec<(SlotKey, u64)> = items.iter().map(|&(k, _, w)| (k, w)).collect();
+                let Some(tree) = SplitTree::build_with_cancel(&weights, content, token, generation)
+                else {
+                    return false;
+                };
+                let meta: HashMap<SlotKey, VisualItem> =
+                    items.iter().map(|&(k, v, _)| (k, v)).collect();
+                for (key, rect) in tree.evaluate(content) {
+                    match meta[&key] {
+                        VisualItem::File(id, color) | VisualItem::FolderTile(id, color) => {
+                            laid_tiles.push(LaidOutTile {
+                                key,
+                                id,
+                                rect,
+                                color,
+                            });
+                        }
+                        VisualItem::SubdirContainer(child_idx) => {
+                            laid_children.push((child_idx, rect));
+                            queue.push_back((child_idx, rect, next_depth));
+                        }
+                    }
+                }
+                tree
+            } else {
+                SplitTree::empty()
+            };
+
+            self.dirs.insert(
+                dir_idx,
+                DirLayout {
+                    bounds,
+                    platform,
+                    depth,
+                    split_tree,
+                    tiles: laid_tiles,
+                    children: laid_children,
+                },
+            );
+        }
+        true
+    }
+
+    /// Incrementally update the layout tree for `dirty_dirs` while preserving
+    /// exact global area proportions AND persistent split-tree spatial order.
     pub fn apply_dirty(
         &mut self,
         scene: &SceneTree,
@@ -928,412 +1036,627 @@ impl LayoutTree {
                 upserted_tiles: Vec::new(),
                 transitions: TransitionBatch {
                     dirty_rects: Vec::new(),
+                    backdrops: Vec::new(),
                     items: Vec::new(),
                 },
             });
         }
 
-        // Step 1: Map every dirty directory to the nearest existing container
-        // in `self.dirs` whose outer bounds stay fixed.
-        let mut candidates = HashSet::new();
+        // Step 1: Collect every dirty directory and all of its ancestors up to root (0).
+        let mut dirty_set = HashSet::new();
+        dirty_set.insert(0usize);
         for &d in dirty_dirs {
-            let scope = self.resolve_scope(scene, d);
-            candidates.insert(scope);
-        }
-
-        // Step 2: Keep only topmost disjoint scopes (drop any scope whose
-        // ancestor is also in `candidates`).
-        let mut scopes = Vec::new();
-        for &s in &candidates {
-            let mut ancestor = scene
-                .dirs
-                .get(s)
-                .and_then(|d| d.as_ref())
-                .and_then(|d| d.parent);
-            let mut covered = false;
-            while let Some(a) = ancestor {
-                if candidates.contains(&a) {
-                    covered = true;
+            let mut cur = Some(d);
+            while let Some(idx) = cur {
+                if !dirty_set.insert(idx) {
                     break;
                 }
-                ancestor = scene
+                cur = scene
                     .dirs
-                    .get(a)
-                    .and_then(|d| d.as_ref())
-                    .and_then(|d| d.parent);
-            }
-            if !covered {
-                scopes.push(s);
+                    .get(idx)
+                    .and_then(|n| n.as_ref())
+                    .and_then(|n| n.parent);
             }
         }
-        scopes.sort_unstable();
 
-        // Step 3: For each disjoint scope, snapshot before-tiles, re-layout in
-        // its existing fixed bounds, snapshot after-tiles, and diff.
-        let mut dirty_rects = Vec::with_capacity(scopes.len());
-        let mut before_tiles = HashMap::<NodeId, (Rect, Color32)>::new();
-        let mut after_tiles = HashMap::<NodeId, (Rect, Color32)>::new();
+        let skip_tol = (self.pixel_size * 0.005).max(0.005);
+        let min_dim = self.pixel_size.max(0.5);
+        let visible_min = self.pixel_size * 0.25;
 
-        for &scope in &scopes {
-            let (scope_bounds, scope_depth) = self
-                .dirs
-                .get(&scope)
-                .map_or((self.bounds, 0), |l| (l.bounds, l.depth));
-            self.collect_subtree_tiles(scope, &mut before_tiles);
-            self.remove_subtree_layouts(scope);
-            if !self.layout_subtree(scene, scope, scope_bounds, scope_depth, token, generation) {
+        struct UpdateTask {
+            dir_idx: usize,
+            old_bounds: Rect,
+            new_bounds: Rect,
+            depth: u8,
+            collapsing: bool,
+            force_emit: bool,
+        }
+
+        struct CandidateItem {
+            owner_dir: usize,
+            item: TransitionItem,
+        }
+
+        struct DirMetaSnapshot {
+            depth: u8,
+            old_content: Rect,
+            new_content: Rect,
+            color: Color32,
+        }
+
+        let mut queue = VecDeque::new();
+        queue.push_back(UpdateTask {
+            dir_idx: 0,
+            old_bounds: self.bounds,
+            new_bounds: self.bounds,
+            depth: 0,
+            collapsing: false,
+            force_emit: false,
+        });
+
+        let mut transition_dirty_rects: Vec<Rect> = Vec::new();
+        let mut raster_dirty_rects: Vec<Rect> = Vec::new();
+        let mut backdrops: Vec<(u8, TransitionBackdrop)> = Vec::new();
+        let mut candidates: Vec<CandidateItem> = Vec::new();
+        let mut dir_snapshots: HashMap<usize, DirMetaSnapshot> = HashMap::new();
+        let mut needs_fill_backdrop: HashSet<usize> = HashSet::new();
+        let mut removed_ids: Vec<NodeId> = Vec::new();
+        let mut upserted_tiles: Vec<TileInfo> = Vec::new();
+
+        while let Some(task) = queue.pop_front() {
+            if token.load(Ordering::Relaxed) != generation {
                 return None;
             }
-            self.collect_subtree_tiles(scope, &mut after_tiles);
-            dirty_rects.push(scope_bounds);
-        }
+            let UpdateTask {
+                dir_idx,
+                old_bounds,
+                new_bounds,
+                depth,
+                collapsing,
+                force_emit,
+            } = task;
 
-        // Step 4: Compute removed IDs, upserted TileInfos (only visible ones),
-        // and GPU transition items.
-        let mut removed_ids = Vec::new();
-        let mut transitions = Vec::new();
-        for (&id, &(from, color)) in &before_tiles {
-            if let Some(&(to, new_color)) = after_tiles.get(&id) {
-                if !rects_approx_eq(from, to) {
-                    transitions.push(TransitionItem {
-                        from,
-                        to,
-                        color: new_color,
-                        kind: TransitionKind::Move,
+            // Case 1: Existing directory container is collapsing (deleted, emptied, or refolded).
+            if collapsing {
+                let Some(old_layout) = self.dirs.remove(&dir_idx) else {
+                    continue;
+                };
+                let dirty_union = union_rects(old_bounds, new_bounds);
+                if render::valid(dirty_union) {
+                    raster_dirty_rects.push(dirty_union);
+                    if !force_emit {
+                        transition_dirty_rects.push(dirty_union);
+                    }
+                }
+                if let Some(p) = old_layout.platform {
+                    backdrops.push((
+                        depth,
+                        TransitionBackdrop {
+                            dir_idx,
+                            from: old_bounds,
+                            to: new_bounds,
+                            color: p.color,
+                        },
+                    ));
+                }
+                let old_content = old_layout.platform.map_or(old_bounds, |p| p.top);
+                let dir_color = old_layout
+                    .tiles
+                    .first()
+                    .map_or(platform_color(depth), |t| t.color);
+                dir_snapshots.insert(
+                    dir_idx,
+                    DirMetaSnapshot {
+                        depth,
+                        old_content,
+                        new_content: new_bounds,
+                        color: dir_color,
+                    },
+                );
+
+                let collapsed_map: HashMap<SlotKey, Rect> = old_layout
+                    .split_tree
+                    .evaluate(new_bounds)
+                    .into_iter()
+                    .collect();
+                for t in &old_layout.tiles {
+                    removed_ids.push(t.id);
+                    let to = collapsed_map
+                        .get(&t.key)
+                        .copied()
+                        .unwrap_or_else(|| center_rect(new_bounds));
+                    if t.rect.w.max(to.w) >= min_dim && t.rect.h.max(to.h) >= min_dim {
+                        candidates.push(CandidateItem {
+                            owner_dir: dir_idx,
+                            item: TransitionItem {
+                                id: t.id,
+                                from: t.rect,
+                                to,
+                                color: t.color,
+                                kind: TransitionKind::FadeOut,
+                            },
+                        });
+                    } else {
+                        needs_fill_backdrop.insert(dir_idx);
+                    }
+                }
+                for &(child_idx, child_old) in &old_layout.children {
+                    let child_to = collapsed_map
+                        .get(&SlotKey::Subdir(child_idx as u32))
+                        .copied()
+                        .unwrap_or_else(|| center_rect(new_bounds));
+                    queue.push_back(UpdateTask {
+                        dir_idx: child_idx,
+                        old_bounds: child_old,
+                        new_bounds: child_to,
+                        depth: depth.saturating_add(1),
+                        collapsing: true,
+                        force_emit: true,
                     });
                 }
-            } else {
-                removed_ids.push(id);
-                let center = Rect {
-                    x: from.x + from.w * 0.5,
-                    y: from.y + from.h * 0.5,
-                    w: 0.0,
-                    h: 0.0,
-                };
-                transitions.push(TransitionItem {
-                    from,
-                    to: center,
-                    color,
-                    kind: TransitionKind::FadeOut,
-                });
-            }
-        }
-        for (&id, &(to, color)) in &after_tiles {
-            if !before_tiles.contains_key(&id) {
-                let center = Rect {
-                    x: to.x + to.w * 0.5,
-                    y: to.y + to.h * 0.5,
-                    w: 0.0,
-                    h: 0.0,
-                };
-                transitions.push(TransitionItem {
-                    from: center,
-                    to,
-                    color,
-                    kind: TransitionKind::FadeIn,
-                });
-            }
-        }
-
-        // Keep the largest visible animated tiles within our fast GPU budget.
-        let min_dim = self.pixel_size.max(0.5);
-        transitions.retain(|t| {
-            let max_w = t.from.w.max(t.to.w);
-            let max_h = t.from.h.max(t.to.h);
-            max_w >= min_dim && max_h >= min_dim
-        });
-        if transitions.len() > MAX_ANIMATED_TILES {
-            transitions.sort_unstable_by(|a, b| {
-                let area_a = (a.from.w * a.from.h).max(a.to.w * a.to.h);
-                let area_b = (b.from.w * b.from.h).max(b.to.w * b.to.h);
-                area_b.total_cmp(&area_a)
-            });
-            transitions.truncate(MAX_ANIMATED_TILES);
-        }
-
-        let mut upserted_tiles = Vec::new();
-        for (&id, &(rect, _)) in &after_tiles {
-            if rect.w >= self.pixel_size * 0.25
-                && rect.h >= self.pixel_size * 0.25
-                && let Some(info) = scene.tile_info(id, self.mode, rect)
-            {
-                upserted_tiles.push(info);
-            }
-        }
-
-        Some(LayoutDiff {
-            dirty_rects: dirty_rects.clone(),
-            removed_ids,
-            upserted_tiles,
-            transitions: TransitionBatch {
-                dirty_rects,
-                items: transitions,
-            },
-        })
-    }
-
-    /// Walk up from `dir_idx` to the nearest active container in `self.dirs`
-    /// whose outer bounds can remain unchanged. Always terminates at `0` (root).
-    fn resolve_scope(&self, scene: &SceneTree, dir_idx: usize) -> usize {
-        let mut cur = dir_idx;
-        loop {
-            if cur == 0 {
-                return 0;
-            }
-            let Some(dir) = scene.dirs.get(cur).and_then(|d| d.as_ref()) else {
-                return 0;
-            };
-            let parent = dir.parent.unwrap_or(0);
-            let Some(existing) = self.dirs.get(&cur) else {
-                // Not currently a container (new dir or previously collapsed).
-                cur = parent;
-                continue;
-            };
-            // If this directory became empty, collapsed into a single leaf tile
-            // (in Hybrid mode), or toggled its unary/platform eligibility, lift
-            // to its parent so sibling allocations stay consistent.
-            let is_empty = dir.total_files == 0;
-            let collapsed_hybrid = self.mode == ViewMode::Hybrid && dir.is_leaf;
-            if is_empty || collapsed_hybrid {
-                cur = parent;
                 continue;
             }
-            let visible_children = count_visible_children(scene, dir, self.mode);
-            let has_direct_tile = has_direct_visual_tiles(dir, self.mode);
-            let unary = visible_children == 1 && !has_direct_tile;
-            let wants_platform = !unary
-                && Platform::new(
-                    existing.bounds,
-                    platform_color(existing.depth),
-                    existing.depth,
-                    self.pixel_size,
-                )
-                .is_some();
-            if wants_platform != existing.platform.is_some() {
-                cur = parent;
-                continue;
-            }
-            return cur;
-        }
-    }
 
-    fn collect_subtree_tiles(&self, root_idx: usize, out: &mut HashMap<NodeId, (Rect, Color32)>) {
-        let mut stack = vec![root_idx];
-        while let Some(idx) = stack.pop() {
-            if let Some(layout) = self.dirs.get(&idx) {
-                for t in &layout.tiles {
-                    out.insert(t.id, (t.rect, t.color));
-                }
-                for &(child, _) in &layout.children {
-                    stack.push(child);
+            // Case 2: Live directory container.
+            let is_dirty = dirty_set.contains(&dir_idx);
+            let items = collect_dir_items(scene, dir_idx, self.mode);
+            let (platform, new_content, next_depth) =
+                compute_platform(dir_idx, new_bounds, depth, self.pixel_size, &items);
+            let dir_color = scene
+                .dirs
+                .get(dir_idx)
+                .and_then(|d| d.as_ref())
+                .map_or_else(|| platform_color(depth), |d| crate::color(&d.path));
+
+            if let Some(existing) = self.dirs.get(&dir_idx) {
+                let bounds_same = bounds_within_tol(existing.bounds, new_bounds, skip_tol);
+                let platform_same =
+                    existing.platform.is_some() == platform.is_some() && existing.depth == depth;
+                if !is_dirty && bounds_same && platform_same && !force_emit {
+                    // Completely untouched subtree: zero work, zero raster, zero overlay.
+                    continue;
                 }
             }
-        }
-    }
 
-    fn remove_subtree_layouts(&mut self, root_idx: usize) {
-        let mut stack = vec![root_idx];
-        while let Some(idx) = stack.pop() {
-            if let Some(layout) = self.dirs.remove(&idx) {
-                for (child, _) in layout.children {
-                    stack.push(child);
-                }
-            }
-        }
-    }
-
-    /// The single recursive layout function used for BOTH initial build and all
-    /// incremental subtree updates.
-    fn layout_subtree(
-        &mut self,
-        scene: &SceneTree,
-        root_idx: usize,
-        root_bounds: Rect,
-        root_depth: u8,
-        token: &AtomicU64,
-        generation: u64,
-    ) -> bool {
-        let mut queue = VecDeque::new();
-        queue.push_back((root_idx, root_bounds, root_depth));
-
-        while let Some((dir_idx, bounds, depth)) = queue.pop_front() {
-            if token.load(Ordering::Relaxed) != generation {
-                return false;
-            }
-            let Some(dir) = scene.dirs.get(dir_idx).and_then(|d| d.as_ref()) else {
-                if dir_idx == 0 {
-                    self.dirs.insert(
-                        0,
-                        DirLayout {
-                            bounds,
-                            platform: None,
-                            depth: 0,
-                            tiles: Vec::new(),
-                            children: Vec::new(),
-                        },
-                    );
-                }
-                continue;
-            };
-
-            let below_root = dir_idx != 0;
-            // In Hybrid mode, a leaf directory collapses into one tile inside its
-            // parent — except when root itself is a leaf, in which case root
-            // draws its single aggregated folder tile directly in `bounds`.
-            if !below_root && self.mode == ViewMode::Hybrid && dir.is_leaf {
-                let tiles = if !dir.files.is_empty() {
-                    vec![LaidOutTile {
-                        id: dir.id,
-                        rect: bounds,
-                        color: crate::color(&dir.path),
-                    }]
+            let mut existing_opt = self.dirs.remove(&dir_idx);
+            let Some(existing) = existing_opt.as_mut() else {
+                // Subcase 2c: Brand-new directory container (newly created or unfolded leaf).
+                let weights: Vec<(SlotKey, u64)> = items.iter().map(|&(k, _, w)| (k, w)).collect();
+                let meta: HashMap<SlotKey, VisualItem> =
+                    items.iter().map(|&(k, v, _)| (k, v)).collect();
+                let split_tree = if !weights.is_empty() && render::valid(new_content) {
+                    SplitTree::build_with_cancel(&weights, new_content, token, generation)?
                 } else {
-                    Vec::new()
+                    SplitTree::empty()
                 };
+
+                let dirty_union = union_rects(old_bounds, new_bounds);
+                if render::valid(dirty_union) {
+                    raster_dirty_rects.push(dirty_union);
+                    if !force_emit {
+                        transition_dirty_rects.push(dirty_union);
+                    }
+                }
+                if let Some(p) = platform {
+                    backdrops.push((
+                        depth,
+                        TransitionBackdrop {
+                            dir_idx,
+                            from: old_bounds,
+                            to: new_bounds,
+                            color: p.color,
+                        },
+                    ));
+                }
+                dir_snapshots.insert(
+                    dir_idx,
+                    DirMetaSnapshot {
+                        depth,
+                        old_content: old_bounds,
+                        new_content,
+                        color: dir_color,
+                    },
+                );
+
+                let froms = split_tree.evaluate(old_bounds);
+                let tos = split_tree.evaluate(new_content);
+                let mut laid_tiles = Vec::new();
+                let mut laid_children = Vec::new();
+
+                for ((key, from), (_, to)) in froms.into_iter().zip(tos) {
+                    match meta[&key] {
+                        VisualItem::File(id, color) | VisualItem::FolderTile(id, color) => {
+                            laid_tiles.push(LaidOutTile {
+                                key,
+                                id,
+                                rect: to,
+                                color,
+                            });
+                            if to.w >= visible_min
+                                && to.h >= visible_min
+                                && let Some(info) = scene.tile_info(id, self.mode, to)
+                            {
+                                upserted_tiles.push(info);
+                            }
+                            if from.w.max(to.w) >= min_dim && from.h.max(to.h) >= min_dim {
+                                candidates.push(CandidateItem {
+                                    owner_dir: dir_idx,
+                                    item: TransitionItem {
+                                        id,
+                                        from,
+                                        to,
+                                        color,
+                                        kind: TransitionKind::FadeIn,
+                                    },
+                                });
+                            } else {
+                                needs_fill_backdrop.insert(dir_idx);
+                            }
+                        }
+                        VisualItem::SubdirContainer(child_idx) => {
+                            laid_children.push((child_idx, to));
+                            queue.push_back(UpdateTask {
+                                dir_idx: child_idx,
+                                old_bounds: from,
+                                new_bounds: to,
+                                depth: next_depth,
+                                collapsing: false,
+                                force_emit: true,
+                            });
+                        }
+                    }
+                }
+
                 self.dirs.insert(
-                    0,
+                    dir_idx,
                     DirLayout {
-                        bounds,
-                        platform: None,
-                        depth: 0,
-                        tiles,
-                        children: Vec::new(),
+                        bounds: new_bounds,
+                        platform,
+                        depth,
+                        split_tree,
+                        tiles: laid_tiles,
+                        children: laid_children,
                     },
                 );
                 continue;
-            }
-
-            // Collect visual items inside this directory for the active mode.
-            #[derive(Clone, Copy)]
-            enum VisualItem {
-                File(NodeId, Color32),
-                FolderTile(NodeId, Color32),
-                SubdirContainer(usize),
-            }
-            let mut items: Vec<(VisualItem, u64)> = Vec::new();
-            let dir_color = crate::color(&dir.path);
-
-            match self.mode {
-                ViewMode::Files => {
-                    for f in &dir.files {
-                        items.push((VisualItem::File(f.id, dir_color), f.size.max(1)));
-                    }
-                    for &child in &dir.subdirs {
-                        if let Some(c) = scene.dirs[child].as_ref()
-                            && c.total_files > 0
-                        {
-                            items.push((VisualItem::SubdirContainer(child), c.total_bytes.max(1)));
-                        }
-                    }
-                }
-                ViewMode::Folders => {
-                    if !dir.files.is_empty() {
-                        items.push((
-                            VisualItem::FolderTile(dir.id, dir_color),
-                            dir.direct_file_bytes.max(1),
-                        ));
-                    }
-                    for &child in &dir.subdirs {
-                        if let Some(c) = scene.dirs[child].as_ref()
-                            && c.total_files > 0
-                        {
-                            // A leaf subdirectory with only direct files can be
-                            // drawn directly as a folder tile without an extra wrapper.
-                            let child_has_nonempty_sub = c.subdirs.iter().any(|&gc| {
-                                scene.dirs[gc].as_ref().is_some_and(|g| g.total_files > 0)
-                            });
-                            if !child_has_nonempty_sub && !c.files.is_empty() {
-                                items.push((
-                                    VisualItem::FolderTile(c.id, crate::color(&c.path)),
-                                    c.direct_file_bytes.max(1),
-                                ));
-                            } else {
-                                items.push((
-                                    VisualItem::SubdirContainer(child),
-                                    c.total_bytes.max(1),
-                                ));
-                            }
-                        }
-                    }
-                }
-                ViewMode::Hybrid => {
-                    for f in &dir.files {
-                        items.push((VisualItem::File(f.id, dir_color), f.size.max(1)));
-                    }
-                    for &child in &dir.subdirs {
-                        if let Some(c) = scene.dirs[child].as_ref()
-                            && c.total_files > 0
-                        {
-                            if c.is_leaf {
-                                items.push((
-                                    VisualItem::FolderTile(c.id, crate::color(&c.path)),
-                                    c.direct_file_bytes.max(1),
-                                ));
-                            } else {
-                                items.push((
-                                    VisualItem::SubdirContainer(child),
-                                    c.total_bytes.max(1),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-
-            let container_count = items
-                .iter()
-                .filter(|(it, _)| matches!(it, VisualItem::SubdirContainer(_)))
-                .count();
-            let tile_count = items.len() - container_count;
-            let unary = container_count == 1 && tile_count == 0;
-            let platform = (below_root && !unary)
-                .then(|| Platform::new(bounds, platform_color(depth), depth, self.pixel_size))
-                .flatten();
-            let content = platform.map_or(bounds, |p| p.top);
-            let next_depth = if below_root {
-                depth.saturating_add(u8::from(platform.is_some()))
-            } else {
-                0
             };
 
-            let mut laid_tiles = Vec::with_capacity(tile_count);
-            let mut laid_children = Vec::with_capacity(container_count);
+            // Subcase 2b: Existing directory container being synchronized in-place.
+            let old_platform = existing.platform;
+            let old_content = old_platform.map_or(existing.bounds, |p| p.top);
+            let outer_moved = !bounds_within_tol(existing.bounds, new_bounds, skip_tol)
+                || old_platform.is_some() != platform.is_some()
+                || existing.depth != depth;
+            let child_force_emit = force_emit || (dir_idx != 0 && outer_moved);
 
-            if !items.is_empty() && render::valid(content) {
-                let weights: Vec<(usize, u64)> = items
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (_, w))| (i, *w))
-                    .collect();
-                let Some(rects) = treemap::layout_with_cancel(&weights, content, token, generation)
-                else {
-                    return false;
-                };
-                for (slot, rect) in rects {
-                    match items[slot].0 {
-                        VisualItem::File(id, color) | VisualItem::FolderTile(id, color) => {
-                            laid_tiles.push(LaidOutTile { id, rect, color });
-                        }
-                        VisualItem::SubdirContainer(child_idx) => {
-                            laid_children.push((child_idx, rect));
-                            queue.push_back((child_idx, rect, next_depth));
-                        }
+            if dir_idx != 0 && outer_moved {
+                let dirty_union = union_rects(existing.bounds, new_bounds);
+                if render::valid(dirty_union) {
+                    raster_dirty_rects.push(dirty_union);
+                    if !force_emit {
+                        transition_dirty_rects.push(dirty_union);
                     }
                 }
             }
-
-            self.dirs.insert(
-                dir_idx,
-                DirLayout {
-                    bounds,
-                    platform,
+            if child_force_emit && let Some(p) = platform.or(old_platform) {
+                backdrops.push((
                     depth,
-                    tiles: laid_tiles,
-                    children: laid_children,
+                    TransitionBackdrop {
+                        dir_idx,
+                        from: existing.bounds,
+                        to: new_bounds,
+                        color: p.color,
+                    },
+                ));
+            }
+            dir_snapshots.insert(
+                dir_idx,
+                DirMetaSnapshot {
+                    depth,
+                    old_content,
+                    new_content,
+                    color: dir_color,
                 },
             );
+
+            let eval_old_content =
+                if dir_idx == 0 && existing.split_tree.is_empty() && !items.is_empty() {
+                    center_rect(self.bounds)
+                } else {
+                    old_content
+                };
+            let eval_new_content =
+                if dir_idx == 0 && !existing.split_tree.is_empty() && items.is_empty() {
+                    center_rect(self.bounds)
+                } else {
+                    new_content
+                };
+
+            let old_tiles_by_key: HashMap<SlotKey, (NodeId, Color32)> = existing
+                .tiles
+                .iter()
+                .map(|t| (t.key, (t.id, t.color)))
+                .collect();
+            let weights: Vec<(SlotKey, u64)> = items.iter().map(|&(k, _, w)| (k, w)).collect();
+            let meta: HashMap<SlotKey, VisualItem> =
+                items.iter().map(|&(k, v, _)| (k, v)).collect();
+
+            let entries = existing.split_tree.sync_and_evaluate(
+                &weights,
+                eval_old_content,
+                eval_new_content,
+                token,
+                generation,
+            )?;
+
+            let mut laid_tiles = Vec::new();
+            let mut laid_children = Vec::new();
+
+            for entry in entries {
+                match entry.status {
+                    SyncStatus::Removed => {
+                        if let SlotKey::Subdir(c) = entry.key
+                            && self.dirs.contains_key(&(c as usize))
+                        {
+                            queue.push_back(UpdateTask {
+                                dir_idx: c as usize,
+                                old_bounds: entry.from,
+                                new_bounds: entry.to,
+                                depth: next_depth,
+                                collapsing: true,
+                                force_emit: child_force_emit,
+                            });
+                        } else if let Some(&(id, color)) = old_tiles_by_key.get(&entry.key) {
+                            removed_ids.push(id);
+                            let dirty_union = union_rects(entry.from, entry.to);
+                            if render::valid(dirty_union) {
+                                raster_dirty_rects.push(dirty_union);
+                                if !child_force_emit {
+                                    transition_dirty_rects.push(dirty_union);
+                                }
+                            }
+                            if entry.from.w.max(entry.to.w) >= min_dim
+                                && entry.from.h.max(entry.to.h) >= min_dim
+                            {
+                                candidates.push(CandidateItem {
+                                    owner_dir: dir_idx,
+                                    item: TransitionItem {
+                                        id,
+                                        from: entry.from,
+                                        to: entry.to,
+                                        color,
+                                        kind: TransitionKind::FadeOut,
+                                    },
+                                });
+                            } else {
+                                needs_fill_backdrop.insert(dir_idx);
+                            }
+                        }
+                    }
+                    SyncStatus::Added => match meta[&entry.key] {
+                        VisualItem::File(id, color) | VisualItem::FolderTile(id, color) => {
+                            laid_tiles.push(LaidOutTile {
+                                key: entry.key,
+                                id,
+                                rect: entry.to,
+                                color,
+                            });
+                            let dirty_union = union_rects(entry.from, entry.to);
+                            if render::valid(dirty_union) {
+                                raster_dirty_rects.push(dirty_union);
+                                if !child_force_emit {
+                                    transition_dirty_rects.push(dirty_union);
+                                }
+                            }
+                            if entry.to.w >= visible_min
+                                && entry.to.h >= visible_min
+                                && let Some(info) = scene.tile_info(id, self.mode, entry.to)
+                            {
+                                upserted_tiles.push(info);
+                            }
+                            if entry.from.w.max(entry.to.w) >= min_dim
+                                && entry.from.h.max(entry.to.h) >= min_dim
+                            {
+                                candidates.push(CandidateItem {
+                                    owner_dir: dir_idx,
+                                    item: TransitionItem {
+                                        id,
+                                        from: entry.from,
+                                        to: entry.to,
+                                        color,
+                                        kind: TransitionKind::FadeIn,
+                                    },
+                                });
+                            } else {
+                                needs_fill_backdrop.insert(dir_idx);
+                            }
+                        }
+                        VisualItem::SubdirContainer(child_idx) => {
+                            laid_children.push((child_idx, entry.to));
+                            queue.push_back(UpdateTask {
+                                dir_idx: child_idx,
+                                old_bounds: entry.from,
+                                new_bounds: entry.to,
+                                depth: next_depth,
+                                collapsing: false,
+                                force_emit: child_force_emit,
+                            });
+                        }
+                    },
+                    SyncStatus::Kept => match meta[&entry.key] {
+                        VisualItem::File(id, color) | VisualItem::FolderTile(id, color) => {
+                            // Check if a previously expanded SubdirContainer refolded into a FolderTile!
+                            let refolded = matches!(entry.key, SlotKey::Subdir(c) if self.dirs.contains_key(&(c as usize)));
+                            if let SlotKey::Subdir(c) = entry.key
+                                && refolded
+                            {
+                                queue.push_back(UpdateTask {
+                                    dir_idx: c as usize,
+                                    old_bounds: entry.from,
+                                    new_bounds: entry.to,
+                                    depth: next_depth,
+                                    collapsing: true,
+                                    force_emit: child_force_emit,
+                                });
+                            }
+
+                            laid_tiles.push(LaidOutTile {
+                                key: entry.key,
+                                id,
+                                rect: entry.to,
+                                color,
+                            });
+                            let moved = !bounds_within_tol(entry.from, entry.to, skip_tol);
+                            let tile_dirty = refolded
+                                || moved
+                                || matches!(entry.key, SlotKey::Subdir(c) if dirty_set.contains(&(c as usize)))
+                                || is_dirty;
+                            if moved || refolded {
+                                let dirty_union = union_rects(entry.from, entry.to);
+                                if render::valid(dirty_union) {
+                                    raster_dirty_rects.push(dirty_union);
+                                    if !child_force_emit {
+                                        transition_dirty_rects.push(dirty_union);
+                                    }
+                                }
+                            }
+                            if tile_dirty
+                                && entry.to.w >= visible_min
+                                && entry.to.h >= visible_min
+                                && let Some(info) = scene.tile_info(id, self.mode, entry.to)
+                            {
+                                upserted_tiles.push(info);
+                            }
+                            if child_force_emit || moved || refolded {
+                                let kind = if refolded {
+                                    TransitionKind::FadeIn
+                                } else {
+                                    TransitionKind::Move
+                                };
+                                if entry.from.w.max(entry.to.w) >= min_dim
+                                    && entry.from.h.max(entry.to.h) >= min_dim
+                                {
+                                    candidates.push(CandidateItem {
+                                        owner_dir: dir_idx,
+                                        item: TransitionItem {
+                                            id,
+                                            from: entry.from,
+                                            to: entry.to,
+                                            color,
+                                            kind,
+                                        },
+                                    });
+                                } else {
+                                    needs_fill_backdrop.insert(dir_idx);
+                                }
+                            }
+                        }
+                        VisualItem::SubdirContainer(child_idx) => {
+                            // Check if a previously collapsed FolderTile unfolded into a SubdirContainer!
+                            let unfolded = !self.dirs.contains_key(&child_idx);
+                            if unfolded
+                                && let Some(&(old_id, old_color)) = old_tiles_by_key.get(&entry.key)
+                            {
+                                removed_ids.push(old_id);
+                                if entry.from.w.max(entry.to.w) >= min_dim
+                                    && entry.from.h.max(entry.to.h) >= min_dim
+                                {
+                                    candidates.push(CandidateItem {
+                                        owner_dir: dir_idx,
+                                        item: TransitionItem {
+                                            id: old_id,
+                                            from: entry.from,
+                                            to: entry.to,
+                                            color: old_color,
+                                            kind: TransitionKind::FadeOut,
+                                        },
+                                    });
+                                }
+                            }
+                            laid_children.push((child_idx, entry.to));
+                            queue.push_back(UpdateTask {
+                                dir_idx: child_idx,
+                                old_bounds: entry.from,
+                                new_bounds: entry.to,
+                                depth: next_depth,
+                                collapsing: false,
+                                force_emit: child_force_emit || unfolded,
+                            });
+                        }
+                    },
+                }
+            }
+
+            existing.bounds = new_bounds;
+            existing.platform = platform;
+            existing.depth = depth;
+            existing.tiles = laid_tiles;
+            existing.children = laid_children;
+            self.dirs.insert(dir_idx, existing_opt.unwrap());
         }
-        true
+
+        // Keep removed_ids strictly disjoint from upserted_tiles (e.g. Folders-mode refold).
+        if !removed_ids.is_empty() && !upserted_tiles.is_empty() {
+            let upserted_ids: HashSet<NodeId> = upserted_tiles.iter().map(|t| t.id).collect();
+            removed_ids.retain(|id| !upserted_ids.contains(id));
+        }
+
+        // Enforce GPU quad budget while emitting solid content backdrops for any
+        // directory that had tiny or budget-trimmed tiles so zero dark holes appear.
+        if candidates.len() > MAX_ANIMATED_TILES {
+            candidates.sort_unstable_by(|a, b| {
+                let area_a = (a.item.from.w * a.item.from.h).max(a.item.to.w * a.item.to.h);
+                let area_b = (b.item.from.w * b.item.from.h).max(b.item.to.w * b.item.to.h);
+                area_b.total_cmp(&area_a)
+            });
+            for dropped in &candidates[MAX_ANIMATED_TILES..] {
+                needs_fill_backdrop.insert(dropped.owner_dir);
+            }
+            candidates.truncate(MAX_ANIMATED_TILES);
+        }
+
+        for dir_idx in needs_fill_backdrop {
+            if let Some(snap) = dir_snapshots.get(&dir_idx) {
+                let max_w = snap.old_content.w.max(snap.new_content.w);
+                let max_h = snap.old_content.h.max(snap.new_content.h);
+                if max_w >= min_dim && max_h >= min_dim {
+                    backdrops.push((
+                        snap.depth.saturating_add(1),
+                        TransitionBackdrop {
+                            dir_idx: dir_idx.wrapping_add(1 << 30),
+                            from: snap.old_content,
+                            to: snap.new_content,
+                            color: snap.color,
+                        },
+                    ));
+                }
+            }
+        }
+
+        // Sort backdrops by increasing depth so parent containers paint behind children.
+        backdrops.sort_by_key(|(depth, _)| *depth);
+        if backdrops.len() > MAX_ANIMATED_BACKDROPS {
+            backdrops.truncate(MAX_ANIMATED_BACKDROPS);
+        }
+
+        let transition_backdrops: Vec<TransitionBackdrop> =
+            backdrops.into_iter().map(|(_, b)| b).collect();
+        let transition_items: Vec<TransitionItem> =
+            candidates.into_iter().map(|c| c.item).collect();
+
+        // Merge raster dirty rects to avoid overlapping LIGHT_REACH raster work.
+        let merged_raster_rects = merge_raster_dirty_rects(&raster_dirty_rects, self.bounds);
+
+        Some(LayoutDiff {
+            dirty_rects: merged_raster_rects,
+            removed_ids,
+            upserted_tiles,
+            transitions: TransitionBatch {
+                dirty_rects: transition_dirty_rects,
+                backdrops: transition_backdrops,
+                items: transition_items,
+            },
+        })
     }
 
     /// Collect ONLY entries and platforms intersecting `region` (expanded by
@@ -1451,6 +1774,139 @@ impl LayoutTree {
     }
 }
 
+fn collect_dir_items(
+    scene: &SceneTree,
+    dir_idx: usize,
+    mode: ViewMode,
+) -> Vec<(SlotKey, VisualItem, u64)> {
+    let Some(dir) = scene.dirs.get(dir_idx).and_then(|d| d.as_ref()) else {
+        return Vec::new();
+    };
+    let mut items = Vec::new();
+    let dir_color = crate::color(&dir.path);
+
+    if dir_idx == 0 && mode == ViewMode::Hybrid && dir.is_leaf {
+        if !dir.files.is_empty() {
+            items.push((
+                SlotKey::SelfFiles,
+                VisualItem::FolderTile(dir.id, dir_color),
+                dir.direct_file_bytes.max(1),
+            ));
+        }
+        return items;
+    }
+
+    match mode {
+        ViewMode::Files => {
+            for f in &dir.files {
+                items.push((
+                    SlotKey::File(f.id),
+                    VisualItem::File(f.id, dir_color),
+                    f.size.max(1),
+                ));
+            }
+            for &child in &dir.subdirs {
+                if let Some(c) = scene.dirs[child].as_ref()
+                    && c.total_files > 0
+                {
+                    items.push((
+                        SlotKey::Subdir(child as u32),
+                        VisualItem::SubdirContainer(child),
+                        c.total_bytes.max(1),
+                    ));
+                }
+            }
+        }
+        ViewMode::Folders => {
+            if !dir.files.is_empty() {
+                items.push((
+                    SlotKey::SelfFiles,
+                    VisualItem::FolderTile(dir.id, dir_color),
+                    dir.direct_file_bytes.max(1),
+                ));
+            }
+            for &child in &dir.subdirs {
+                if let Some(c) = scene.dirs[child].as_ref()
+                    && c.total_files > 0
+                {
+                    let child_has_nonempty_sub = c
+                        .subdirs
+                        .iter()
+                        .any(|&gc| scene.dirs[gc].as_ref().is_some_and(|g| g.total_files > 0));
+                    if !child_has_nonempty_sub && !c.files.is_empty() {
+                        items.push((
+                            SlotKey::Subdir(child as u32),
+                            VisualItem::FolderTile(c.id, crate::color(&c.path)),
+                            c.direct_file_bytes.max(1),
+                        ));
+                    } else {
+                        items.push((
+                            SlotKey::Subdir(child as u32),
+                            VisualItem::SubdirContainer(child),
+                            c.total_bytes.max(1),
+                        ));
+                    }
+                }
+            }
+        }
+        ViewMode::Hybrid => {
+            for f in &dir.files {
+                items.push((
+                    SlotKey::File(f.id),
+                    VisualItem::File(f.id, dir_color),
+                    f.size.max(1),
+                ));
+            }
+            for &child in &dir.subdirs {
+                if let Some(c) = scene.dirs[child].as_ref()
+                    && c.total_files > 0
+                {
+                    if c.is_leaf {
+                        items.push((
+                            SlotKey::Subdir(child as u32),
+                            VisualItem::FolderTile(c.id, crate::color(&c.path)),
+                            c.direct_file_bytes.max(1),
+                        ));
+                    } else {
+                        items.push((
+                            SlotKey::Subdir(child as u32),
+                            VisualItem::SubdirContainer(child),
+                            c.total_bytes.max(1),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    items
+}
+
+fn compute_platform(
+    dir_idx: usize,
+    bounds: Rect,
+    depth: u8,
+    pixel_size: f32,
+    items: &[(SlotKey, VisualItem, u64)],
+) -> (Option<Platform>, Rect, u8) {
+    let below_root = dir_idx != 0;
+    let container_count = items
+        .iter()
+        .filter(|(_, it, _)| matches!(it, VisualItem::SubdirContainer(_)))
+        .count();
+    let tile_count = items.len() - container_count;
+    let unary = container_count == 1 && tile_count == 0;
+    let platform = (below_root && !unary)
+        .then(|| Platform::new(bounds, platform_color(depth), depth, pixel_size))
+        .flatten();
+    let content = platform.map_or(bounds, |p| p.top);
+    let next_depth = if below_root {
+        depth.saturating_add(u8::from(platform.is_some()))
+    } else {
+        0
+    };
+    (platform, content, next_depth)
+}
+
 fn platform_color(depth: u8) -> Color32 {
     let factor = 1.0 + (depth as f32 * 0.035).min(0.14);
     let channel = |v: u8| (v as f32 * factor).min(255.0) as u8;
@@ -1461,45 +1917,73 @@ fn platform_color(depth: u8) -> Color32 {
     )
 }
 
-fn count_visible_children(scene: &SceneTree, dir: &DirNode, mode: ViewMode) -> usize {
-    dir.subdirs
-        .iter()
-        .filter(|&&c| {
-            let Some(child) = scene.dirs[c].as_ref() else {
-                return false;
-            };
-            if child.total_files == 0 {
-                return false;
-            }
-            match mode {
-                ViewMode::Files => true,
-                ViewMode::Hybrid => !child.is_leaf,
-                ViewMode::Folders => child
-                    .subdirs
-                    .iter()
-                    .any(|&gc| scene.dirs[gc].as_ref().is_some_and(|g| g.total_files > 0)),
-            }
-        })
-        .count()
+fn center_rect(r: Rect) -> Rect {
+    Rect {
+        x: r.x + r.w * 0.5,
+        y: r.y + r.h * 0.5,
+        w: 0.0,
+        h: 0.0,
+    }
 }
 
-fn has_direct_visual_tiles(dir: &DirNode, mode: ViewMode) -> bool {
-    match mode {
-        ViewMode::Files => !dir.files.is_empty(),
-        ViewMode::Folders => !dir.files.is_empty() || !dir.subdirs.is_empty(),
-        ViewMode::Hybrid => !dir.files.is_empty() || !dir.subdirs.is_empty(),
+fn union_rects(a: Rect, b: Rect) -> Rect {
+    let x0 = a.x.min(b.x);
+    let y0 = a.y.min(b.y);
+    let x1 = (a.x + a.w).max(b.x + b.w);
+    let y1 = (a.y + a.h).max(b.y + b.h);
+    Rect {
+        x: x0,
+        y: y0,
+        w: (x1 - x0).max(0.0),
+        h: (y1 - y0).max(0.0),
     }
+}
+
+fn bounds_within_tol(a: Rect, b: Rect, tol: f32) -> bool {
+    (a.x - b.x).abs() <= tol
+        && (a.y - b.y).abs() <= tol
+        && ((a.x + a.w) - (b.x + b.w)).abs() <= tol
+        && ((a.y + a.h) - (b.y + b.h)).abs() <= tol
 }
 
 fn rects_intersect(a: Rect, b: Rect) -> bool {
     a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
 }
 
-fn rects_approx_eq(a: Rect, b: Rect) -> bool {
-    (a.x - b.x).abs() < 0.01
-        && (a.y - b.y).abs() < 0.01
-        && (a.w - b.w).abs() < 0.01
-        && (a.h - b.h).abs() < 0.01
+fn merge_raster_dirty_rects(rects: &[Rect], full: Rect) -> Vec<Rect> {
+    let valid_rects: Vec<Rect> = rects.iter().copied().filter(|&r| render::valid(r)).collect();
+    if valid_rects.is_empty() {
+        return Vec::new();
+    }
+    let full_area = (full.w * full.h).max(1.0);
+    let mut merged: Vec<Rect> = Vec::with_capacity(valid_rects.len());
+    for mut rect in valid_rects {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let mut i = 0;
+            while i < merged.len() {
+                let expanded = Rect {
+                    x: merged[i].x - LIGHT_REACH,
+                    y: merged[i].y - LIGHT_REACH,
+                    w: merged[i].w + LIGHT_REACH * 2.0,
+                    h: merged[i].h + LIGHT_REACH * 2.0,
+                };
+                if rects_intersect(expanded, rect) {
+                    rect = union_rects(rect, merged.swap_remove(i));
+                    changed = true;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        merged.push(rect);
+    }
+    let merged_area: f32 = merged.iter().map(|r| r.w * r.h).sum();
+    if merged_area >= full_area * 0.6 {
+        return vec![full];
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -1569,7 +2053,7 @@ mod tests {
     }
 
     #[test]
-    fn local_file_deletion_updates_only_parent_scope_and_animates_siblings() {
+    fn file_deletion_updates_global_proportions_and_preserves_spatial_order() {
         let scan = make_scan(&[
             ("/disk/a/f1", 500, true),
             ("/disk/a/f2", 500, true),
@@ -1585,8 +2069,13 @@ mod tests {
         let token = AtomicU64::new(1);
         let mut layout =
             LayoutTree::build(&scene, ViewMode::Files, bounds, 1.0, &token, 1).unwrap();
-        let before_b = layout.collect_visible_tiles(&scene);
-        let g1_before = before_b
+        let before = layout.collect_visible_tiles(&scene);
+        let f2_before = before
+            .values()
+            .find(|t| t.path == Path::new("/disk/a/f2"))
+            .unwrap()
+            .rect;
+        let g1_before = before
             .values()
             .find(|t| t.path == Path::new("/disk/b/g1"))
             .unwrap()
@@ -1594,30 +2083,263 @@ mod tests {
 
         let dirty = scene.remove_file(Path::new("/disk/a/f1"), FileIdentity::default());
         let diff = layout.apply_dirty(&scene, &dirty, 1.0, &token, 1).unwrap();
-        assert_eq!(diff.dirty_rects.len(), 1);
-        // Only folder `a` was dirty, NOT the full canvas!
-        assert!(diff.dirty_rects[0].w < bounds.w || diff.dirty_rects[0].h < bounds.h);
-        // Sibling `f2` moved/expanded and `f1` faded out.
+        assert!(!diff.dirty_rects.is_empty());
         assert!(
             diff.transitions
                 .items
                 .iter()
                 .any(|t| t.kind == TransitionKind::Move)
         );
-        assert!(
-            diff.transitions
-                .items
-                .iter()
-                .any(|t| t.kind == TransitionKind::FadeOut)
-        );
-        // Unrelated folder `b/g1` did not move by a single pixel.
-        let after_b = layout.collect_visible_tiles(&scene);
-        let g1_after = after_b
+        let fade_out = diff
+            .transitions
+            .items
+            .iter()
+            .find(|t| t.kind == TransitionKind::FadeOut)
+            .expect("deleted file must emit FadeOut");
+        // Deleted tile collapses flush to a zero-area edge rather than shrinking to center.
+        assert_eq!(fade_out.to.w * fade_out.to.h, 0.0);
+
+        // True proportions: f2 (500) = 1/3, g1 (1000) = 2/3!
+        let after = layout.collect_visible_tiles(&scene);
+        let f2_after = after
+            .values()
+            .find(|t| t.path == Path::new("/disk/a/f2"))
+            .unwrap()
+            .rect;
+        let g1_after = after
             .values()
             .find(|t| t.path == Path::new("/disk/b/g1"))
             .unwrap()
             .rect;
-        assert_eq!(g1_before, g1_after);
+        let canvas_area = bounds.w * bounds.h;
+        assert!(
+            (f2_after.w * f2_after.h / canvas_area - 1.0 / 3.0).abs() < 0.02,
+            "f2 area should reflect 1/3 proportion, got {}",
+            f2_after.w * f2_after.h / canvas_area
+        );
+        assert!(
+            (g1_after.w * g1_after.h / canvas_area - 2.0 / 3.0).abs() < 0.02,
+            "g1 area should reflect 2/3 proportion, got {}",
+            g1_after.w * g1_after.h / canvas_area
+        );
+        // Spatial order between folder `a` and folder `b` must be preserved!
+        let a_was_left = f2_before.x < g1_before.x;
+        let a_is_left = f2_after.x < g1_after.x;
+        assert_eq!(a_was_left, a_is_left, "folders must never swap sides");
+    }
+
+    #[test]
+    fn resize_and_addition_preserve_spatial_memory_and_exact_proportions() {
+        let scan = make_scan(&[
+            ("/disk/a/f1", 400, true),
+            ("/disk/b/g1", 300, true),
+            ("/disk/c/h1", 200, true),
+            ("/disk/d/k1", 100, true),
+        ]);
+        let mut scene = SceneTree::from_scan(scan);
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1000.0,
+            h: 600.0,
+        };
+        let token = AtomicU64::new(1);
+        let mut layout =
+            LayoutTree::build(&scene, ViewMode::Hybrid, bounds, 1.0, &token, 1).unwrap();
+        let before: HashMap<PathBuf, Rect> = layout
+            .collect_visible_tiles(&scene)
+            .into_values()
+            .map(|t| (t.path, t.rect))
+            .collect();
+
+        // Grow the smallest folder `/disk/d` from 100 -> 1100 (now the largest!).
+        let snap_d = DirectorySnapshot {
+            identity: FileIdentity {
+                device: 1,
+                inode: 5,
+            },
+            enumeration_complete: true,
+            excluded: false,
+            files: vec![scan::FileEntry {
+                path: PathBuf::from("/disk/d/k1"),
+                parent: Arc::from(Path::new("/disk/d")),
+                size: 1100,
+                identity: FileIdentity {
+                    device: 1,
+                    inode: 103,
+                },
+                parent_identity: FileIdentity {
+                    device: 1,
+                    inode: 5,
+                },
+                parent_is_leaf: true,
+                can_trash: true,
+            }],
+            subdirs: Vec::new(),
+        };
+        let (dirty, _) = scene.apply_dir_snapshot(Path::new("/disk/d"), Some(snap_d));
+        let _diff = layout.apply_dirty(&scene, &dirty, 1.0, &token, 1).unwrap();
+
+        let after: HashMap<PathBuf, Rect> = layout
+            .collect_visible_tiles(&scene)
+            .into_values()
+            .map(|t| (t.path, t.rect))
+            .collect();
+        let canvas_area = bounds.w * bounds.h;
+        // Total is now 400 + 300 + 200 + 1100 = 2000 -> `/disk/d` must be 55%!
+        let d_frac = after[Path::new("/disk/d")].w * after[Path::new("/disk/d")].h / canvas_area;
+        assert!(
+            (d_frac - 0.55).abs() < 0.01,
+            "expected /disk/d to occupy 55%, got {d_frac}"
+        );
+        // Relative left/right and top/bottom ordering among all 4 folders must be preserved!
+        let paths: Vec<PathBuf> = before.keys().cloned().collect();
+        for p1 in &paths {
+            for p2 in &paths {
+                if p1 == p2 {
+                    continue;
+                }
+                let (b1, b2) = (before[p1], before[p2]);
+                let (a1, a2) = (after[p1], after[p2]);
+                if b1.x + b1.w <= b2.x + 1e-2 {
+                    assert!(
+                        a1.x + a1.w <= a2.x + 1e-1,
+                        "horizontal order flipped between {p1:?} and {p2:?}"
+                    );
+                }
+                if b1.y + b1.h <= b2.y + 1e-2 {
+                    assert!(
+                        a1.y + a1.h <= a2.y + 1e-1,
+                        "vertical order flipped between {p1:?} and {p2:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tiny_mutation_skips_unaffected_sibling_subtrees() {
+        let scan = make_scan(&[
+            ("/disk/a/f1", 100, true),
+            ("/disk/a/f2", 100, true),
+            ("/disk/b/g1", 100_000_000, true),
+        ]);
+        let mut scene = SceneTree::from_scan(scan);
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 800.0,
+            h: 600.0,
+        };
+        let token = AtomicU64::new(1);
+        let mut layout =
+            LayoutTree::build(&scene, ViewMode::Files, bounds, 1.0, &token, 1).unwrap();
+
+        let dirty = scene.remove_file(Path::new("/disk/a/f1"), FileIdentity::default());
+        let diff = layout.apply_dirty(&scene, &dirty, 1.0, &token, 1).unwrap();
+        // Folder `b` moved by ~0.0008px (< skip_tol), so dirty rect stays tiny and local!
+        assert!(!diff.dirty_rects.is_empty());
+        assert!(diff.dirty_rects.iter().all(|r| r.w < bounds.w * 0.25));
+    }
+
+    #[test]
+    fn demo_mutations_keep_exact_proportions_and_spatial_order_across_all_modes() {
+        let bounds = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1200.0,
+            h: 800.0,
+        };
+        let canvas_area = bounds.w * bounds.h;
+        let token = AtomicU64::new(1);
+
+        for mode in [ViewMode::Hybrid, ViewMode::Files, ViewMode::Folders] {
+            let mut scene = SceneTree::from_scan(crate::demo::virtual_scan());
+            let mut layout = LayoutTree::build(&scene, mode, bounds, 1.0, &token, 1).unwrap();
+
+            // Record initial top-level folder rectangles from root's split tree.
+            let root_rects = |l: &LayoutTree| -> HashMap<SlotKey, Rect> {
+                let root_layout = &l.dirs[&0];
+                root_layout.split_tree.evaluate(bounds).into_iter().collect()
+            };
+            let initial_top = root_rects(&layout);
+
+            let actions = [
+                crate::demo::DemoAction::AddFile,
+                crate::demo::DemoAction::ResizeRandom,
+                crate::demo::DemoAction::DeleteRandom,
+                crate::demo::DemoAction::ResizeRandom,
+                crate::demo::DemoAction::AddFile,
+                crate::demo::DemoAction::DeleteRandom,
+            ];
+            for (step, action) in actions.into_iter().enumerate() {
+                let dirty = scene.apply_demo_action(action, step as u64 + 1, mode);
+                let _diff = layout.apply_dirty(&scene, &dirty, 1.0, &token, 1).unwrap();
+
+                let now_top = root_rects(&layout);
+                let total_bytes = scene.total_bytes() as f32;
+                assert!(total_bytes > 0.0);
+
+                // 1. Every top-level folder area must reflect its real byte share!
+                for (&key, &rect) in &now_top {
+                    if let SlotKey::Subdir(idx) = key
+                        && let Some(dir) = scene.dirs[idx as usize].as_ref()
+                    {
+                        let expected_share = dir.total_bytes.max(1) as f32 / total_bytes;
+                        let actual_share = (rect.w * rect.h) / canvas_area;
+                        assert!(
+                            (actual_share - expected_share).abs() < 1e-3,
+                            "mode={mode:?} step={step}: dir {} share {actual_share} != expected {expected_share}",
+                            dir.path.display()
+                        );
+                    }
+                }
+
+                // 2. Relative spatial ordering of every surviving top-level pair must never flip!
+                let surviving: Vec<SlotKey> = initial_top
+                    .keys()
+                    .copied()
+                    .filter(|k| now_top.contains_key(k))
+                    .collect();
+                for &k1 in &surviving {
+                    for &k2 in &surviving {
+                        if k1 == k2 {
+                            continue;
+                        }
+                        let (b1, b2) = (initial_top[&k1], initial_top[&k2]);
+                        let (a1, a2) = (now_top[&k1], now_top[&k2]);
+                        let was_left = b1.x + b1.w <= b2.x + 1e-2;
+                        let was_right = b2.x + b2.w <= b1.x + 1e-2;
+                        let was_above = b1.y + b1.h <= b2.y + 1e-2;
+                        let was_below = b2.y + b2.h <= b1.y + 1e-2;
+                        let is_left = a1.x + a1.w <= a2.x + 1e-1;
+                        let is_right = a2.x + a2.w <= a1.x + 1e-1;
+                        let is_above = a1.y + a1.h <= a2.y + 1e-1;
+                        let is_below = a2.y + a2.h <= a1.y + 1e-1;
+                        // In a persistent BSP tree, the LCA separating axis between
+                        // any two leaves never changes or flips direction:
+                        if was_left && !was_above && !was_below {
+                            assert!(is_left, "mode={mode:?} step={step}: horizontal order flipped");
+                        }
+                        if was_above && !was_left && !was_right {
+                            assert!(is_above, "mode={mode:?} step={step}: vertical order flipped");
+                        }
+                        if was_left && was_above {
+                            assert!(
+                                (is_left || is_above) && !is_right && !is_below,
+                                "mode={mode:?} step={step}: top-left/bottom-right order flipped"
+                            );
+                        }
+                        if was_left && was_below {
+                            assert!(
+                                (is_left || is_below) && !is_right && !is_above,
+                                "mode={mode:?} step={step}: bottom-left/top-right order flipped"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

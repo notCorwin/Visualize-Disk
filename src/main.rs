@@ -43,7 +43,7 @@ const PALETTE: [Color32; 12] = {
     ]
 };
 
-const TRANSITION_SECONDS: f64 = 0.24;
+const TRANSITION_SECONDS: f64 = 0.30;
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(180);
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(120);
 
@@ -1424,9 +1424,16 @@ impl App {
                             for tile in upserted_tiles {
                                 scene.tiles.insert(tile.id, tile);
                             }
-                            if !transitions.items.is_empty() {
+                            if !transitions.items.is_empty() || !transitions.backdrops.is_empty() {
+                                let merged = retarget_transition(
+                                    &scene.transitions,
+                                    transitions,
+                                    &removed_ids,
+                                    now,
+                                );
+                                scene.transitions.clear();
                                 scene.transitions.push(ActiveTransition {
-                                    batch: transitions,
+                                    batch: merged,
                                     started: now,
                                 });
                             }
@@ -1951,7 +1958,8 @@ impl App {
 
                     for (id, width) in [(self.selected, 2.0_f32), (hovered, 1.5_f32)] {
                         if let Some(tile) = id.and_then(|i| scene.tiles.get(&i)) {
-                            let r = tile.rect;
+                            let r = animated_tile_rect(&scene.transitions, tile.id, now)
+                                .unwrap_or(tile.rect);
                             let rect = Rect::from_min_size(
                                 canvas.min + Vec2::new(r.x * scale.x, r.y * scale.y),
                                 Vec2::new(r.w * scale.x, r.h * scale.y),
@@ -1999,6 +2007,108 @@ impl App {
     }
 }
 
+fn ease_out_cubic(raw_t: f32) -> f32 {
+    1.0 - (1.0 - raw_t.clamp(0.0, 1.0)).powi(3)
+}
+
+fn animated_tile_rect(
+    transitions: &[ActiveTransition],
+    id: NodeId,
+    now: f64,
+) -> Option<treemap::Rect> {
+    for tr in transitions.iter().rev() {
+        let raw_t = ((now - tr.started) / TRANSITION_SECONDS).clamp(0.0, 1.0) as f32;
+        if raw_t >= 1.0 {
+            continue;
+        }
+        let ease = ease_out_cubic(raw_t);
+        if let Some(item) = tr.batch.items.iter().find(|item| item.id == id) {
+            return Some(lerp_rect(item.from, item.to, ease));
+        }
+    }
+    None
+}
+
+/// Retarget an incoming transition batch smoothly from the current in-flight
+/// on-screen positions so rapid mutations never stack opaque overlays or jump.
+fn retarget_transition(
+    active: &[ActiveTransition],
+    mut next: TransitionBatch,
+    removed_ids: &[NodeId],
+    now: f64,
+) -> TransitionBatch {
+    let Some(prev) = active.last() else {
+        return next;
+    };
+    let raw_t = ((now - prev.started) / TRANSITION_SECONDS).clamp(0.0, 1.0) as f32;
+    if raw_t >= 1.0 {
+        return next;
+    }
+    let ease = ease_out_cubic(raw_t);
+
+    let live_tiles: HashMap<NodeId, treemap::Rect> = prev
+        .batch
+        .items
+        .iter()
+        .map(|it| (it.id, lerp_rect(it.from, it.to, ease)))
+        .collect();
+    let live_backdrops: HashMap<usize, treemap::Rect> = prev
+        .batch
+        .backdrops
+        .iter()
+        .map(|b| (b.dir_idx, lerp_rect(b.from, b.to, ease)))
+        .collect();
+
+    let mut next_tile_ids = std::collections::HashSet::with_capacity(next.items.len());
+    for item in &mut next.items {
+        next_tile_ids.insert(item.id);
+        if let Some(&cur) = live_tiles.get(&item.id) {
+            item.from = cur;
+        }
+    }
+    let mut next_backdrop_ids = std::collections::HashSet::with_capacity(next.backdrops.len());
+    for backdrop in &mut next.backdrops {
+        next_backdrop_ids.insert(backdrop.dir_idx);
+        if let Some(&cur) = live_backdrops.get(&backdrop.dir_idx) {
+            backdrop.from = cur;
+        }
+    }
+
+    // Carry forward any still-moving items from untouched regions of the screen.
+    let removed_set: std::collections::HashSet<NodeId> = removed_ids.iter().copied().collect();
+    let mut carried_any = false;
+    for prev_item in &prev.batch.items {
+        if prev_item.kind != TransitionKind::FadeOut
+            && !next_tile_ids.contains(&prev_item.id)
+            && !removed_set.contains(&prev_item.id)
+        {
+            let cur = lerp_rect(prev_item.from, prev_item.to, ease);
+            next.items.push(scene::TransitionItem {
+                id: prev_item.id,
+                from: cur,
+                to: prev_item.to,
+                color: prev_item.color,
+                kind: TransitionKind::Move,
+            });
+            carried_any = true;
+        }
+    }
+    if carried_any {
+        for prev_b in &prev.batch.backdrops {
+            if !next_backdrop_ids.contains(&prev_b.dir_idx) {
+                next.backdrops.push(scene::TransitionBackdrop {
+                    dir_idx: prev_b.dir_idx,
+                    from: lerp_rect(prev_b.from, prev_b.to, ease),
+                    to: prev_b.to,
+                    color: prev_b.color,
+                });
+            }
+        }
+        next.dirty_rects.extend_from_slice(&prev.batch.dirty_rects);
+    }
+    next
+}
+
 fn paint_transitions(
     painter: &egui::Painter,
     canvas: Rect,
@@ -2019,42 +2129,57 @@ fn paint_transitions(
         if raw_t >= 1.0 {
             continue;
         }
-        // Cubic ease-out for smooth physical motion.
-        let ease = 1.0 - (1.0 - raw_t).powi(3);
-        // Keep moving layer opaque while tiles travel, then cross-fade smoothly
-        // into the crisp hill-shaded raster over the final 30% of the duration.
-        let fade_out_overlay = if raw_t < 0.70 {
+        let ease = ease_out_cubic(raw_t);
+        // Keep animated quads opaque while blocks glide (>98% settled by 0.75),
+        // then smoothly reveal the crisp hill-shaded raster over 0.75..1.0.
+        let fade_out_overlay = if raw_t < 0.75 {
             1.0
         } else {
-            let u = ((raw_t - 0.70) / 0.30).clamp(0.0, 1.0);
+            let u = ((raw_t - 0.75) / 0.25).clamp(0.0, 1.0);
+            1.0 - u * u * (3.0 - 2.0 * u)
+        };
+        // Fade the backdrop mask slightly ahead of the tiles so the already-settled
+        // raster underneath replaces tiles with zero dark flash.
+        let bg_fade = if raw_t < 0.70 {
+            1.0
+        } else {
+            let u = ((raw_t - 0.70) / 0.12).clamp(0.0, 1.0);
             1.0 - u * u * (3.0 - 2.0 * u)
         };
 
-        let bg_alpha = (fade_out_overlay * 235.0).round() as u8;
-        let bg_color = Color32::from_rgba_unmultiplied(BG.r(), BG.g(), BG.b(), bg_alpha);
-        for &dirty in &tr.batch.dirty_rects {
-            let screen = to_screen(dirty).intersect(canvas);
-            if screen.is_positive() {
-                mesh.add_colored_rect(screen, bg_color);
+        let bg_alpha = (bg_fade * 255.0).round() as u8;
+        if bg_alpha > 0 {
+            let bg_color = Color32::from_rgba_unmultiplied(BG.r(), BG.g(), BG.b(), bg_alpha);
+            for &dirty in &tr.batch.dirty_rects {
+                let screen = to_screen(dirty).intersect(canvas);
+                if screen.is_positive() {
+                    mesh.add_colored_rect(screen, bg_color);
+                }
+            }
+        }
+
+        let backdrop_alpha = (fade_out_overlay * 255.0).round() as u8;
+        if backdrop_alpha > 0 {
+            for backdrop in &tr.batch.backdrops {
+                let rect = lerp_rect(backdrop.from, backdrop.to, ease);
+                let screen = to_screen(rect).intersect(canvas);
+                if screen.width() < 0.5 || screen.height() < 0.5 {
+                    continue;
+                }
+                let c = backdrop.color;
+                mesh.add_colored_rect(
+                    screen,
+                    Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), backdrop_alpha),
+                );
             }
         }
 
         for item in &tr.batch.items {
-            let (rect, alpha_mul) = match item.kind {
-                TransitionKind::Move => (lerp_rect(item.from, item.to, ease), fade_out_overlay),
-                TransitionKind::FadeOut => (
-                    lerp_rect(item.from, item.to, ease),
-                    (1.0 - ease) * fade_out_overlay,
-                ),
-                TransitionKind::FadeIn => {
-                    let start = treemap::Rect {
-                        x: item.to.x + item.to.w * 0.15,
-                        y: item.to.y + item.to.h * 0.15,
-                        w: item.to.w * 0.70,
-                        h: item.to.h * 0.70,
-                    };
-                    (lerp_rect(start, item.to, ease), ease * fade_out_overlay)
-                }
+            let rect = lerp_rect(item.from, item.to, ease);
+            let alpha_mul = match item.kind {
+                TransitionKind::Move => fade_out_overlay,
+                TransitionKind::FadeOut => (1.0 - ease * ease) * fade_out_overlay,
+                TransitionKind::FadeIn => ease.sqrt() * fade_out_overlay,
             };
             let screen = to_screen(rect).intersect(canvas);
             if screen.width() < 0.5 || screen.height() < 0.5 || alpha_mul <= 0.01 {
