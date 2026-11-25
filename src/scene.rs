@@ -1934,7 +1934,7 @@ mod tests {
                 size,
                 identity: FileIdentity {
                     device: 1,
-                    inode: entries.len() as u64 + 100,
+                    inode: (entries.len() as u64 + 100).into(),
                 },
                 parent_identity: FileIdentity {
                     device: 1,
@@ -1955,7 +1955,7 @@ mod tests {
                     path: p.clone(),
                     identity: FileIdentity {
                         device: 1,
-                        inode: i as u64 + 1,
+                        inode: (i as u64 + 1).into(),
                     },
                     enumeration_complete: true,
                     has_subdirectories: has_sub,
@@ -2455,7 +2455,7 @@ mod tests {
                 let dpath = root.join(name);
                 let did = FileIdentity {
                     device: 1,
-                    inode: dir_ino,
+                    inode: dir_ino.into(),
                 };
                 directories.push(scan::DirectoryFact {
                     path: dpath.clone(),
@@ -2470,7 +2470,7 @@ mod tests {
                     size,
                     identity: FileIdentity {
                         device: 1,
-                        inode: batch_idx * 1000 + dir_ino,
+                        inode: (batch_idx * 1000 + dir_ino).into(),
                     },
                     parent_identity: did,
                     parent_is_leaf: true,
