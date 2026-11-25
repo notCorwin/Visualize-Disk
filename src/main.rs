@@ -2442,6 +2442,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn command_backspace_respects_protection_and_starts_folder_delete_without_confirmation() {
         let ctx = egui::Context::default();
         configure(&ctx);

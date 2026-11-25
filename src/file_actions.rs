@@ -455,27 +455,30 @@ mod tests {
             verify_target(&original, identity, TargetKind::Directory).unwrap_err(),
             REPLACED
         );
-        assert!(!can_move_target(Path::new("/"), TargetKind::Directory));
-        assert!(!can_move_target(
-            Path::new("/System"),
-            TargetKind::Directory
-        ));
-        assert!(!can_move_target(
-            Path::new("/System/Volumes/Data"),
-            TargetKind::Directory
-        ));
-        assert!(!can_move_target(
-            Path::new("/System/Volumes/Data/System"),
-            TargetKind::Directory
-        ));
-        assert!(can_move_target(
-            Path::new("/System/Volumes/Data/Users"),
-            TargetKind::Directory
-        ));
-        assert!(can_move_target(
-            Path::new("/Systematic"),
-            TargetKind::Directory
-        ));
+        #[cfg(not(windows))]
+        {
+            assert!(!can_move_target(Path::new("/"), TargetKind::Directory));
+            assert!(!can_move_target(
+                Path::new("/System"),
+                TargetKind::Directory
+            ));
+            assert!(!can_move_target(
+                Path::new("/System/Volumes/Data"),
+                TargetKind::Directory
+            ));
+            assert!(!can_move_target(
+                Path::new("/System/Volumes/Data/System"),
+                TargetKind::Directory
+            ));
+            assert!(can_move_target(
+                Path::new("/System/Volumes/Data/Users"),
+                TargetKind::Directory
+            ));
+            assert!(can_move_target(
+                Path::new("/Systematic"),
+                TargetKind::Directory
+            ));
+        }
     }
 
     #[test]
@@ -494,6 +497,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn system_files_cannot_be_trashed_but_data_volume_user_files_can() {
         for path in ["/System/Library/file", "/System/Volumes/Data/System/file"] {
             assert!(!can_move_to_trash(Path::new(path)), "{path}");
