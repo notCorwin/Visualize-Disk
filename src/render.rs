@@ -758,11 +758,11 @@ pub fn raster_region(
                 continue;
             }
             let ix0 = to_px_hi(r.x + BEVEL_WIDTH + pad_pos_x, view.x, sx, rx0, rx1).clamp(px0, px1);
-            let ix1 = to_px_lo(r.x + r.w - BEVEL_WIDTH - pad_neg_x, view.x, sx, rx0, rx1)
-                .clamp(ix0, px1);
+            let ix1 =
+                to_px_lo(r.x + r.w - BEVEL_WIDTH - pad_neg_x, view.x, sx, rx0, rx1).clamp(ix0, px1);
             let iy0 = to_px_hi(r.y + BEVEL_WIDTH + pad_pos_y, view.y, sy, ry0, ry1).clamp(py0, py1);
-            let iy1 = to_px_lo(r.y + r.h - BEVEL_WIDTH - pad_neg_y, view.y, sy, ry0, ry1)
-                .clamp(iy0, py1);
+            let iy1 =
+                to_px_lo(r.y + r.h - BEVEL_WIDTH - pad_neg_y, view.y, sy, ry0, ry1).clamp(iy0, py1);
             if ix0 < ix1 && iy0 < iy1 {
                 for y in py0..iy0 {
                     lit_mask[y * patch_w + px0..y * patch_w + px1].fill(1);

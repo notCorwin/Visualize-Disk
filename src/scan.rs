@@ -304,8 +304,8 @@ fn scan_impl(
     if stream.is_some() {
         // Isolate streaming directory traversal from the global Rayon pool so
         // live layout & rasterization on `SceneWorker` never starve behind scan tasks.
-        let scan_threads = std::thread::available_parallelism()
-            .map_or(2, |n| n.get().saturating_sub(2).max(2));
+        let scan_threads =
+            std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(2).max(2));
         if let Ok(pool) = rayon::ThreadPoolBuilder::new()
             .num_threads(scan_threads)
             .build()
@@ -2153,8 +2153,11 @@ mod tests {
             let sub = temp.0.join(format!("dir-{dir}"));
             fs::create_dir(&sub).unwrap();
             for file in 0..5 {
-                fs::write(sub.join(format!("f-{file}")), vec![0u8; (dir + 1) * 128 + file])
-                    .unwrap();
+                fs::write(
+                    sub.join(format!("f-{file}")),
+                    vec![0u8; (dir + 1) * 128 + file],
+                )
+                .unwrap();
             }
         }
         let full = scan(

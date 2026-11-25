@@ -19,14 +19,15 @@ if [[ "$BUILD" == 1 ]]; then
     (cd "$ROOT" && cargo build --release --locked)
 fi
 
-BINARY="$ROOT/target/release/visualize-ssd"
+BINARY="$ROOT/target/release/visualize-disk"
 BUNDLE_DIR="$ROOT/target/release/bundle"
-BUNDLE="$BUNDLE_DIR/Visualize SSD Demo.app"
-IDENTIFIER='com.visualizessd.demo'
+BUNDLE_NAME='Visualize Disk Demo.app'
+BUNDLE="$BUNDLE_DIR/$BUNDLE_NAME"
+IDENTIFIER='com.visualizedisk.demo'
 [[ -x "$BINARY" ]] || { printf 'Release executable is missing: %s\n' "$BINARY" >&2; exit 1; }
 mkdir -p "$BUNDLE_DIR"
-WORK="$(mktemp -d "$BUNDLE_DIR/.visualize-ssd-demo.XXXXXX")"
-STAGED="$WORK/Visualize SSD Demo.app"
+WORK="$(mktemp -d "$BUNDLE_DIR/.visualize-disk-demo.XXXXXX")"
+STAGED="$WORK/$BUNDLE_NAME"
 cleanup_work() {
     status=$?
     trap - EXIT
@@ -38,15 +39,15 @@ cleanup_work() {
 }
 trap cleanup_work EXIT
 mkdir -p "$STAGED/Contents/MacOS" "$STAGED/Contents/Resources"
-cp "$BINARY" "$STAGED/Contents/MacOS/visualize-ssd-demo"
+cp "$BINARY" "$STAGED/Contents/MacOS/visualize-disk-demo"
 cp "$ROOT/assets/Info.plist" "$STAGED/Contents/Info.plist"
 cp "$ROOT/assets/AppIcon.icns" "$STAGED/Contents/Resources/AppIcon.icns"
 printf 'APPL????' > "$STAGED/Contents/PkgInfo"
 PLIST="$STAGED/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable visualize-ssd-demo' "$PLIST"
-/usr/libexec/PlistBuddy -c 'Set :CFBundleIdentifier com.visualizessd.demo' "$PLIST"
-/usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Visualize SSD Demo' "$PLIST"
-/usr/libexec/PlistBuddy -c 'Set :CFBundleName Visualize SSD Demo' "$PLIST"
+/usr/libexec/PlistBuddy -c 'Set :CFBundleExecutable visualize-disk-demo' "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $IDENTIFIER" "$PLIST"
+/usr/libexec/PlistBuddy -c 'Set :CFBundleDisplayName Visualize Disk Demo' "$PLIST"
+/usr/libexec/PlistBuddy -c 'Set :CFBundleName Visualize Disk Demo' "$PLIST"
 /usr/bin/plutil -lint "$PLIST"
 SIGNING_IDENTITY="${CODESIGN_IDENTITY:-}"
 if [[ -z "$SIGNING_IDENTITY" ]]; then
@@ -68,8 +69,9 @@ touch "$BUNDLE"
 trap - EXIT
 
 if [[ "$INSTALL" == 1 ]]; then
-    STAGE="$(mktemp -d /Applications/.visualize-ssd-demo.XXXXXX)"
-    DEST='/Applications/Visualize SSD Demo.app'
+    STAGE="$(mktemp -d /Applications/.visualize-disk-demo.XXXXXX)"
+    DEST="/Applications/$BUNDLE_NAME"
+    STAGED="$STAGE/$BUNDLE_NAME"
     PREVIOUS="$STAGE/previous.app"
     NEW_PLACED=0
     cleanup_install() {
@@ -92,8 +94,8 @@ if [[ "$INSTALL" == 1 ]]; then
         exit "$status"
     }
     trap cleanup_install EXIT
-    /usr/bin/ditto "$BUNDLE" "$STAGE/Visualize SSD Demo.app"
-    /usr/bin/codesign --verify --deep --strict "$STAGE/Visualize SSD Demo.app"
+    /usr/bin/ditto "$BUNDLE" "$STAGED"
+    /usr/bin/codesign --verify --deep --strict "$STAGED"
     if [[ -e "$DEST" || -L "$DEST" ]]; then
         [[ ! -L "$DEST" && "$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$DEST/Contents/Info.plist" 2>/dev/null || true)" == "$IDENTIFIER" ]] || {
             printf 'Refusing to replace an unrelated application: %s\n' "$DEST" >&2
@@ -101,11 +103,20 @@ if [[ "$INSTALL" == 1 ]]; then
         }
         mv "$DEST" "$PREVIOUS"
     fi
-    mv "$STAGE/Visualize SSD Demo.app" "$DEST"
+    mv "$STAGED" "$DEST"
     NEW_PLACED=1
     /usr/bin/codesign --verify --deep --strict "$DEST"
     /usr/bin/plutil -lint "$DEST/Contents/Info.plist"
     LSREGISTER='/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister'
+    LEGACY='/Applications/Visualize SSD Demo.app'
+    if [[ -d "$LEGACY" && ! -L "$LEGACY" ]] &&
+        /usr/bin/codesign --verify --deep --strict -R='identifier "com.visualizessd.demo"' "$LEGACY" 2>/dev/null; then
+        if [[ -x "$LSREGISTER" ]]; then
+            "$LSREGISTER" -u "$LEGACY" >/dev/null 2>&1 ||
+                printf 'Could not unregister old app entry: %s\n' "$LEGACY" >&2
+        fi
+        /usr/bin/trash "$LEGACY" || printf 'Could not move old app to Trash: %s\n' "$LEGACY" >&2
+    fi
     if [[ -x "$LSREGISTER" ]]; then
         "$LSREGISTER" -f "$DEST" >/dev/null 2>&1 ||
             printf 'Could not refresh app registration: %s\n' "$DEST" >&2

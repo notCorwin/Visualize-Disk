@@ -343,7 +343,7 @@ mod macos {
                 if stream.is_null() {
                     return None;
                 }
-                let label = CString::new("com.visualizessd.fsevents").ok()?;
+                let label = CString::new("com.visualizedisk.fsevents").ok()?;
                 let queue = dispatch_queue_create(label.as_ptr(), ptr::null());
                 if queue.is_null() {
                     FSEventStreamRelease(stream);
@@ -406,7 +406,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "visualize-ssd-watch-{}-{stamp}",
+            "visualize-disk-watch-{}-{stamp}",
             std::process::id()
         ));
         std::fs::create_dir(&dir).unwrap();

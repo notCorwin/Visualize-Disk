@@ -236,7 +236,7 @@ mod finder {
             if status == 0 {
                 Ok(())
             } else {
-                Err("需要允许 Visualize SSD 控制 Finder，才能将文件移到废纸篓。请在系统设置 > 隐私与安全性 > 自动化中允许 Finder。文件尚未移动。".into())
+                Err("需要允许 Visualize Disk 控制 Finder，才能将文件移到废纸篓。请在系统设置 > 隐私与安全性 > 自动化中允许 Finder。文件尚未移动。".into())
             }
         })
     }

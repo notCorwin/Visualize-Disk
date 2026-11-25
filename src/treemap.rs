@@ -85,7 +85,6 @@ impl<K> SplitTree<K> {
 }
 
 impl<K: Copy + Eq + Hash + Send> SplitTree<K> {
-
     /// Build a balanced initial `SplitTree` for `items` in `bounds`.
     pub fn build_with_cancel(
         items: &[(K, u64)],
@@ -138,7 +137,13 @@ impl<K: Copy + Eq + Hash + Send> SplitTree<K> {
             return Vec::new();
         }
         let mut out = Vec::with_capacity(self.nodes.len().div_ceil(2));
-        evaluate_nodes(&self.nodes, root, bounds, |i| self.nodes[i].weight, &mut out);
+        evaluate_nodes(
+            &self.nodes,
+            root,
+            bounds,
+            |i| self.nodes[i].weight,
+            &mut out,
+        );
         out
     }
 
@@ -223,10 +228,7 @@ impl<K: Copy + Eq + Hash + Send> SplitTree<K> {
             return Some(entries);
         }
 
-        let desired_map: HashMap<K, u64> = desired
-            .iter()
-            .map(|&(k, w)| (k, w.max(1)))
-            .collect();
+        let desired_map: HashMap<K, u64> = desired.iter().map(|&(k, w)| (k, w.max(1))).collect();
 
         // Fast path: check if topology is completely unchanged (weight-only update).
         let mut leaf_count = 0usize;
@@ -243,7 +245,13 @@ impl<K: Copy + Eq + Hash + Send> SplitTree<K> {
         if all_existing_kept && leaf_count == desired_map.len() {
             let root = self.root.unwrap();
             let mut froms = Vec::with_capacity(leaf_count);
-            evaluate_nodes(&self.nodes, root, old_bounds, |i| self.nodes[i].weight, &mut froms);
+            evaluate_nodes(
+                &self.nodes,
+                root,
+                old_bounds,
+                |i| self.nodes[i].weight,
+                &mut froms,
+            );
             let post = post_order(&self.nodes, root);
             for idx in post {
                 match self.nodes[idx].kind {
@@ -258,7 +266,13 @@ impl<K: Copy + Eq + Hash + Send> SplitTree<K> {
                 }
             }
             let mut tos = Vec::with_capacity(leaf_count);
-            evaluate_nodes(&self.nodes, root, new_bounds, |i| self.nodes[i].weight, &mut tos);
+            evaluate_nodes(
+                &self.nodes,
+                root,
+                new_bounds,
+                |i| self.nodes[i].weight,
+                &mut tos,
+            );
             let entries = froms
                 .into_iter()
                 .zip(tos)
@@ -316,12 +330,8 @@ impl<K: Copy + Eq + Hash + Send> SplitTree<K> {
                 let (_, right_if_here) = split_rect_by_weights(existing_if_here, axis, lw, rw);
                 let worst_here = rect_aspect(right_if_here).max(rect_aspect(new_if_here));
 
-                let (_, post_right_rect) = split_rect_by_weights(
-                    cur_post_rect,
-                    axis,
-                    lw,
-                    rw.saturating_add(added_total),
-                );
+                let (_, post_right_rect) =
+                    split_rect_by_weights(cur_post_rect, axis, lw, rw.saturating_add(added_total));
                 let worst_deeper = candidate_split_aspect(post_right_rect, rw, added_total);
                 if worst_deeper >= worst_here {
                     break;
@@ -393,11 +403,29 @@ impl<K: Copy + Eq + Hash + Send> SplitTree<K> {
         let approx_leaves = self.nodes.len().div_ceil(2);
         let mut froms = Vec::with_capacity(approx_leaves);
         let mut tos = Vec::with_capacity(approx_leaves);
-        evaluate_nodes(&self.nodes, root, old_bounds, |i| before_weights[i], &mut froms);
-        evaluate_nodes(&self.nodes, root, new_bounds, |i| after_weights[i], &mut tos);
+        evaluate_nodes(
+            &self.nodes,
+            root,
+            old_bounds,
+            |i| before_weights[i],
+            &mut froms,
+        );
+        evaluate_nodes(
+            &self.nodes,
+            root,
+            new_bounds,
+            |i| after_weights[i],
+            &mut tos,
+        );
 
         let mut leaf_statuses = Vec::with_capacity(froms.len());
-        collect_leaf_statuses(&self.nodes, root, &before_weights, &after_weights, &mut leaf_statuses);
+        collect_leaf_statuses(
+            &self.nodes,
+            root,
+            &before_weights,
+            &after_weights,
+            &mut leaf_statuses,
+        );
 
         let entries: Vec<SyncEntry<K>> = froms
             .into_iter()
@@ -521,7 +549,14 @@ pub fn rect_aspect(r: Rect) -> f64 {
     (w / h).max(h / w)
 }
 
-fn strip_worst_aspect(row_w: f64, max_item: f64, min_item: f64, total_w: f64, short: f64, long: f64) -> f64 {
+fn strip_worst_aspect(
+    row_w: f64,
+    max_item: f64,
+    min_item: f64,
+    total_w: f64,
+    short: f64,
+    long: f64,
+) -> f64 {
     if row_w <= 0.0 || min_item <= 0.0 || max_item <= 0.0 || short <= 0.0 || long <= 0.0 {
         return f64::INFINITY;
     }
@@ -1223,15 +1258,7 @@ mod tests {
             w: 600.0,
             h: 400.0,
         };
-        let items = vec![
-            (0u32, 6),
-            (1, 6),
-            (2, 4),
-            (3, 3),
-            (4, 2),
-            (5, 2),
-            (6, 1),
-        ];
+        let items = vec![(0u32, 6), (1, 6), (2, 4), (3, 3), (4, 2), (5, 2), (6, 1)];
         let tree = SplitTree::build(&items, bounds);
         let rects = tree.evaluate(bounds);
         assert_eq!(rects.len(), items.len());
@@ -1244,7 +1271,8 @@ mod tests {
             "expected squarified max aspect <= 3.05, got {max_aspect}"
         );
         // Verify average aspect ratio is very close to 1.
-        let avg_aspect = rects.iter().map(|(_, r)| rect_aspect(*r)).sum::<f64>() / rects.len() as f64;
+        let avg_aspect =
+            rects.iter().map(|(_, r)| rect_aspect(*r)).sum::<f64>() / rects.len() as f64;
         assert!(
             avg_aspect <= 1.85,
             "expected squarified avg aspect <= 1.85, got {avg_aspect}"

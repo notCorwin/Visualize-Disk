@@ -375,7 +375,7 @@ mod native_tests {
     fn windows_recycle_smoke() {
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
-            "visualize-ssd-recycle-smoke-{}-{}",
+            "visualize-disk-recycle-smoke-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));

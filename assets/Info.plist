@@ -3,12 +3,12 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
-    <key>CFBundleDisplayName</key><string>Visualize SSD</string>
-    <key>CFBundleExecutable</key><string>visualize-ssd</string>
+    <key>CFBundleDisplayName</key><string>Visualize Disk</string>
+    <key>CFBundleExecutable</key><string>visualize-disk</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
-    <key>CFBundleIdentifier</key><string>com.visualizessd.app</string>
+    <key>CFBundleIdentifier</key><string>com.visualizedisk.app</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-    <key>CFBundleName</key><string>Visualize SSD</string>
+    <key>CFBundleName</key><string>Visualize Disk</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>1</string>

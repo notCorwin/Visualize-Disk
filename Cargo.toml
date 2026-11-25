@@ -1,5 +1,5 @@
 [package]
-name = "visualize-ssd"
+name = "visualize-disk"
 version = "0.1.0"
 edition = "2024"
 

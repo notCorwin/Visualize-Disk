@@ -498,13 +498,9 @@ impl SceneWorker {
 
                         let tree = scene::SceneTree::from_scan(scan);
                         let px = render::logical_pixel_size(bounds, physical_size);
-                        let Some(layout) = scene::LayoutTree::build(
-                            &tree,
-                            bounds,
-                            px,
-                            &worker_token,
-                            generation,
-                        ) else {
+                        let Some(layout) =
+                            scene::LayoutTree::build(&tree, bounds, px, &worker_token, generation)
+                        else {
                             continue;
                         };
                         let Some(patch) =
@@ -571,13 +567,9 @@ impl SceneWorker {
                                 render::stream_preview_size(phys)
                             };
                             let px = render::logical_pixel_size(bounds, physical_size);
-                            let Some(layout) = scene::LayoutTree::build(
-                                s,
-                                bounds,
-                                px,
-                                &worker_token,
-                                generation,
-                            ) else {
+                            let Some(layout) =
+                                scene::LayoutTree::build(s, bounds, px, &worker_token, generation)
+                            else {
                                 continue;
                             };
                             let Some(patch) =
@@ -621,10 +613,12 @@ impl SceneWorker {
                                     ) else {
                                         continue;
                                     };
-                                    let _ = l.apply_dirty(s, &[0], full_px, &worker_token, generation);
+                                    let _ =
+                                        l.apply_dirty(s, &[0], full_px, &worker_token, generation);
                                     Some(diff)
                                 } else {
-                                    let _ = l.apply_dirty(s, &[0], full_px, &worker_token, generation);
+                                    let _ =
+                                        l.apply_dirty(s, &[0], full_px, &worker_token, generation);
                                     None
                                 };
                                 let Some(patch) =
@@ -1166,8 +1160,8 @@ impl App {
         viewport: ViewportKey,
         ctx: &egui::Context,
     ) {
-        let same_root = self.stats.as_ref().is_some_and(|s| s.root == scan.root)
-            && self.ui_scene.is_some();
+        let same_root =
+            self.stats.as_ref().is_some_and(|s| s.root == scan.root) && self.ui_scene.is_some();
         let bounds = self
             .ui_scene
             .as_ref()
@@ -1953,7 +1947,7 @@ impl App {
                                 ui.label("无法完成启动检查，请重新检查后重试。");
                             } else {
                                 ui.label(
-                                    "在系统设置中添加并开启 /Applications/Visualize SSD.app。",
+                                    "在系统设置中添加并开启 /Applications/Visualize Disk.app。",
                                 );
                                 ui.label("授权后点击重新检查；若系统要求，请退出并重新打开应用。");
                             }
@@ -2110,9 +2104,7 @@ impl App {
                 }
                 self.handle_resize(key, &ctx);
 
-                if self.job.is_none()
-                    && self.stats.as_ref().is_some_and(|s| s.total_files == 0)
-                {
+                if self.job.is_none() && self.stats.as_ref().is_some_and(|s| s.total_files == 0) {
                     ui.painter_at(canvas).text(
                         canvas.center(),
                         egui::Align2::CENTER_CENTER,
@@ -2232,13 +2224,13 @@ fn main() -> eframe::Result {
         || (cfg!(target_os = "macos")
             && std::env::current_exe()
                 .ok()
-                .and_then(|path| path.file_name().map(|s| s == "visualize-ssd-demo"))
+                .and_then(|path| path.file_name().map(|s| s == "visualize-disk-demo"))
                 .unwrap_or(false));
     eframe::run_native(
         if demo {
-            "Visualize SSD · 演示"
+            "Visualize Disk · 演示"
         } else {
-            "Visualize SSD"
+            "Visualize Disk"
         },
         native_options()?,
         Box::new(move |cc| {
@@ -2494,8 +2486,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir =
-            std::env::temp_dir().join(format!("visualize-ssd-live-{}-{stamp}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "visualize-disk-live-{}-{stamp}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/initial.bin"), vec![1u8; 4096]).unwrap();
 

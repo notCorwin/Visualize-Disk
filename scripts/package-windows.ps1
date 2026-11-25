@@ -29,14 +29,14 @@ try {
     $MetadataJson = & cargo metadata --no-deps --format-version 1 --locked
     if ($LASTEXITCODE -ne 0) { throw 'Cannot read Cargo build metadata.' }
     $Metadata = $MetadataJson | ConvertFrom-Json
-    $Package = $Metadata.packages | Where-Object { $_.name -eq 'visualize-ssd' }
-    $Binary = Join-Path $Metadata.target_directory "$Target/release/visualize-ssd.exe"
+    $Package = $Metadata.packages | Where-Object { $_.name -eq 'visualize-disk' }
+    $Binary = Join-Path $Metadata.target_directory "$Target/release/visualize-disk.exe"
     if (-not (Test-Path -LiteralPath $Binary -PathType Leaf)) {
         throw "Release executable is missing: $Binary"
     }
 
     $Architecture = if ($Target.StartsWith('aarch64-')) { 'arm64' } else { 'x64' }
-    $BundleName = "Visualize-SSD-$($Package.version)-$Architecture.exe"
+    $BundleName = "Visualize-Disk-$($Package.version)-$Architecture.exe"
     $BundleRoot = Join-Path $Metadata.target_directory 'release/bundle'
     New-Item -ItemType Directory -Force -Path $BundleRoot | Out-Null
     $Executable = Join-Path $BundleRoot $BundleName

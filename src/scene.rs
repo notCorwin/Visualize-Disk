@@ -1403,8 +1403,12 @@ impl LayoutTree {
                         .map(|e| e.to),
                 );
                 if old_wa > 1.45 {
-                    let candidate =
-                        SplitTree::build_with_cancel(&weights, eval_new_content, token, generation)?;
+                    let candidate = SplitTree::build_with_cancel(
+                        &weights,
+                        eval_new_content,
+                        token,
+                        generation,
+                    )?;
                     let cand_rects = candidate.evaluate(eval_new_content);
                     let new_wa = weighted_aspect(cand_rects.iter().map(|&(_, r)| r));
                     if new_wa < old_wa * 0.88 {
@@ -1457,8 +1461,12 @@ impl LayoutTree {
                         }
                     }
                     SyncStatus::Added => {
-                        match resolve_visual_item(scene, meta[&entry.key], entry.to, self.pixel_size)
-                        {
+                        match resolve_visual_item(
+                            scene,
+                            meta[&entry.key],
+                            entry.to,
+                            self.pixel_size,
+                        ) {
                             VisualItem::File(id, color) | VisualItem::FolderTile(id, color) => {
                                 laid_tiles.push(LaidOutTile {
                                     key: entry.key,
@@ -1490,8 +1498,12 @@ impl LayoutTree {
                         }
                     }
                     SyncStatus::Kept => {
-                        match resolve_visual_item(scene, meta[&entry.key], entry.to, self.pixel_size)
-                        {
+                        match resolve_visual_item(
+                            scene,
+                            meta[&entry.key],
+                            entry.to,
+                            self.pixel_size,
+                        ) {
                             VisualItem::File(id, color) | VisualItem::FolderTile(id, color) => {
                                 // Check if a previously expanded SubdirContainer refolded into a FolderTile!
                                 let refolded = matches!(entry.key, SlotKey::Subdir(c) if self.dirs.contains_key(&(c as usize)));
@@ -1535,8 +1547,7 @@ impl LayoutTree {
                             VisualItem::SubdirContainer(child_idx) => {
                                 // Check if a previously collapsed FolderTile unfolded into a SubdirContainer!
                                 let unfolded = !self.dirs.contains_key(&child_idx);
-                                if unfolded
-                                    && let Some(&old_id) = old_tiles_by_key.get(&entry.key)
+                                if unfolded && let Some(&old_id) = old_tiles_by_key.get(&entry.key)
                                 {
                                     removed_ids.push(old_id);
                                 }
@@ -1850,7 +1861,11 @@ fn rects_intersect(a: Rect, b: Rect) -> bool {
 }
 
 fn merge_raster_dirty_rects(rects: &[Rect], full: Rect) -> Vec<Rect> {
-    let mut valid_rects: Vec<Rect> = rects.iter().copied().filter(|&r| render::valid(r)).collect();
+    let mut valid_rects: Vec<Rect> = rects
+        .iter()
+        .copied()
+        .filter(|&r| render::valid(r))
+        .collect();
     if valid_rects.is_empty() {
         return Vec::new();
     }
@@ -2150,7 +2165,11 @@ mod tests {
         // Record initial top-level folder rectangles from root's split tree.
         let root_rects = |l: &LayoutTree| -> HashMap<SlotKey, Rect> {
             let root_layout = &l.dirs[&0];
-            root_layout.split_tree.evaluate(bounds).into_iter().collect()
+            root_layout
+                .split_tree
+                .evaluate(bounds)
+                .into_iter()
+                .collect()
         };
         let initial_top = root_rects(&layout);
 
@@ -2575,7 +2594,15 @@ mod tests {
             "previously LOD-collapsed directory must unfold once enlarged"
         );
         let tiles = layout.collect_visible_tiles(&scene);
-        assert!(tiles.values().any(|t| t.path == Path::new("/disk/tiny/sub1")));
-        assert!(tiles.values().any(|t| t.path == Path::new("/disk/tiny/sub2")));
+        assert!(
+            tiles
+                .values()
+                .any(|t| t.path == Path::new("/disk/tiny/sub1"))
+        );
+        assert!(
+            tiles
+                .values()
+                .any(|t| t.path == Path::new("/disk/tiny/sub2"))
+        );
     }
 }
